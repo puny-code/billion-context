@@ -370,6 +370,13 @@ entries:
     group: behavior
     desc_en: "Prompt-cache routing posture for cache-aware lane selection."
     desc_zh: "面向缓存感知路由选择的提示词缓存路由姿态。"
+  - key: cacheKeepalive
+    type: "{ enabled?, ttlFactor?, maxDurationMs?, maxConcurrentPings?, assumeTtl?, armWithoutBreakpoints?, intervalMs? }"
+    default: "{} (disabled)"
+    env: [BILI_CACHE_KEEPALIVE, BILI_CACHE_KEEPALIVE_TTL_FACTOR, BILI_CACHE_KEEPALIVE_MAX_DURATION_MS, BILI_CACHE_KEEPALIVE_MAX_PINGS, BILI_CACHE_KEEPALIVE_ASSUME_TTL, BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS, BILI_CACHE_KEEPALIVE_INTERVAL_MS]
+    group: behavior
+    desc_en: "Idle prompt-cache keepalive for the Anthropic wire (#3376): while a session goes idle, replay the last forwarded body with max_tokens=1 on a TTL-derived cadence so the upstream prefix cache stays warm; verified by usage.cache_read_input_tokens, stops on miss/429/error-streak/duration cap; also settable per provider route."
+    desc_zh: "Anthropic 线路的空闲期提示缓存保活（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由覆盖。"
   - key: native.attachExternal
     type: boolean
     default: "false"
