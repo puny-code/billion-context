@@ -642,8 +642,8 @@
   - **武装条件。** 只有成功的（2xx）Anthropic 线路 POST 才会武装/刷新快照。透传请求、重签名通道（存下的签名对应旧字节）、非字符串请求体、超过 64 MiB 的请求体、以及无任何 `cache_control` 断点的请求都不会武装（除非用下面的开关覆盖）。快照仅存内存：重启即清空，下一个真实请求重新武装。
   - **节奏。** `档位 × ttlFactor`：body 中任一断点声明 `ttl: "1h"` 则档位为 `1h`，否则 `5m`；默认因子 `0.9` → 约 4.5 分钟 / 54 分钟一次。可用 `assumeTtl` 覆盖（跳过 body 检测——面向会在 bili 下游注入或改写 `cache_control` TTL 的中继），或用绝对值 `intervalMs`（优先级最高）；`armWithoutBreakpoints: true` 让无断点的 body 也武装（配合 `assumeTtl` 使用）。
   - **停止条件。** 该会话出现真实请求立即取消（真实请求自己就会刷新缓存）；到点时该会话有在途请求则延迟约 5 秒再试；`cache_read_input_tokens = 0` → 停（`prefix-dead`）；HTTP 429 → 立即停；连续 3 次其他错误 → 停；距该会话最后一次真实请求超过 `maxDurationMs`（默认 24 小时）→ 停；`maxConcurrentPings`（默认 4）限制同时武装的会话数，超限时先驱逐空闲最久者。
-  - **成本与可观测性。** ping 完全绕过代理管线，因此不会进入 `/acp-cache` 命中率台账（合成流量不得污染健康判定）。每次 ping 记录 `[keepalive] <session> ping#N hit=<tokens>` 日志行，解除武装的原因同样记录。
-  - **逐 provider 覆盖。** 所有字段也可写在 provider 路由下（`providers.<url>.cacheKeepalive`）：逐字段而言，路由值 > 全局块 > 内置默认值；环境变量优先于两者。
+  - **成本与可观测性。** ping 完全绕过代理管线，因此不会进入 `/acp-cache` 命中率台账（合成流量不得污染健康判定），也不会产生任何缓存归因样本——miss 归因计算跑的请求序列与不开保活时完全一致。每次武装/ping/解除武装都记录 `[keepalive] …` 日志行；`acp_status` 对已武装会话输出一行 `CACHE KEEPALIVE: armed tier=… cadence=… · pings=N [· last-hit Mm ago]`（未武装时不出现）；Web UI 在会话列表显示保活徽标、详情页显示完整状态行，其原始 JSON 配置编辑器可直接写入本配置节（保存时服务端校验）。
+  - **逐 provider / 逐模型覆盖。** 所有字段也可写在 provider 路由下（`providers.<url>.cacheKeepalive`），或写在该路由的某个具体模型下（`providers.<url>.models.<model>.cacheKeepalive`）——同一上游后的不同模型可以跑不同的档位/节奏。逐字段优先级：环境变量 > 模型 > 路由 > 全局块 > 内置默认值。
 
 ### `autoUpdate`
 
