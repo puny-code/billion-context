@@ -120,7 +120,13 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `dsh.authoredCompaction` | boolean | true (on, #3901 flip) | BILI_DSH_AUTHORED_COMPACTION | bili answers dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3723/#3733). ON by default since the 0.1.203 dogfood window held; false (or env BILI_DSH_AUTHORED_COMPACTION=0) restores the #1729 refusal path. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding. |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
-| `cacheKeepalive` | { enabled?, ttlFactor?, maxDurationMs?, maxConcurrentPings?, assumeTtl?, armWithoutBreakpoints?, intervalMs? } | {} (disabled) | BILI_CACHE_KEEPALIVE, BILI_CACHE_KEEPALIVE_TTL_FACTOR, BILI_CACHE_KEEPALIVE_MAX_DURATION_MS, BILI_CACHE_KEEPALIVE_MAX_PINGS, BILI_CACHE_KEEPALIVE_ASSUME_TTL, BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS, BILI_CACHE_KEEPALIVE_INTERVAL_MS | Idle prompt-cache keepalive for the Anthropic wire (#3376): while a session goes idle, replay the last forwarded body with max_tokens=1 on a TTL-derived cadence so the upstream prefix cache stays warm; verified by usage.cache_read_input_tokens, stops on miss/429/error-streak/duration cap; also settable per provider route. |
+| `cacheKeepalive.enabled` | boolean | false | BILI_CACHE_KEEPALIVE | Master switch for idle prompt-cache keepalive on the Anthropic wire (#3376): while a session goes idle, bili replays the last forwarded body with max_tokens=1 on a TTL-derived cadence so the upstream prefix cache stays warm; hits are verified via usage.cache_read_input_tokens; stops on miss/429/error-streak/duration cap. Also settable per provider route and per model. |
+| `cacheKeepalive.ttlFactor` | number | 0.9 | BILI_CACHE_KEEPALIVE_TTL_FACTOR | Cadence factor applied to the detected/assumed cache TTL tier (ping interval = tier x factor; 0.9 gives roughly one ping per 4.5 min on the 5-min tier and per 54 min on the 1-hour tier). Must be in (0, 1]. |
+| `cacheKeepalive.maxDurationMs` | number | 86400000 | BILI_CACHE_KEEPALIVE_MAX_DURATION_MS | Per-session keepalive lifetime cap, measured from the session's last real request (default 24 h); past it, keepalive disarms even while still hitting. |
+| `cacheKeepalive.maxConcurrentPings` | number | 4 | BILI_CACHE_KEEPALIVE_MAX_PINGS | Cap on simultaneously armed sessions; when exceeded, the longest-idle armed session is evicted first. |
+| `cacheKeepalive.assumeTtl` | "5m" \| "1h" | null (detect from body breakpoints) | BILI_CACHE_KEEPALIVE_ASSUME_TTL | Skip body breakpoint detection and derive the cadence from this tier directly - for relays that inject or rewrite cache_control TTL downstream of bili, leaving the forwarded body breakpoint-less or mis-tiered. |
+| `cacheKeepalive.armWithoutBreakpoints` | boolean | false | BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS | Arm keepalive even when the forwarded body carries no cache_control breakpoint at all (off by default - without breakpoints there is no explicit break-pointed content to refresh; pair with assumeTtl/intervalMs when your relay manages breakpoints itself). |
+| `cacheKeepalive.intervalMs` | number | null (derive from TTL tier) | BILI_CACHE_KEEPALIVE_INTERVAL_MS | Absolute ping interval in milliseconds; wins over ttlFactor, assumeTtl and the detected tier. For fixed cadences that do not follow the upstream TTL policy. |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
 | `native.attachLanePriority` | string[] | [] (own lane → user zone → spawn) | — | Ordered list of FOREIGN lane names a lane may ride when no own-lane instance exists (#2905). Own lane always wins first; the user zone (manual bili start, the 8787 global) is ALWAYS last; unlisted lanes stay non-attachable. File-only, no env var. |
 | `native.attachPolicy` | "own-lane" \| "global-fallback" | own-lane | BILI_NATIVE_ATTACH_POLICY | Lane affinity for native-hook attach, and the gate on whether any cross-lane riding happens (#2877). own-lane (default): a LANEd hook rides ONLY a same-lane daemon and, with none available, spawns its own instead of falling back onto a lane-less / manually-started bili start daemon or another lane's daemon (that convergence pinned every agent to one daemon's version and double-wrote sessions); an armed lane-less daemon (a managed shared proxy, #1225) stays shareable under either policy. global-fallback restores the pre-#2877 behavior: same-lane first, then a compatible lane-less/user-zone daemon, and (with attachLanePriority) the listed foreign lanes. |
@@ -1730,14 +1736,13 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh` | {} |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
 | `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
-| `BILI_CACHE_KEEPALIVE` | `cacheKeepalive` | {} (disabled) |
-| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | `cacheKeepalive` | {} (disabled) |
-| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | `cacheKeepalive` | {} (disabled) |
-| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | `cacheKeepalive` | {} (disabled) |
-| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | `cacheKeepalive` | {} (disabled) |
-| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | `cacheKeepalive` | {} (disabled) |
-| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | `cacheKeepalive` | {} (disabled) |
-| `BILI_CA_FILE` | `network.caFile` | unset |
+| `BILI_CACHE_KEEPALIVE` | `cacheKeepalive.enabled` | false |
+| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | `cacheKeepalive.armWithoutBreakpoints` | false |
+| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | `cacheKeepalive.assumeTtl` | null (detect from body breakpoints) |
+| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | `cacheKeepalive.intervalMs` | null (derive from TTL tier) |
+| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | `cacheKeepalive.maxDurationMs` | 86400000 |
+| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | `cacheKeepalive.maxConcurrentPings` | 4 |
+| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | `cacheKeepalive.ttlFactor` | 0.9 |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
