@@ -10,6 +10,7 @@ import http from "node:http";
 import {
     buildPingBody,
     detectKeepaliveTier,
+    keepaliveStatusFor,
     noteSuccessfulForward,
     resolveCacheKeepalive,
     _setKeepaliveClockForTest,
@@ -21,7 +22,7 @@ import {
     type KeepaliveArmInput,
     type ResolvedKeepalive,
 } from "../src/cache-keepalive.ts";
-import { type ProviderRoutes } from "../src/config.ts";
+import { parseRouteEntry, type ProviderRoutes } from "../src/config.ts";
 import { acquireInFlight, dropSessionForGc, getSession, releaseInFlight, _resetSessionsForTest } from "../src/session.ts";
 
 // ---- fake upstream -------------------------------------------------------
@@ -255,6 +256,30 @@ test("resolveCacheKeepalive: env wins over provider; malformed env falls back", 
     assert.equal(r.maxConcurrentPings, 2, "non-positive pings fall through to the provider tier");
 });
 
+test("resolveCacheKeepalive: model level beats provider; unknown/absent model falls through", () => {
+    clearEnv();
+    const routes: ProviderRoutes = {
+        [upstreamUrl]: {
+            cacheKeepalive: { enabled: true, ttlFactor: 0.5, maxConcurrentPings: 2 },
+            models: { "claude-opus-4-6": { cacheKeepalive: { ttlFactor: 0.25 } } },
+        },
+    };
+    let r = resolveCacheKeepalive(routes, upstreamUrl, "claude-opus-4-6");
+    assert.equal(r.ttlFactor, 0.25, "model tier wins over the provider tier");
+    assert.equal(r.maxConcurrentPings, 2, "unset model fields fall through to the provider tier");
+    r = resolveCacheKeepalive(routes, upstreamUrl, "other-model");
+    assert.equal(r.ttlFactor, 0.5, "unknown model uses the provider tier");
+    r = resolveCacheKeepalive(routes, upstreamUrl);
+    assert.equal(r.ttlFactor, 0.5, "absent model name uses the provider tier");
+});
+
+test("parseRouteEntry: per-model cacheKeepalive validated strictly", () => {
+    const ok = parseRouteEntry({ models: { m: { cacheKeepalive: { ttlFactor: 0.25 } } } });
+    assert.ok(ok);
+    assert.equal(ok!.models?.["m"]?.cacheKeepalive?.ttlFactor, 0.25);
+    assert.throws(() => parseRouteEntry({ models: { m: { cacheKeepalive: { bogusKey: 1 } } } }), /cacheKeepalive/);
+});
+
 // ---- arm gates ------------------------------------------------------------
 
 test("arm: anthropic POST with 5m breakpoints arms at TTL×0.9", () => {
@@ -458,4 +483,27 @@ test("ping: pings continue until the max duration elapses", async () => {
     timers.advance(500);
     await settle(() => _keepaliveArmedForTest().length === 0);
     assert.equal(upstreamRequests.length, 2, "no third ping past the duration cap");
+});
+
+test("keepaliveStatusFor: mirrors armed state, ping history and disarm", async () => {
+    assert.equal(keepaliveStatusFor(sid), undefined, "nothing armed yet");
+    noteSuccessfulForward(armInput());
+    let st = keepaliveStatusFor(sid);
+    assert.ok(st);
+    assert.equal(st!.tierLabel, "5m");
+    assert.equal(st!.cadenceMs, 270_000);
+    assert.equal(st!.pingCount, 0);
+    assert.equal(st!.failStreak, 0);
+    assert.equal(st!.lastPingAt, undefined);
+    assert.equal(st!.lastHitAt, undefined);
+    timers.advance(270_000);
+    await settle(() => keepaliveStatusFor(sid)?.lastHitAt !== undefined);
+    st = keepaliveStatusFor(sid);
+    assert.equal(st!.pingCount, 1);
+    assert.equal(st!.lastPingAt, timers.now);
+    assert.equal(st!.lastHitAt, timers.now);
+    nextReply = { status: 200, body: MISS_BODY };
+    timers.advance(270_000);
+    await settle(() => _keepaliveArmedForTest().length === 0);
+    assert.equal(keepaliveStatusFor(sid), undefined, "disarmed sessions report no state");
 });
