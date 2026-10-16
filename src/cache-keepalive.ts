@@ -80,10 +80,20 @@ function pickMs(envName: string, fileValue: unknown, valid: (n: number) => boole
     return fallback;
 }
 
-export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined): ResolvedKeepalive {
+/** True when any model under the matched route declares a keepalive tier —
+ *  the only reason armInternal must parse the body while globally disabled. */
+function modelTierPresent(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined): boolean {
+    const models = routes ? findRoute(routes, upstreamUrl)?.models : undefined;
+    if (!models) return false;
+    return Object.values(models).some((e) => e !== null && typeof e === "object" && "cacheKeepalive" in e);
+}
+
+export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): ResolvedKeepalive {
     const g: CacheKeepaliveSettings = loadConfigFile().cacheKeepalive ?? {};
-    const p: CacheKeepaliveSettings = routes ? findRoute(routes, upstreamUrl)?.cacheKeepalive ?? {} : {};
-    const lvl = <K extends keyof CacheKeepaliveSettings>(k: K): CacheKeepaliveSettings[K] => (p[k] !== undefined ? p[k] : g[k]);
+    const route = routes ? findRoute(routes, upstreamUrl) : undefined;
+    const p: CacheKeepaliveSettings = route?.cacheKeepalive ?? {};
+    const m: CacheKeepaliveSettings = typeof model === "string" && model.length > 0 ? route?.models?.[model]?.cacheKeepalive ?? {} : {};
+    const lvl = <K extends keyof CacheKeepaliveSettings>(k: K): CacheKeepaliveSettings[K] => (m[k] !== undefined ? m[k] : p[k] !== undefined ? p[k] : g[k]);
 
     let assumeTtl: "5m" | "1h" | undefined;
     const assumeEnv = process.env["BILI_CACHE_KEEPALIVE_ASSUME_TTL"];
@@ -154,6 +164,8 @@ interface KeepaliveEntry {
     maxDurationMs: number;
     pingCount: number;
     failStreak: number;
+    lastPingAt?: number;
+    lastHitAt?: number;
     timerId: ReturnType<typeof setTimeout> | undefined;
     pingInFlight: boolean;
 }
@@ -175,6 +187,8 @@ export interface KeepaliveArmInput {
     headers: Record<string, string>;
     dispatcher: object | undefined;
     routes: ProviderRoutes | undefined;
+    /** The request's model name — selects the model-level config tier. */
+    model?: string;
 }
 
 /** Relay hook — call once per SUCCESSFUL anthropic-wire forward with the
@@ -188,6 +202,34 @@ export function noteSuccessfulForward(inp: KeepaliveArmInput): void {
     }
 }
 
+/** Live per-session keepalive state for status surfaces (acp_status, web UI) —
+ *  undefined when the session has no armed snapshot. */
+export interface KeepaliveStatus {
+    tierLabel: string;
+    cadenceMs: number;
+    pingCount: number;
+    failStreak: number;
+    armedAt: number;
+    lastRealActivityAt: number;
+    lastPingAt?: number;
+    lastHitAt?: number;
+}
+
+export function keepaliveStatusFor(sessionId: string): KeepaliveStatus | undefined {
+    const e = registry.get(sessionId);
+    if (!e) return undefined;
+    return {
+        tierLabel: e.tierLabel,
+        cadenceMs: e.cadenceMs,
+        pingCount: e.pingCount,
+        failStreak: e.failStreak,
+        armedAt: e.armedAt,
+        lastRealActivityAt: e.lastRealActivityAt,
+        lastPingAt: e.lastPingAt,
+        lastHitAt: e.lastHitAt,
+    };
+}
+
 function armInternal(inp: KeepaliveArmInput): void {
     if (inp.protocol !== "anthropic" || inp.reqMethod !== "POST" || inp.sidePassthrough || inp.resignLane) return;
     if (typeof inp.wireBody !== "string" || inp.wireBody.length === 0) return;
@@ -195,8 +237,10 @@ function armInternal(inp: KeepaliveArmInput): void {
         loggerLog("warn", `[${inp.sessionId}] [keepalive] snapshot skipped: body ${inp.wireBody.length} bytes exceeds ${MAX_SNAPSHOT_BYTES} cap`);
         return;
     }
-    const cfg = resolveCacheKeepalive(inp.routes, inp.upstreamUrl);
-    if (!cfg.enabled) {
+    // Fast path while the feature is off everywhere: decide WITHOUT parsing
+    // the (potentially multi-MiB) body. A per-model tier may still enable it,
+    // so only skip when no route declares one.
+    if (!resolveCacheKeepalive(inp.routes, inp.upstreamUrl).enabled && !modelTierPresent(inp.routes, inp.upstreamUrl)) {
         disarm(inp.sessionId, "disabled");
         return;
     }
@@ -208,6 +252,22 @@ function armInternal(inp: KeepaliveArmInput): void {
         return;
     }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+
+    // The relay hook cannot reference the request-scoped model variable at the
+    // 2xx commit point, so the model comes from the body itself (top-level
+    // "model" on the anthropic wire) unless an explicit hint was passed.
+    const rec = parsed as { model?: unknown };
+    const model =
+        typeof inp.model === "string" && inp.model.length > 0
+            ? inp.model
+            : typeof rec.model === "string"
+              ? rec.model
+              : undefined;
+    const cfg = resolveCacheKeepalive(inp.routes, inp.upstreamUrl, model);
+    if (!cfg.enabled) {
+        disarm(inp.sessionId, "disabled");
+        return;
+    }
 
     const now = clock();
     const credFp = credentialFingerprint(inp.headers);
@@ -293,6 +353,7 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
         return;
     }
     entry.pingInFlight = true;
+    entry.lastPingAt = clock();
     let resp: Response;
     try {
         resp = await sendPing(entry);
@@ -323,6 +384,7 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
     entry.pingCount += 1;
     if (typeof cached === "number" && cached > 0) {
         entry.failStreak = 0;
+        entry.lastHitAt = clock();
         loggerLog("info", `[${entry.sessionId}] [keepalive] ping#${entry.pingCount} hit=${cached}tok`);
         reschedule(entry);
     } else {

@@ -195,6 +195,9 @@ export type ModelEntry = {
      *  (CODEARTS_BENEFIT_FALLBACK mirror). Env BILI_RESIGN_BENEFIT wins over
      *  this like every other knob. */
     benefit?: boolean;
+    /** #3376 per-model idle-cache-keepalive override — the deepest config
+     *  tier (env > model > provider > global) for that model's snapshots. */
+    cacheKeepalive?: CacheKeepaliveSettings;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -2638,6 +2641,13 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (obj.compress) route.compress = obj.compress;
         const cacheKeepalive = parseCacheKeepaliveSettings(obj.cacheKeepalive);
         if (cacheKeepalive) route.cacheKeepalive = cacheKeepalive;
+        // Per-model keepalive blocks share the same strict parser (#1909
+        // stance) — validation only; well-formed entries pass through as-is.
+        for (const raw of Object.values(obj.models ?? {})) {
+            if (raw && typeof raw === "object" && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, "cacheKeepalive")) {
+                parseCacheKeepaliveSettings(raw.cacheKeepalive);
+            }
+        }
         const compat: ProviderRoute["compat"] = {};
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) compat.roles = compatRoles;
@@ -2737,7 +2747,7 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
 // cold-rebuild every time.
 const CACHE_KEEPALIVE_FIELDS = ["enabled", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
 
-function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
+export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
     if (v === undefined) return undefined;
     if (!v || typeof v !== "object" || Array.isArray(v))
         throw new Error(`[acp-config] cacheKeepalive must be an object of optional fields (got ${JSON.stringify(v)})`);
