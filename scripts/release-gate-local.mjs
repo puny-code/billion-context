@@ -417,7 +417,7 @@ async function main() {
       if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
 
       const m2 = mark();
-      const t2 = await turn("Without reading any file again: reply with ONLY the TITLE line of section S07.", "t2");
+      const t2 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.", "t2");
       // T2b gives the cache a second stable-prefix request so the warm-up
       // after the fold is observable (first post-fold round often has no
       // upstream cache report at all).
@@ -454,7 +454,7 @@ async function main() {
       if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
 
       const m3 = mark();
-      const t3 = await turn("Without reading any file again: reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
+      const t3 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
       const s3 = slice(m3);
       const pfa3 = /\[sess=(pfa-[0-9a-f]+)\]/.exec(s3)?.[1];
       const forked = pfa3 && pfa3 !== pfaPre && s3.includes(`lineage=forked of ${pfaPre}`);
