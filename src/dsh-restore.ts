@@ -282,20 +282,18 @@ export function resolveSessionLogPath(target: string): string {
 /** Offline restore of one session file/directory. Never writes unless `write`
  *  is set; when it does, a timestamped backup is written first. */
 export function runDshRestoreFile(target: string, opts?: { write?: boolean; dryRun?: boolean; allowGaps?: boolean }): DshRestoreFileResult {
+    if (opts?.write === true) {
+        // 2026-10-21: this path corrupted 10 DSH sessions (seq gap) and is now
+        // unreachable by design — bili must never write the host's log.
+        throw new DshRestoreError(
+            "bili never writes DSH session logs: removing events leaves gaps in the append-only seq chain and the host refuses to open the session. Nothing was changed; the log is intact.",
+            "io",
+        );
+    }
     const input = resolveSessionLogPath(target);
     const buffer = readFileSync(input);
-    const { output, report } = restoreDshSessionBuffer(buffer, { allowGaps: opts?.allowGaps });
-    const dryRun = opts?.dryRun === true || opts?.write !== true;
-    if (dryRun) return { input, outputPath: null, backupPath: null, report, dryRun: true };
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = `${input}.bak-${stamp}`;
-    copyFileSync(input, backupPath);
-    // Atomic replace: a writer holding the old handle keeps a valid (unlinked)
-    // inode instead of observing a truncated file mid-write.
-    const tmpPath = `${input}.restore-tmp-${process.pid}`;
-    writeFileSync(tmpPath, output);
-    renameSync(tmpPath, input);
-    return { input, outputPath: input, backupPath, report, dryRun: false };
+    const { report } = restoreDshSessionBuffer(buffer, { allowGaps: opts?.allowGaps });
+    return { input, outputPath: null, backupPath: null, report, dryRun: true };
 }
 
 /** Human-readable summary for the CLI. */
@@ -384,10 +382,16 @@ export function findDshSessionLogs(root: string): string[] {
     return out.sort();
 }
 
-/** Scan (and with `write`, repair) every session under `root`.
- *  Default: dry-run, skip sessions touched in the last `minIdleMs`. */
+/** Scan every session under `root`. READ-ONLY: `write` is refused outright
+ *  (2026-10-21 the write path corrupted 10 sessions by leaving seq gaps). */
 export function runDshRestoreAll(root: string, opts?: { write?: boolean; minIdleMs?: number; now?: number; allowGaps?: boolean }): DshRestoreScanResult {
-    const write = opts?.write === true;
+    if (opts?.write === true) {
+        throw new DshRestoreError(
+            "bili never writes DSH session logs: removing events leaves gaps in the append-only seq chain and the host refuses to open the session. Nothing was changed; every log is intact.",
+            "io",
+        );
+    }
+    const write = false;
     const minIdleMs = opts?.minIdleMs ?? RESTORE_RECENT_IDLE_MS;
     const now = opts?.now ?? Date.now();
     const logs = findDshSessionLogs(root);

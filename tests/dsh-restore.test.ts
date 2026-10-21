@@ -11,7 +11,8 @@ import {
     runDshRestoreAll,
     runDshRestoreFile,
 } from "../src/dsh-restore.ts";
-import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { auditDshSessions } from "../src/dsh-session-audit.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmrf } from "./tmp-rm.ts";
@@ -107,7 +108,7 @@ test("#4046 restore: the concatenated-zstd live format round-trips with frames c
     assert.ok(output.equals(Buffer.concat(keptOriginal)), "surviving frames are byte-identical");
 });
 
-test("#4046 restore file runner: dry-run writes nothing, write mode backs up first", () => {
+test("#4046 restore file runner: READ-ONLY — write mode is refused and never touches the log", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-restore-"));
     try {
         const file = join(dir, "session.v4.jsonl");
@@ -120,56 +121,47 @@ test("#4046 restore file runner: dry-run writes nothing, write mode backs up fir
         assert.equal(dry.outputPath, null);
         assert.ok(readFileSync(file).equals(original), "dry-run must not touch the file");
 
-        const real = runDshRestoreFile(file, { write: true });
-        assert.equal(real.dryRun, false);
-        assert.ok(real.backupPath !== null);
-        assert.ok(readFileSync(real.backupPath).equals(original), "the backup is a byte-exact copy");
-        assert.ok(!readFileSync(file).toString("utf8").includes("compaction/"), "the live file is restored");
+        // 2026-10-21 regression: --write removed events and left seq gaps; DSH
+        // then refused the whole session. The write path must be unreachable.
+        assert.throws(
+            () => runDshRestoreFile(file, { write: true } as never),
+            (e: unknown) => e instanceof DshRestoreError && /never writes DSH session logs/.test(e.message),
+        );
+        assert.ok(readFileSync(file).equals(original), "a refused write leaves the log byte-identical");
     } finally {
         rmrf(dir);
     }
 });
 
-test("#4046 restore --all: scans the tree, repairs idle sessions, skips the ones still in use", () => {
-    const root = mkdtempSync(join(tmpdir(), "bili-restore-all-"));
+test("#4046 audit: reports compaction damage without ever writing, and refuses --write", () => {
+    const root = mkdtempSync(join(tmpdir(), "bili-audit-"));
     try {
-        const make = (name: string, damaged: boolean, ageMin: number): string => {
+        const make = (name: string, compacted: boolean): string => {
             const dir = join(root, name);
             mkdirSync(dir, { recursive: true });
             const file = join(dir, "session.v4.jsonl");
-            const events = damaged ? base : base.filter((e) => !e.type.startsWith("compaction/") && e.seq !== 12);
+            const events = compacted ? base : base.filter((e) => !e.type.startsWith("compaction/") && e.seq !== 12);
             writeFileSync(file, log(events));
-            const when = new Date(Date.now() - ageMin * 60_000);
-            utimesSync(file, when, when);
             return file;
         };
-        const old = make("old-damaged", true, 120);
-        const recent = make("recent-damaged", true, 1);
-        const healthy = make("healthy", false, 120);
+        const compacted = make("compacted", true);
+        const healthy = make("healthy", false);
+        const before = readFileSync(compacted);
+        const beforeHealthy = readFileSync(healthy);
 
-        const dry = runDshRestoreAll(root);
-        assert.equal(dry.scanned, 3);
-        assert.equal(dry.healthy, 1);
-        assert.equal(dry.damaged, 2);
-        assert.equal(dry.fixed, 0);
-        assert.equal(dry.dryRun, true);
-        assert.ok(readFileSync(old, "utf8").includes("compaction/"), "dry-run must not touch files");
+        const audit = auditDshSessions(root);
+        assert.equal(audit.scanned, 2);
+        assert.equal(audit.ok + audit.compacted + audit.corrupt, 2, "every log gets a verdict");
+        assert.equal(audit.errors, 0);
+        assert.ok(readFileSync(compacted).equals(before), "audit is read-only");
+        assert.ok(readFileSync(healthy).equals(beforeHealthy), "audit is read-only");
 
-        const run = runDshRestoreAll(root, { write: true, minIdleMs: 30 * 60_000 });
-        assert.equal(run.fixed, 1, "the 2h-idle session is repaired");
-        assert.equal(run.skippedRecent, 1, "the 1m-idle session is left alone (DSH may hold it open)");
-        assert.ok(!readFileSync(old, "utf8").includes("compaction/"));
-        assert.ok(run.entries.find((e) => e.path === old)?.backupPath !== undefined, "every write is backed up");
-        assert.ok(readFileSync(recent, "utf8").includes("compaction/"), "the recent session is untouched");
-        assert.ok(readFileSync(healthy, "utf8").includes("assistant/message"), "a healthy log is never rewritten");
-
-        // Second pass after the recent one has aged: nothing else to do.
-        const again = runDshRestoreAll(root, { write: true, minIdleMs: 0 });
-        assert.equal(again.fixed, 1, "the recent one becomes eligible and is fixed");
-        const third = runDshRestoreAll(root, { write: true, minIdleMs: 0 });
-        assert.equal(third.fixed, 0);
-        assert.equal(third.healthy, 3);
-        assert.equal(third.damaged, 0);
+        // The write path that corrupted 10 sessions in 2026-10-21 is unreachable.
+        assert.throws(
+            () => runDshRestoreAll(root, { write: true } as never),
+            (e: unknown) => e instanceof DshRestoreError && /never writes DSH session logs/.test(e.message),
+        );
+        assert.ok(readFileSync(compacted).equals(before), "a refused write leaves every log byte-identical");
     } finally {
         rmrf(root);
     }

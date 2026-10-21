@@ -41,7 +41,8 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
-import { DshRestoreError, renderDshRestoreReport, renderDshRestoreScanReport, runDshRestoreAll, runDshRestoreFile } from "./dsh-restore.js";
+import { DshRestoreError, resolveSessionLogPath as resolveDshSessionLogPath } from "./dsh-restore.js";
+import { auditDshSessions, checkDshSessionLog, renderDshAuditReport } from "./dsh-session-audit.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
@@ -158,8 +159,8 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
-    bili restore <session-dir|file>   # un-shadow a DSH session that a lossy native compaction collapsed (dry-run; add --write)
-    bili restore ~/.dsh/sessions/<proj>/<session> --write   # restore in place, after a timestamped backup
+    bili restore <session-dir|file>   # READ-ONLY audit: seq continuity + compaction state (never writes)
+    bili restore --all                # audit every DSH session; never modifies a log
 
 Options (override config file / env):
   -F <url>                         upstream proxy to forward through (gost-style;
@@ -669,27 +670,46 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "restore") {
-        // Offline un-shadow of a DSH session log (#4046 follow-up). Standalone:
-        // no proxy, no store — it reads the log and (with --write) rewrites it
-        // after a timestamped backup. Default is a dry-run.
+        // READ-ONLY audit of DSH session logs. The old `--write` mode removed
+        // compaction events without renumbering `seq`, and DSH then refused 10
+        // sessions as corrupt (2026-10-21). A plugin must never write the host's
+        // append-only log, so --write is refused here too.
         try {
+            if (restoreWrite) {
+                console.error(
+                    "bili restore: --write was REMOVED. bili never writes DSH session logs: deleting events leaves gaps in the append-only seq chain and the host then refuses to open the session (2026-10-21: 10 sessions corrupt). Nothing was changed.",
+                );
+                process.exit(2);
+            }
             if (restoreAll) {
                 const root = restoreRoot ?? join(homedir(), ".dsh", "sessions");
-                const scan = runDshRestoreAll(root, {
-                    write: restoreWrite,
-                    minIdleMs: restoreMinIdleMin !== undefined ? restoreMinIdleMin * 60_000 : undefined,
-                    allowGaps: restoreAllowGaps,
-                });
-                process.stdout.write(jsonOutput ? JSON.stringify(scan) + "\n" : renderDshRestoreScanReport(scan));
-                if (scan.errors > 0) process.exit(1);
+                const audit = auditDshSessions(root);
+                process.stdout.write(jsonOutput ? JSON.stringify(audit) + "\n" : renderDshAuditReport(audit));
+                if (audit.corrupt > 0 || audit.errors > 0) process.exit(1);
                 return;
             }
             if (restoreTarget === undefined) {
-                console.error("bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--write] [--json]");
+                console.error("bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--json]   (read-only audit)");
+                console.error("             bili restore --all [--root <dir>]                                              (audit every session)");
                 process.exit(2);
             }
-            const result = runDshRestoreFile(restoreTarget, { write: restoreWrite, allowGaps: restoreAllowGaps });
-            process.stdout.write(jsonOutput ? JSON.stringify(result) + "\n" : renderDshRestoreReport(result));
+            const check = checkDshSessionLog(resolveDshSessionLogPath(restoreTarget));
+            const status: "ok" | "compacted" | "corrupt" = check.gap !== null ? "corrupt" : check.compactionEvents > 0 ? "compacted" : "ok";
+            const entry = { path: restoreTarget, status, check };
+            process.stdout.write(
+                jsonOutput
+                    ? JSON.stringify(entry) + "\n"
+                    : renderDshAuditReport({
+                          root: restoreTarget,
+                          scanned: 1,
+                          ok: status === "ok" ? 1 : 0,
+                          compacted: status === "compacted" ? 1 : 0,
+                          corrupt: status === "corrupt" ? 1 : 0,
+                          errors: 0,
+                          entries: [entry],
+                      }),
+            );
+            if (status === "corrupt") process.exit(1);
         } catch (error) {
             const code = error instanceof DshRestoreError && (error.code === "nothing-to-do" || error.code === "unparseable") ? 2 : 1;
             console.error(`bili restore: ${error instanceof Error ? error.message : String(error)}`);
