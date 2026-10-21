@@ -296,7 +296,12 @@ export type ParsedStreamEvent =
     // dropped there, the rebuilt history loses the signature association.
     | { kind: "standalone_signature"; signature: string }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
+    // #4072: cacheCreation carries the upstream's cache_creation breakdown
+    // object (e.g. { ephemeral_5m_input_tokens }) verbatim — Anthropic puts it
+    // in message_start, which the anthropic adapter forwards usage-neutral
+    // (#1315), so only the synthetic terminal can deliver it to hosts that
+    // derive their prompt-cache TTL from the breakdown.
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; cacheCreation?: Record<string, unknown> }
     // #1766: keys on the upstream terminal frame that bili does not model
     // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
     // a synthetic completion, so anything not carried here vanishes from the
@@ -317,7 +322,7 @@ export type ParsedStreamEvent =
 
 export interface EmitCompletionOpts {
     finishReason?: string;
-    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number };
+    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; cacheCreation?: Record<string, unknown> };
     terminalExtra?: Record<string, unknown>;
 }
 
@@ -691,7 +696,7 @@ export async function* runCompressLoop(
             const roundParts: RoundPart[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; cacheCreation?: Record<string, unknown> } = {};
             let finishReason: string | undefined;
             let streamError: string | undefined;
             let sawDone = false;
@@ -816,6 +821,7 @@ export async function* runCompressLoop(
                             outputTokens: ev.outputTokens,
                             cachedTokens: ev.cachedTokens,
                             creationTokens: ev.creationTokens,
+                            cacheCreation: ev.cacheCreation,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;
