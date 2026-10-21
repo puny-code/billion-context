@@ -104,6 +104,47 @@ test("F8: the refusal warning is one-shot per session", () => {
     assert.deepEqual(otherLogged, ["warn"]);
 });
 
+test("F8: a small-but-legal bound is WRITTEN, not refused (the death-rattle band)", () => {
+    // W=1,048,576, input 970,000 -> margin 48,500 -> bound 30,076. This is a
+    // legal budget: input+bound+margin == window, and #453's clamp accepts
+    // anything >= its 1024 surrender line. Refusing it would keep max_tokens=1,
+    // which cannot self-heal (a 1-token reservation never starts a fold, so the
+    // same bound recurs every turn).
+    const parsed = starvedBody();
+    const session = freshSession({ nativeContextLimit: 1_048_576 }, { localInputEstimate: 970_000 });
+    restoreOutputBudget(parsed, session, () => {}, 384_000);
+    assert.equal(parsed.max_tokens, 30_076, "a bound inside the band must be written");
+});
+
+test("F8: the refusal line is the clamp's 1024, pinned on both sides", () => {
+    // bound == 1024 exactly: write it.
+    //   1,048,576 - 997,668 - 49,884 = 1,024
+    _resetRestoreRefusedForTest();
+    const atFloor = starvedBody();
+    restoreOutputBudget(atFloor, freshSession({ nativeContextLimit: 1_048_576 }, { localInputEstimate: 997_668 }), () => {}, 384_000);
+    assert.equal(atFloor.max_tokens, 1_024, "1024 is a legal budget (#453's own floor), so it must be written");
+    // bound == 1023: below it, refuse (the client keeps its starvation).
+    const belowFloor = starvedBody();
+    const logged: string[] = [];
+    restoreOutputBudget(
+        belowFloor,
+        { ...freshSession({ nativeContextLimit: 1_048_576 }, { localInputEstimate: 997_669 }), id: "f8-floor" },
+        (level: string) => { logged.push(level); },
+        384_000,
+    );
+    assert.equal(belowFloor.max_tokens, 1, "below the clamp's floor there is nothing safe to write");
+    assert.deepEqual(logged, ["warn"]);
+});
+
+test("F8: a session's own smaller proven budget is never refused", () => {
+    // #3406 high-water 8,000 (above the clamp floor, below the old 32,768 line):
+    // the fence must not replace a value the provider already accepted.
+    const parsed = starvedBody();
+    const session = freshSession({ nativeContextLimit: 1_048_576, outputBudgetHighWater: 8_000 }, { localInputEstimate: 970_000 });
+    restoreOutputBudget(parsed, session, () => {});
+    assert.equal(parsed.max_tokens, 8_000, "the bound (30,076) is above the session's proven 8,000 -> untouched");
+});
+
 test("F8: no input bound and no native window -> pre-F8 behavior is preserved", () => {
     // Callers that pass a bare { id, metadata } session (e.g. the #3833 suite)
     // must keep the old restore exactly: the fence degrades to a no-op.

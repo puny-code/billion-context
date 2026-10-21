@@ -338,6 +338,12 @@ const OUTPUT_HIGH_WATER_TRUST_MIN = 4096;
 // the numbers are restated here and must stay in step).
 const OUTPUT_RESTORE_MARGIN_PCT = 0.05;
 const OUTPUT_RESTORE_MIN_MARGIN = 2048;
+/** The downstream clamp's surrender line (`OUTPUT_CLAMP_FLOOR`, budget.ts):
+ *  below it the #453 clamp refuses to write anything, so a restore landing there
+ *  would be fighting it. At/above it the value is legal and safe — input + bound
+ *  + margin == window by construction. It is NOT #3071's 32,768: that floor is
+ *  the capability target for a restore, not a legality line for the write. */
+const OUTPUT_RESTORE_LEGAL_FLOOR = 1024;
 
 /** F8: bound a restore target by the INPUT side. restoreOutputBudget restores
  *  the client's output budget up to a capability ceiling with no regard for how
@@ -574,18 +580,19 @@ export function restoreOutputBudget(
         // keep the client's starvation (recoverable) instead of writing a value
         // that guarantees an over-window rejection (no body to inspect).
         const bounded = boundRestoreTargetByInput(target, session);
-        // Refuse only when the INPUT bound is what limits the restore and what it
-        // leaves cannot reach the DOCUMENTED absolute floor (32,768, #3071): a
-        // sub-floor value is the death-rattle zone (too small to emit a compress
-        // call), so keeping the client's own (recoverable) starvation is the
-        // honest choice. A target BELOW the bound is not this fence's business
-        // — that is the session's own proven high-water (#3406), and shrinking or
-        // refusing it would re-introduce #3406. One warn per session: the same
-        // estimate keeps producing the same refusal, and a later fold may free
-        // the room.
-        if (bounded.window !== undefined && bounded.target < target && bounded.target < OUTPUT_RESTORE_ABSOLUTE_FLOOR) {
+        // Refuse only when the INPUT bound is what limits the restore AND what it
+        // leaves is below the downstream clamp's own surrender line (1024 —
+        // `OUTPUT_CLAMP_FLOOR` in budget.ts, restated here for the same reason
+        // the margin constants above are). A value at/above that line is a real,
+        // safe budget: `input + bound + margin = window` by construction, so it
+        // composes with the #453 clamp instead of fighting it; refusing it would
+        // keep the client's `max_tokens: 1`, which cannot self-heal (a 1-token
+        // reservation never starts a fold, so the same bound recurs every turn).
+        // Note the smaller number matters, not #3071's 32,768: that floor is the
+        // capability target for a restore, not a legality line for the write.
+        if (bounded.window !== undefined && bounded.target < target && bounded.target < OUTPUT_RESTORE_LEGAL_FLOOR) {
             if (noteRestoreRefused(session.id)) {
-                log("warn", `[${session.id}] output budget restore REFUSED ${value} -> (would have been ${target}, bound ${bounded.target}): the input side fills the window (window ${bounded.window} - input upper bound ${bounded.inputUpperBound} - margin ${bounded.margin}), below the ${OUTPUT_RESTORE_ABSOLUTE_FLOOR}-token capability floor — keeping the client's ${value} (#F8)`);
+                log("warn", `[${session.id}] output budget restore REFUSED ${value} -> (would have been ${target}, bound ${bounded.target}): the input side fills the window (window ${bounded.window} - input upper bound ${bounded.inputUpperBound} - margin ${bounded.margin}), below the ${OUTPUT_RESTORE_LEGAL_FLOOR}-token legality floor — keeping the client's ${value} (#F8)`);
             }
             return;
         }
