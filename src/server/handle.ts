@@ -33,7 +33,7 @@ import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHos
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
-import { personaConversationOrder } from "../session-resolve.js";
+import { identityDecisionNote, personaConversationResolution } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork, maybeRecoverFoldsFromSibling } from "../fork-adoption.js";
@@ -990,6 +990,20 @@ async function handleRequest(
               : protocol === "google"
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
+        // F2: the request path keeps only the resolver's key. The two verdicts
+        // that can strand a conversation's fold ledger on a lane the next
+        // request never visits — `reanchor` (fold pointer moves) and an
+        // order/persona fork (new lane with 0 blocks) — used to be invisible
+        // (2026-10-21 incident: the main lane's 86 blocks stayed under
+        // `|sub:…` while the request path re-claimed the empty raw record).
+        // Routine claim/continue and the one-blob reviewer probes stay silent.
+        const identityKey = (rawId: string, history: unknown, tag: string): string => {
+            const resolution = personaConversationResolution(rawId, history, tag, pluginReportedModel(req.headers));
+            const cells = Array.isArray(history) ? history.length : 0;
+            const note = identityDecisionNote(rawId, resolution, cells);
+            if (note !== null) log("info", note);
+            return resolution.key;
+        };
         const conversation = protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
@@ -1004,11 +1018,10 @@ async function handleRequest(
             ? (dshPersona && !sideRequestLike
                 ? (personaSystemText === ""
                       ? (googleIdentity?.value ?? googleSignal)
-                      : personaConversationOrder(
+                      : identityKey(
                           googleIdentity?.value ?? googleSignal,
                           (parsed as GoogleRequestBody).contents,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
                       ))
                 : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1033,20 +1046,18 @@ async function handleRequest(
                           // empty-tag traffic through the order resolver
                           // (codex turn-1 shape keys by its session header).
                           ? (anthropicIdentity?.value ?? anthropicSignal)
-                          : personaConversationOrder(
+                          : identityKey(
                               anthropicIdentity?.value ?? anthropicSignal,
                               (parsed as AnthropicRequestBody).messages,
                               personaSystemText,
-                              pluginReportedModel(req.headers),
                           ))
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
               ? (dshPersona && !sideRequestLike && personaSystemText !== ""
-                    ? personaConversationOrder(
+                    ? identityKey(
                           openaiIdentity?.value ?? openaiSignal,
                           (parsed as OpenAIRequestBody).messages,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1064,11 +1075,10 @@ async function handleRequest(
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
                    // Empty instructions = non-anchoring (verbatim id).
-                    ? personaConversationOrder(
+                    ? identityKey(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                           (parsed as ResponsesRequestBody).input,
                           (parsed as ResponsesRequestBody).instructions ?? "",
-                          pluginReportedModel(req.headers),
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1104,11 +1114,10 @@ async function handleRequest(
                             // verbatim id (codex turn-1 / metadata-less roots).
                             ((parsed as ResponsesRequestBody).instructions ?? "") === ""
                               ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
-                              : personaConversationOrder(
+                              : identityKey(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                                 (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
-                                pluginReportedModel(req.headers),
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
