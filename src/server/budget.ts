@@ -193,6 +193,23 @@ export function responsesSysDevItemText(item: Record<string, unknown>): string {
     return "";
 }
 
+/** Serialized wire-payload size in bytes, representation-independent (a re-sent
+ *  body may come back as a Buffer where the original was a string and vice
+ *  versa, so comparing the two representations directly is meaningless). */
+export function wireBodyBytes(body: string | Buffer): number {
+    return typeof body === "string" ? Buffer.byteLength(body, "utf8") : body.byteLength;
+}
+
+/** overflow-refold-noop: a refold that does not materially shrink the payload is not a retry —
+ *  it re-sends, in substance byte for byte, the request the upstream just
+ *  rejected. Anything under this reduction counts as "nothing foldable". */
+export const OVERFLOW_REFOLD_MIN_SHRINK_PCT = 0.02;
+
+export function refoldShrank(previousBytes: number, nextBytes: number): boolean {
+    if (previousBytes <= 0) return false;
+    return nextBytes <= previousBytes * (1 - OVERFLOW_REFOLD_MIN_SHRINK_PCT);
+}
+
 /** #470: tokens the wire payload carries OUTSIDE the message array —
  * system/instructions text and tool definitions (including the proxy-injected
  * ACP tools). estimateCoreMessages only counts messages, so without this term

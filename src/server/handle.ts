@@ -52,6 +52,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
+import { OVERFLOW_REFOLD_MIN_SHRINK_PCT, refoldShrank, wireBodyBytes } from "./budget.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
@@ -2623,8 +2624,20 @@ async function handleRequest(
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
+                          const previousBytes = wireBodyBytes(pendingForward.body);
                           const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
-                          if (!next || String(next.body) === String(pendingForward.body)) return null;
+                          if (!next) return null;
+                          const nextBytes = wireBodyBytes(next.body);
+                          // overflow-refold-noop: the body can differ byte-wise from the rejected one
+                          // merely because fold-reconcile re-anchored covered ids —
+                          // nothing folded. Re-sending it at the same size is not a
+                          // retry, it is the identical doomed request again (billed
+                          // twice, and the client waits out its whole timeout). Only a
+                          // material shrink earns a resend.
+                          if (!refoldShrank(previousBytes, nextBytes)) {
+                              log("warn", `[${session.id}] overflow refold produced no material shrink (${previousBytes} -> ${nextBytes} bytes, need <= ${Math.round((1 - OVERFLOW_REFOLD_MIN_SHRINK_PCT) * 100)}% of the rejected size) — not re-sending the payload the upstream just rejected; the armed overflow baseline folds the next request first`);
+                              return null;
+                          }
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
                           return next;
