@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
@@ -53,6 +53,9 @@ export interface DshSessionRecord {
 
 export interface DshRestoreReport {
     records: number;
+    /** Shadowed seqs whose event is absent from the log (only non-zero in
+     *  --allow-gaps mode: nothing can restore those, the rest is still un-shadowed). */
+    missingShadowed?: number;
     events: number;
     droppedCompactionEvents: number;
     droppedCheckpointMessages: number;
@@ -156,7 +159,7 @@ export interface DshRestorePlan {
 }
 
 /** Decide which events survive. Pure: no I/O, no mutation of the input. */
-export function planDshRestore(records: readonly DshSessionRecord[]): DshRestorePlan {
+export function planDshRestore(records: readonly DshSessionRecord[], opts?: { allowGaps?: boolean }): DshRestorePlan {
     const all = records.flatMap((r) => r.events);
     if (!all.some((e) => typeof e.type === "string" && e.type.startsWith("compaction/"))) {
         throw new DshRestoreError("no compaction events in this log — nothing to restore", "nothing-to-do");
@@ -196,7 +199,7 @@ export function planDshRestore(records: readonly DshSessionRecord[]): DshRestore
     const missing = [...shadowedSeqs].filter((s) => !keptSeqs.has(s));
     const before = all.filter((e) => typeof e.type === "string" && MESSAGE_TYPES.has(e.type)).length;
     const after = keptEvents.filter((e) => typeof e.type === "string" && MESSAGE_TYPES.has(e.type)).length;
-    if (missing.length > 0) {
+    if (missing.length > 0 && opts?.allowGaps !== true) {
         throw new DshRestoreError(
             `${missing.length} shadowed message(s) have no surviving event (e.g. seq ${missing.slice(0, 3).join(", ")}) — restoring would still lose data`,
             "unsafe",
@@ -212,6 +215,7 @@ export function planDshRestore(records: readonly DshSessionRecord[]): DshRestore
         shadowedTokens,
         report: {
             records: records.length,
+            missingShadowed: missing.length,
             events: all.length,
             droppedCompactionEvents: all.filter((e) => typeof e.type === "string" && DROP_TYPES.has(e.type)).length,
             droppedCheckpointMessages: checkpointSeqs.size,
@@ -231,9 +235,9 @@ export interface DshRestoreResult {
 
 /** Build the restored log. A frame none of whose events was dropped is copied
  *  verbatim; a frame that loses events is re-encoded from its survivors. */
-export function restoreDshSessionBuffer(buffer: Buffer): DshRestoreResult {
+export function restoreDshSessionBuffer(buffer: Buffer, opts?: { allowGaps?: boolean }): DshRestoreResult {
     const records = readDshSessionRecords(buffer);
-    const plan = planDshRestore(records);
+    const plan = planDshRestore(records, opts);
     const compressed = isZstd(buffer);
     const parts: Buffer[] = [];
     for (const record of records) {
@@ -277,16 +281,20 @@ export function resolveSessionLogPath(target: string): string {
 
 /** Offline restore of one session file/directory. Never writes unless `write`
  *  is set; when it does, a timestamped backup is written first. */
-export function runDshRestoreFile(target: string, opts?: { write?: boolean; dryRun?: boolean }): DshRestoreFileResult {
+export function runDshRestoreFile(target: string, opts?: { write?: boolean; dryRun?: boolean; allowGaps?: boolean }): DshRestoreFileResult {
     const input = resolveSessionLogPath(target);
     const buffer = readFileSync(input);
-    const { output, report } = restoreDshSessionBuffer(buffer);
+    const { output, report } = restoreDshSessionBuffer(buffer, { allowGaps: opts?.allowGaps });
     const dryRun = opts?.dryRun === true || opts?.write !== true;
     if (dryRun) return { input, outputPath: null, backupPath: null, report, dryRun: true };
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backupPath = `${input}.bak-${stamp}`;
     copyFileSync(input, backupPath);
-    writeFileSync(input, output);
+    // Atomic replace: a writer holding the old handle keeps a valid (unlinked)
+    // inode instead of observing a truncated file mid-write.
+    const tmpPath = `${input}.restore-tmp-${process.pid}`;
+    writeFileSync(tmpPath, output);
+    renameSync(tmpPath, input);
     return { input, outputPath: input, backupPath, report, dryRun: false };
 }
 
@@ -298,6 +306,7 @@ export function renderDshRestoreReport(result: DshRestoreFileResult): string {
         `events: ${r.events} -> ${r.events - r.droppedCompactionEvents - r.droppedCheckpointMessages} (dropped ${r.droppedCompactionEvents} compaction event(s) + ${r.droppedCheckpointMessages} injected checkpoint message(s))`,
         `un-shadowed: ${r.shadowedSeqs} message(s), ~${r.shadowedTokens} token(s)`,
         `message events: ${r.messageEventsBefore} -> ${r.messageEventsAfter} (the checkpoint is generated content, not history)`,
+        ...(r.missingShadowed ? [`gaps: ${r.missingShadowed} shadowed message(s) are absent from the log itself — nothing can restore those; the rest is un-shadowed`] : []),
         result.dryRun ? "dry-run: nothing written (pass --write to restore in place)" : `written in place; backup: ${result.backupPath}`,
     ];
     return `${lines.join("\n")}\n`;
@@ -305,4 +314,154 @@ export function renderDshRestoreReport(result: DshRestoreFileResult): string {
 
 export function defaultRestoredPath(input: string): string {
     return join(dirname(input), `${basename(input)}.restored.jsonl`);
+}
+
+// ── Fleet restore (--all) ────────────────────────────────────────────────────
+//
+// Uninstalling bili hands DSH's native compaction back to the client, so the
+// damage is not one session: every long session the user touched after the
+// plugin left can carry its own `compaction/*` block. The single-file command
+// therefore grows a fleet mode that scans the whole session tree and repairs
+// what is safely repairable WITHOUT asking the user to hunt directories.
+//
+// Only sessions idle for at least RECENT_IDLE_MS are touched: a session DSH may
+// still hold open is skipped (its next append/reload would race the rewrite),
+// and it becomes eligible automatically once it has been quiet that long.
+
+/** A session must be quiet this long before the fleet restore writes to it. */
+const RESTORE_RECENT_IDLE_MS = 30 * 60 * 1000;
+
+export interface DshRestoreScanEntry {
+    path: string;
+    /** "healthy" | "damaged" | "fixed" | "skipped-recent" | "error" */
+    status: "healthy" | "damaged" | "fixed" | "skipped-recent" | "error";
+    report?: DshRestoreReport;
+    backupPath?: string | null;
+    error?: string;
+    idleMinutes: number;
+}
+
+export interface DshRestoreScanResult {
+    root: string;
+    scanned: number;
+    healthy: number;
+    damaged: number;
+    fixed: number;
+    skippedRecent: number;
+    errors: number;
+    entries: DshRestoreScanEntry[];
+    dryRun: boolean;
+}
+
+/** Every session log under `root` (`.jsonl.zstd` live form preferred). */
+export function findDshSessionLogs(root: string): string[] {
+    const out: string[] = [];
+    const walk = (dir: string, depth: number): void => {
+        if (depth > 4) return;
+        let entries: string[];
+        try {
+            entries = readdirSync(dir);
+        } catch {
+            return;
+        }
+        for (const name of entries) {
+            const full = join(dir, name);
+            let isDir = false;
+            try {
+                isDir = statSync(full).isDirectory();
+            } catch {
+                continue;
+            }
+            if (isDir) {
+                walk(full, depth + 1);
+                continue;
+            }
+            if (name === "session.v4.jsonl.zstd" || name === "session.v4.jsonl") out.push(full);
+        }
+    };
+    if (!existsSync(root)) throw new DshRestoreError(`no such sessions root: ${root}`, "io");
+    walk(root, 0);
+    return out.sort();
+}
+
+/** Scan (and with `write`, repair) every session under `root`.
+ *  Default: dry-run, skip sessions touched in the last `minIdleMs`. */
+export function runDshRestoreAll(root: string, opts?: { write?: boolean; minIdleMs?: number; now?: number; allowGaps?: boolean }): DshRestoreScanResult {
+    const write = opts?.write === true;
+    const minIdleMs = opts?.minIdleMs ?? RESTORE_RECENT_IDLE_MS;
+    const now = opts?.now ?? Date.now();
+    const logs = findDshSessionLogs(root);
+    const entries: DshRestoreScanEntry[] = [];
+    for (const log of logs) {
+        let idleMinutes = 0;
+        try {
+            idleMinutes = Math.round((now - statSync(log).mtimeMs) / 60000);
+        } catch {
+            idleMinutes = 0;
+        }
+        let buffer: Buffer;
+        try {
+            buffer = readFileSync(log);
+        } catch (e) {
+            entries.push({ path: log, status: "error", error: `cannot read: ${e instanceof Error ? e.message : String(e)}`, idleMinutes });
+            continue;
+        }
+        let restored: ReturnType<typeof restoreDshSessionBuffer>;
+        try {
+            restored = restoreDshSessionBuffer(buffer, { allowGaps: opts?.allowGaps });
+        } catch (e) {
+            if (e instanceof DshRestoreError && e.code === "nothing-to-do") {
+                entries.push({ path: log, status: "healthy", idleMinutes });
+                continue;
+            }
+            entries.push({ path: log, status: "error", error: e instanceof Error ? e.message : String(e), idleMinutes });
+            continue;
+        }
+        if (!write) {
+            entries.push({ path: log, status: "damaged", report: restored.report, idleMinutes });
+            continue;
+        }
+        if (idleMinutes * 60000 < minIdleMs) {
+            entries.push({ path: log, status: "skipped-recent", report: restored.report, idleMinutes });
+            continue;
+        }
+        const stamp = new Date(now).toISOString().replace(/[:.]/g, "-");
+        const backupPath = `${log}.bak-${stamp}`;
+        try {
+            copyFileSync(log, backupPath);
+            const tmpPath = `${log}.restore-tmp-${process.pid}`;
+            writeFileSync(tmpPath, restored.output);
+            renameSync(tmpPath, log);
+        } catch (e) {
+            entries.push({ path: log, status: "error", error: `write failed: ${e instanceof Error ? e.message : String(e)}`, idleMinutes });
+            continue;
+        }
+        entries.push({ path: log, status: "fixed", report: restored.report, backupPath, idleMinutes });
+    }
+    return {
+        root,
+        scanned: entries.length,
+        healthy: entries.filter((e) => e.status === "healthy").length,
+        damaged: entries.filter((e) => e.status === "damaged").length,
+        fixed: entries.filter((e) => e.status === "fixed").length,
+        skippedRecent: entries.filter((e) => e.status === "skipped-recent").length,
+        errors: entries.filter((e) => e.status === "error").length,
+        entries,
+        dryRun: !write,
+    };
+}
+
+export function renderDshRestoreScanReport(result: DshRestoreScanResult): string {
+    const lines = [
+        `sessions root: ${result.root}`,
+        `scanned ${result.scanned}: healthy ${result.healthy}, damaged ${result.damaged}, fixed ${result.fixed}, skipped-recent ${result.skippedRecent}, errors ${result.errors}`,
+    ];
+    for (const e of result.entries) {
+        if (e.status === "healthy") continue;
+        const gap = e.report?.missingShadowed ? `, ${e.report.missingShadowed} unrecoverable gap(s)` : "";
+        const why = e.report ? `${e.report.shadowedSeqs} msg / ~${e.report.shadowedTokens} tok${gap}` : (e.error ?? "");
+        lines.push(`  [${e.status}] ${e.path} (idle ${e.idleMinutes}m) — ${why}`);
+    }
+    if (result.dryRun) lines.push("dry-run: nothing written (pass --write to repair every eligible session)");
+    return `${lines.join("\n")}\n`;
 }

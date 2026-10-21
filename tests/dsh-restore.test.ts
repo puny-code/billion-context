@@ -8,9 +8,10 @@ import {
     readDshSessionRecords,
     restoreDshSessionBuffer,
     resolveSessionLogPath,
+    runDshRestoreAll,
     runDshRestoreFile,
 } from "../src/dsh-restore.ts";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmrf } from "./tmp-rm.ts";
@@ -126,5 +127,50 @@ test("#4046 restore file runner: dry-run writes nothing, write mode backs up fir
         assert.ok(!readFileSync(file).toString("utf8").includes("compaction/"), "the live file is restored");
     } finally {
         rmrf(dir);
+    }
+});
+
+test("#4046 restore --all: scans the tree, repairs idle sessions, skips the ones still in use", () => {
+    const root = mkdtempSync(join(tmpdir(), "bili-restore-all-"));
+    try {
+        const make = (name: string, damaged: boolean, ageMin: number): string => {
+            const dir = join(root, name);
+            mkdirSync(dir, { recursive: true });
+            const file = join(dir, "session.v4.jsonl");
+            const events = damaged ? base : base.filter((e) => !e.type.startsWith("compaction/") && e.seq !== 12);
+            writeFileSync(file, log(events));
+            const when = new Date(Date.now() - ageMin * 60_000);
+            utimesSync(file, when, when);
+            return file;
+        };
+        const old = make("old-damaged", true, 120);
+        const recent = make("recent-damaged", true, 1);
+        const healthy = make("healthy", false, 120);
+
+        const dry = runDshRestoreAll(root);
+        assert.equal(dry.scanned, 3);
+        assert.equal(dry.healthy, 1);
+        assert.equal(dry.damaged, 2);
+        assert.equal(dry.fixed, 0);
+        assert.equal(dry.dryRun, true);
+        assert.ok(readFileSync(old, "utf8").includes("compaction/"), "dry-run must not touch files");
+
+        const run = runDshRestoreAll(root, { write: true, minIdleMs: 30 * 60_000 });
+        assert.equal(run.fixed, 1, "the 2h-idle session is repaired");
+        assert.equal(run.skippedRecent, 1, "the 1m-idle session is left alone (DSH may hold it open)");
+        assert.ok(!readFileSync(old, "utf8").includes("compaction/"));
+        assert.ok(run.entries.find((e) => e.path === old)?.backupPath !== undefined, "every write is backed up");
+        assert.ok(readFileSync(recent, "utf8").includes("compaction/"), "the recent session is untouched");
+        assert.ok(readFileSync(healthy, "utf8").includes("assistant/message"), "a healthy log is never rewritten");
+
+        // Second pass after the recent one has aged: nothing else to do.
+        const again = runDshRestoreAll(root, { write: true, minIdleMs: 0 });
+        assert.equal(again.fixed, 1, "the recent one becomes eligible and is fixed");
+        const third = runDshRestoreAll(root, { write: true, minIdleMs: 0 });
+        assert.equal(third.fixed, 0);
+        assert.equal(third.healthy, 3);
+        assert.equal(third.damaged, 0);
+    } finally {
+        rmrf(root);
     }
 });

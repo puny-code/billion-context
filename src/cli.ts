@@ -35,11 +35,13 @@ import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
-import { DshRestoreError, renderDshRestoreReport, runDshRestoreFile } from "./dsh-restore.js";
+import { DshRestoreError, renderDshRestoreReport, renderDshRestoreScanReport, runDshRestoreAll, runDshRestoreFile } from "./dsh-restore.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
@@ -202,6 +204,10 @@ type Parsed = {
     sessionsNoVacuum?: boolean;
     restoreTarget?: string;
     restoreWrite?: boolean;
+    restoreAll?: boolean;
+    restoreRoot?: string;
+    restoreMinIdleMin?: number;
+    restoreAllowGaps?: boolean;
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
@@ -234,6 +240,10 @@ export function parseArgs(argv: string[]): Parsed {
     let sessionsNoVacuum = false;
     let restoreTarget: string | undefined;
     let restoreWrite = false;
+    let restoreAll = false;
+    let restoreRoot: string | undefined;
+    let restoreMinIdleMin: number | undefined;
+    let restoreAllowGaps = false;
     let storageDays: number | undefined;
     let storageVacuum: Parsed["storageVacuum"];
     let storageDryRun = false;
@@ -309,6 +319,32 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--fix":
                 doctorFix = true;
+                break;
+            case "--all":
+                restoreAll = true;
+                break;
+            case "--root": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error("bili: --root requires a value");
+                    process.exit(2);
+                }
+                restoreRoot = val;
+                break;
+            }
+            case "--min-idle-min": {
+                const val = argv[++i];
+                if (val === undefined || !Number.isFinite(Number(val))) {
+                    console.error("bili: --min-idle-min requires a number");
+                    process.exit(2);
+                }
+                restoreMinIdleMin = Number(val);
+                break;
+            }
+            case "--allow-gaps":
+                // Repairs a session whose log itself lost some shadowed events
+                // (nothing can bring those back) instead of refusing the rest.
+                restoreAllowGaps = true;
                 break;
             case "--write":
                 // bili restore: rewrite the log in place (after a timestamped
@@ -494,8 +530,9 @@ export function parseArgs(argv: string[]): Parsed {
             // NATIVE compaction collapsed. Standalone (no proxy, no store).
             command = "restore";
             restoreTarget = positional[1];
-            if (restoreTarget === undefined) {
+            if (restoreTarget === undefined && !restoreAll) {
                 console.error('bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--write] [--json]');
+                console.error('             bili restore --all [--write] [--root <dir>] [--min-idle-min N]   # whole DSH session tree');
                 process.exit(2);
             }
         } else {
@@ -504,11 +541,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite, restoreAll, restoreRoot, restoreMinIdleMin, restoreAllowGaps };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite, restoreAll, restoreRoot, restoreMinIdleMin, restoreAllowGaps } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -636,11 +673,22 @@ export async function main(): Promise<void> {
         // no proxy, no store — it reads the log and (with --write) rewrites it
         // after a timestamped backup. Default is a dry-run.
         try {
+            if (restoreAll) {
+                const root = restoreRoot ?? join(homedir(), ".dsh", "sessions");
+                const scan = runDshRestoreAll(root, {
+                    write: restoreWrite,
+                    minIdleMs: restoreMinIdleMin !== undefined ? restoreMinIdleMin * 60_000 : undefined,
+                    allowGaps: restoreAllowGaps,
+                });
+                process.stdout.write(jsonOutput ? JSON.stringify(scan) + "\n" : renderDshRestoreScanReport(scan));
+                if (scan.errors > 0) process.exit(1);
+                return;
+            }
             if (restoreTarget === undefined) {
                 console.error("bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--write] [--json]");
                 process.exit(2);
             }
-            const result = runDshRestoreFile(restoreTarget, { write: restoreWrite });
+            const result = runDshRestoreFile(restoreTarget, { write: restoreWrite, allowGaps: restoreAllowGaps });
             process.stdout.write(jsonOutput ? JSON.stringify(result) + "\n" : renderDshRestoreReport(result));
         } catch (error) {
             const code = error instanceof DshRestoreError && (error.code === "nothing-to-do" || error.code === "unparseable") ? 2 : 1;
