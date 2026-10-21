@@ -266,8 +266,38 @@ test("#4059 anthropic: read error after forwarded message_stop → exactly one m
 
 test("#4059 anthropic contrast: stop_reason delivered but message_stop lost → message_stop still synthesized", async () => {
     const out: string[] = [];
-    await pipePluginChatWithStrip(streamOf(anthropicFrames(false), "error"), makeRes(out), "anthropic", makeSession({ pluginAgent: "dsh" }));
+    await pipePluginChatWithStrip(streamOf(anthropicFrames(false), "error"), makeRes(out), "anthropic", makeSession({ pluginAgent: "dsh" }), logLine);
     const wire = out.join("");
     assert.equal((wire.match(/"type":"message_stop"/g) ?? []).length, 1, "synthesized terminal byte preserved");
     assert.ok(!wire.includes("upstream_stream_truncated"), "finished=true stays silent-completion, not an error");
+});
+
+// #4059 review supplement: the google wire's terminator IS its finish-reason
+// chunk — pin both gate directions there too (pre-fix, a post-terminator read
+// error logged the misleading "truncation signal path" line and built a diag
+// although no frame was ever appended).
+const gchunk = (c: Record<string, unknown>) => `data: ${JSON.stringify({ candidates: [c] })}\n\n`;
+
+test("#4059 google: read error after forwarded finish-reason chunk ends clean — no synthesized frame", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    await pipePluginChatWithStrip(
+        streamOf([gchunk({ content: { parts: [{ text: "hi" }] } }), gchunk({ content: { parts: [{}] }, finishReason: "STOP" })], "error"),
+        res,
+        "google",
+        makeSession({ pluginAgent: "dsh" }),
+    );
+    const wire = out.join("");
+    assert.ok(wire.includes('"finishReason":"STOP"'), "terminator chunk forwarded");
+    assert.ok(!wire.includes('"status":"UNAVAILABLE"'), "no synthesized UNAVAILABLE frame after the terminator");
+    assert.ok(!wire.includes("upstream_stream_truncated"), "no truncation signal after the terminator");
+    assert.ok(logs.some((l) => l.includes("terminal byte already forwarded")), "guarded catch branch logged");
+    assert.equal(res.endedCount, 1);
+});
+
+test("#4059 google contrast: cut BEFORE the finish-reason chunk keeps the UNAVAILABLE frame", async () => {
+    const out: string[] = [];
+    await pipePluginChatWithStrip(streamOf([gchunk({ content: { parts: [{ text: "hi" }] } })], "error"), makeRes(out), "google", makeSession({ pluginAgent: "dsh" }), logLine);
+    const wire = out.join("");
+    assert.ok(wire.includes('"status":"UNAVAILABLE"'), "mid-flight cut still signals");
 });
