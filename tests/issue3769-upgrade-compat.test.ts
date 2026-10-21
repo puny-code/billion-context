@@ -13,6 +13,12 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// This suite is a full-mode story by design (its own comments: "since the
+// #3818 full-mode default the index row IS the load path") — pin it so the
+// CI runner's legacy storage baseline preload cannot flip the lane and turn
+// the index-row load path into an un-probeable namespaced file (same
+// discipline as the storage family; explicit env beats the preload's ??=).
+process.env.BILI_STORAGE_UNIFIED = "full";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-upg-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";

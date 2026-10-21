@@ -16,6 +16,10 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// Full-mode story by design (header: records hydrate ONLY through the unified
+// index row) — pin it so the CI runner's legacy storage baseline preload
+// cannot flip the lane (explicit env beats the preload's ??=).
+process.env.BILI_STORAGE_UNIFIED = "full";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-pool-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
