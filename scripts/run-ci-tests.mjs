@@ -23,7 +23,8 @@
 // `error: 'test failed'` and zero subtests; NO reporter can surface an error
 // the child never emitted. On failure this runner therefore: captures exit
 // code + signal (previously discarded by an empty catch) plus a resource
-// snapshot (free/total mem, loadavg, node version, platform); detects the
+// snapshot (free/total mem, loadavg, free/total disk #4041, node version,
+// platform); detects the
 // swallowed shape (a top-level `not ok … *.test.ts` — successful files promote
 // their inner tests to top level by test name and never emit a file-level
 // entry); re-runs each such file in ISOLATION for attribution; then retries
@@ -45,7 +46,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
 import { classifyPhaseFailure, describeRetryOutcome } from "./ci-failure-shapes.mjs";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statfsSync } from "node:fs";
 import { freemem, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -204,9 +205,18 @@ function runNodeTest(files, concurrency, label) {
 
 function resourceSnapshot() {
     const mi = (n) => `${Math.round(n / 1048576)}MiB`;
+    // #4041: disk pressure is the other axis of the sqlite hydration flakes
+    // (ENOSPC in shard logs) — free/total mem alone cannot attribute it.
+    let disk = "disk=n/a";
+    try {
+        const s = statfsSync(root);
+        const gib = (n) => (n / 1073741824).toFixed(2);
+        disk = `diskfree=${gib(s.bavail * s.bsize)}GiB disktotal=${gib(s.blocks * s.bsize)}GiB`;
+    } catch { /* statfs unsupported or unstatable: keep the rest of the snapshot */ }
     return (
         `freemem=${mi(freemem())} totalmem=${mi(totalmem())} ` +
         `loadavg=${loadavg().map((x) => x.toFixed(2)).join("/")} ` +
+        `${disk} ` +
         `node=${process.version} platform=${process.platform}/${process.arch}`
     );
 }
