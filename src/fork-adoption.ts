@@ -723,19 +723,26 @@ export function foldRecoveryConflict(session: Session, plan: ForkAdoptionPlan): 
  *  along — but `adoptContentStore` swaps the whole store, and a cross-lane
  *  target (unlike a fresh fork) already owns originals of its own (its deleted
  *  blocks keep their content, #2695). Handing the donor slice over alone would
- *  DELETE those entries and rewrite the sidecar on the next save. First write
- *  wins per ref: the lane's own entries stay authoritative, the donor fills the
- *  rest. Returns null when there is nothing to adopt at all. */
+ *  DELETE those entries and rewrite the sidecar on the next save.
+ *
+ *  Precedence is per ref and BINDING-AWARE: the lane's own entry wins only while
+ *  its ref still points at that same message (`isLiveOwnEntry`). A pruned ref
+ *  (#4046 dead refs) leaves a stale entry behind with no live binding; letting
+ *  it win would make applyRetrieve(ref) hand back the OLD message while the
+ *  adopted block cites the donor's — a wrong-original bug, worse than a miss.
+ *  Returns null when there is nothing to adopt at all. */
 export function mergeAdoptedContentStore(
     own: MessageContentStore | undefined,
     donorSlice: MessageContentStore | null,
+    isLiveOwnEntry: (ref: string, rawId: string) => boolean = () => true,
 ): MessageContentStore | null {
     if (!donorSlice) return own ?? null;
     if (!own) return donorSlice;
     const byRef: MessageContentStore["byRef"] = { ...own.byRef };
     const byHash: MessageContentStore["byHash"] = { ...own.byHash };
     for (const [ref, entry] of Object.entries(donorSlice.byRef)) {
-        if (ref in byRef) continue;
+        const existing = byRef[ref];
+        if (existing && isLiveOwnEntry(ref, existing.rawId)) continue;
         byRef[ref] = { ...entry };
         const text = donorSlice.byHash[entry.hash];
         if (text !== undefined && !(entry.hash in byHash)) byHash[entry.hash] = text;
@@ -815,7 +822,13 @@ export function recoverFoldsFromSibling(args: {
     // one statement wide (the block push is what marks the session dirty).
     const wanted = new Set(Object.keys(best.plan.refs.byRef));
     const donorSlice = cloneStoreForRefs(contentStoreOf(best.donor), wanted);
-    const mergedStore = mergeAdoptedContentStore(contentStoreOf(session), donorSlice);
+    // A ref's own original is authoritative only while its binding is live: a
+    // pruned ref keeps a stale entry whose raw id no longer maps to it.
+    const mergedStore = mergeAdoptedContentStore(
+        contentStoreOf(session),
+        donorSlice,
+        (ref, rawId) => session.state.messageRefs.byRef[ref] === rawId,
+    );
     applyForkAdoption(session, best.plan, best.donor);
     if (mergedStore !== null) adoptContentStore(session, mergedStore);
     session.metadata.foldRecoveredFrom = best.donor.id;
@@ -844,7 +857,12 @@ export function foldRecoveryGate(
     if (session.metadata.foldRecoveryTried === true) return { run: false, tries: 0 };
     const tries = typeof session.metadata.foldRecoveryTries === "number" ? session.metadata.foldRecoveryTries : 0;
     if (tries >= RECOVERY_MAX_TRIES) return { run: false, tries };
-    if (session.state.blocks.some((b) => b.active)) return { run: false, tries };
+    // A lane that owns blocks is healthy — UNLESS its last adoption was
+    // incomplete (a straddling plan proved the replay was a tail). Then the
+    // full replay is exactly the request that may finish the job.
+    if (session.state.blocks.some((b) => b.active) && session.metadata.foldRecoveryIncomplete !== true) {
+        return { run: false, tries };
+    }
     // Evidence gate: a lane that never served a request is not a husk — only a
     // giant first replay (a fork lane replaying the whole transcript) is worth a
     // scan there, and bytes are only ever a TRIGGER here, never a rejection.
@@ -905,7 +923,16 @@ export function maybeRecoverFoldsFromSibling(args: {
     }
     // Latch only on a COMPLETE adoption: a plan that straddles the replay's head
     // proved the replay is a tail, not the whole transcript — later turns may
-    // cover more blocks, so keep the bounded retries alive. A miss is retried
-    // for the same reason (the donor may not be saved yet).
-    if (result.adopted > 0 && result.straddled === 0) session.metadata.foldRecoveryTried = true;
+    // cover more blocks, so the lane is marked INCOMPLETE and keeps its bounded
+    // retries (the active-blocks gate would otherwise close the door for good the
+    // moment one block is adopted). A miss is retried for the same reason (the
+    // donor may not be saved yet).
+    if (result.adopted > 0) {
+        if (result.straddled === 0) {
+            session.metadata.foldRecoveryTried = true;
+            session.metadata.foldRecoveryIncomplete = false;
+        } else {
+            session.metadata.foldRecoveryIncomplete = true;
+        }
+    }
 }

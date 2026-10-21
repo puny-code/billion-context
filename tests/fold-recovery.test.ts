@@ -370,6 +370,38 @@ test("#4046 foldRecoveryGate refuses every non-replay shape and bounds the retri
     assert.deepEqual(foldRecoveryGate(lastChance, 40), { run: true, tries: 2 }, "the last allowed attempt still runs");
 });
 
+test("#4046 foldRecoveryGate: an INCOMPLETE adoption keeps the door open", () => {
+    // A straddling plan proves the replay was a tail; one adopted block must not
+    // close the gate for the full replay that arrives later.
+    const partial = fakeSession("conv-partial", [{ id: "b1", rawIds: ["raw1"], tokens: 10 }], ["raw1"]);
+    partial.metadata.foldRecoveryIncomplete = true;
+    partial.metadata.foldRecoveryTries = 1;
+    assert.equal(foldRecoveryGate(partial, 40).run, true, "an incomplete adoption may finish the job on the full replay");
+    const complete = fakeSession("conv-complete", [{ id: "b1", rawIds: ["raw1"], tokens: 10 }], ["raw1"]);
+    complete.metadata.foldRecoveryIncomplete = false;
+    assert.equal(foldRecoveryGate(complete, 40).run, false, "a complete ledger is healthy and never rescanned");
+});
+
+test("#4046 mergeAdoptedContentStore prefers the donor over a STALE own entry", () => {
+    // A pruned ref leaves an old entry behind with no live binding; if it kept
+    // winning, applyRetrieve(ref) would hand back the OLD message while the
+    // adopted block cites the donor's.
+    const own: MessageContentStore = {
+        version: 1,
+        byHash: { hOld: "ORIGINAL-OF-PRUNED-MESSAGE" },
+        byRef: { m00007: { hash: "hOld", kind: "text", tokens: 5, rawId: "rawOld", chars: 5, head: "OLD" } },
+    };
+    const donor: MessageContentStore = {
+        version: 1,
+        byHash: { hNew: "DONOR-MESSAGE" },
+        byRef: { m00007: { hash: "hNew", kind: "text", tokens: 5, rawId: "rawNew", chars: 5, head: "NEW" } },
+    };
+    const stale = mergeAdoptedContentStore(own, donor, () => false);
+    assert.equal(stale!.byRef.m00007.rawId, "rawNew", "no live binding -> the donor's original must win");
+    assert.equal(stale!.byHash.hNew, "DONOR-MESSAGE");
+    const live = mergeAdoptedContentStore(own, donor, (ref, rawId) => ref === "m00007" && rawId === "rawOld");
+    assert.equal(live!.byRef.m00007.rawId, "rawOld", "a live binding keeps the lane's own original");
+});
 test("#4046 foldRecoveryGate: virgin lanes pay only for a giant replay, and retries back off", () => {
     // A brand-new conversation must not pay a sibling scan on every request;
     // a first request that replays a whole transcript (>4 MB — the incident's

@@ -1474,7 +1474,10 @@ async function handleRequest(
                     const list = protocol === "google" ? p.contents : protocol === "responses" ? p.input : p.messages;
                     return Array.isArray(list) ? list.length : 0;
                 })(),
-                incomingBytes: inboundBytes,
+                // Decoded body size, not the compressed wire size: a gzip client
+                // would never cross the giant-replay trigger with the raw byte
+                // count taken before decodeRequestBody.
+                incomingBytes: bodyText !== undefined ? Buffer.byteLength(bodyText, "utf8") : inboundBytes,
             });
         } catch (err) {
             log("warn", `[fold-recovery] ${session.id}: failed (${String(err)}); continuing with the lane's own state`);
