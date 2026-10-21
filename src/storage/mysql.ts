@@ -32,6 +32,7 @@ import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } fr
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { sha256Hex } from "./store.js";
+import { HYDRATE_MARKERS, SPLIT_MEDIA_URL, collectRawOpenaiImageParts, isMediaRef } from "./media.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend } from "./backend.js";
 import type {
@@ -825,19 +826,36 @@ export class MysqlBackend implements StorageBackend {
         return out;
     }
 
+    /** #3762/#4069: async twin of the sqlite hydrate (contract in media.ts). */
     private async hydrateMediaAsync(content: string): Promise<string> {
-        if (!content.includes('"$media"')) return content;
+        if (!HYDRATE_MARKERS.some((k) => content.includes(k))) return content;
+        let parsed: Record<string, unknown>;
         try {
-            const parsed = JSON.parse(content) as { imageBase64?: unknown };
-            const slot = parsed.imageBase64;
-            if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
-                const bytes = await this.getContent(this.pool, (slot as { $media: string }).$media);
-                if (typeof bytes === "string" && bytes.length > 0) {
-                    parsed.imageBase64 = bytes;
-                    return JSON.stringify(parsed);
-                }
-            }
+            parsed = JSON.parse(content) as Record<string, unknown>;
+        } catch {
             return content;
+        }
+        let changed = false;
+        const slot = parsed.imageBase64;
+        if (isMediaRef(slot)) {
+            const bytes = await this.getContent(this.pool, slot.$media);
+            if (typeof bytes === "string" && bytes.length > 0) {
+                parsed.imageBase64 = bytes;
+                changed = true;
+            }
+        }
+        for (const part of collectRawOpenaiImageParts(parsed)) {
+            const m = typeof part.image_url.url === "string" ? SPLIT_MEDIA_URL.exec(part.image_url.url) : null;
+            if (!m) continue;
+            const bytes = await this.getContent(this.pool, m[2]);
+            if (typeof bytes === "string" && bytes.length > 0) {
+                part.image_url.url = `data:${m[1]};base64,${bytes}`;
+                changed = true;
+            }
+        }
+        if (!changed) return content;
+        try {
+            return JSON.stringify(parsed);
         } catch {
             return content;
         }

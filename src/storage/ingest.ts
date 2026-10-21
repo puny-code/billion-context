@@ -28,6 +28,7 @@
 import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
+import { splitMediaContent } from "./media.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
 
 /** Field order of mergeState() output (src/persist.ts) — the loader must
@@ -94,31 +95,6 @@ export const ingestSerializations = { count: 0 };
 /** One messages-log entry with its ABSOLUTE seq already assigned (intern
  *  assigns first-seen order; the delta planner continues after the trusted
  *  prefix). */
-/**
- * #3762 media CAS split: pull the top-level imageBase64 payload out of the
- * serialized message. The stored content keeps the key POSITION but carries
- * a {"$media": sha256(bytes)} reference; the bytes themselves live in the
- * content CAS, refcounted via message_media rows. Key order is preserved by
- * JSON.parse, so hydrate-and-restringify is byte-identical — every existing
- * reader (getMessages hydrates before returning) sees the verbatim original.
- * No media (or empty) → passthrough with the plain content hash.
- */
-function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
-    if (!content.includes("\"imageBase64\"")) return { content, hash: sha256Hex(content), media: [] };
-    let parsed: { imageBase64?: unknown };
-    try {
-        parsed = JSON.parse(content) as { imageBase64?: unknown };
-    } catch {
-        return { content, hash: sha256Hex(content), media: [] };
-    }
-    const bytes = parsed.imageBase64;
-    if (typeof bytes !== "string" || bytes.length === 0) return { content, hash: sha256Hex(content), media: [] };
-    const mediaHash = sha256Hex(bytes);
-    parsed.imageBase64 = { $media: mediaHash };
-    const split = JSON.stringify(parsed);
-    return { content: split, hash: sha256Hex(split), media: [{ hash: mediaHash, bytes }] };
-}
-
 interface LogEntry {
     seq: number;
     msgId: string;

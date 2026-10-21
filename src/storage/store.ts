@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
+import { hydrateMediaRefs } from "./media.js";
 import type { MessageContentStore } from "acp-kernel";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
@@ -1793,27 +1794,9 @@ export class UnifiedStore {
         }));
     }
 
-    /** #3762: swap {"$media": hash} references back to the CAS bytes. Only
-     *  touches content that carries the marker; key order is preserved by
-     *  parse/stringify so the result is byte-identical to the pre-split
-     *  serialization. A missing CAS row (corruption / manual surgery) falls
-     *  back to the split form rather than throwing — visible, not silent. */
+    /** #3762/#4069: swap media references back to the CAS bytes (see media.ts). */
     private hydrateMedia(content: string): string {
-        if (!content.includes("\"$media\"")) return content;
-        try {
-            const parsed = JSON.parse(content) as { imageBase64?: unknown };
-            const slot = parsed.imageBase64;
-            if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
-                const bytes = this.getContent((slot as { $media: string }).$media);
-                if (typeof bytes === "string" && bytes.length > 0) {
-                    parsed.imageBase64 = bytes;
-                    return JSON.stringify(parsed);
-                }
-            }
-            return content;
-        } catch {
-            return content;
-        }
+        return hydrateMediaRefs(content, (h) => this.getContent(h));
     }
 
     /** #3762 test/ops helper: refcount of the content row holding exactly
