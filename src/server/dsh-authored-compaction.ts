@@ -29,30 +29,43 @@
 // session and therefore no snapshot to author; it keeps refusing.
 import { renderForgedSummary, buildPromptForgeBody } from "../codex-compact.js";
 
-/** Identity header prefix of an authored checkpoint. Angle brackets
- *  hex-escaped per KDD #2 (see dsh-compaction-guard.ts). */
+/** Legacy identity header prefix of an authored checkpoint (builds <=0.1.202-
+ *  kaizen.3). Recognized only — never emitted any more: it is a bili-only XML
+ *  element, and the checkpoint text it rides in becomes DSH's OWN durable
+ *  history. After the plugin is uninstalled the host compacts that text again,
+ *  so anything bili-specific inside it is foreign matter the host cannot
+ *  interpret. Angle brackets hex-escaped per KDD #2. */
 export const BILI_SNAPSHOT_TAG_PREFIX = "\x3cbili-snapshot v1 ";
 
-/** Renders the full checkpoint text for a session: one identity header line
- *  (conversation id, canonical message count, active block ids — the exact
- *  server-side anchors the refs map to) followed by every ACTIVE block's
- *  summary in the kernel render format (renderForgedSummary — the same bytes
- *  the model reads for a live kernel-rendered block, so a captured checkpoint
- *  reads identically to a live one). `seq` counts the raw messages the server
- *  has ingested for the session (messageRefs.byRaw keys). */
+/** Self-describing first line of the client-facing checkpoint. Plain prose, no
+ *  XML, no refs, no block ids: if bili is uninstalled, DSH still owns a text it
+ *  can compact as ordinary conversation. Recognition rides on this sentence
+ *  (clients resend message text verbatim), so it is declarative either way. */
+export const BILI_CHECKPOINT_MARKER = "Conversation checkpoint written by billion-context (bili).";
+
+/** Renders the full checkpoint text for a session: a plain, self-contained
+ *  preamble followed by every ACTIVE block's summary in the kernel render
+ *  format (renderForgedSummary). Deliberately contains NO bili-only markup,
+ *  no session id, no seq and no block ids: this text is recorded by DSH as the
+ *  client's own history and outlives the plugin, so it must read as normal
+ *  conversation to any consumer (including DSH's own later compaction). */
 export function renderDshAuthoredCheckpoint(session: { id: string; state: { messageRefs: { byRaw: Record<string, unknown> }; blocks: readonly { blockId: string; active: boolean; summary: string; topic?: string }[] } }): string {
     const active = session.state.blocks.filter((b) => b.active);
-    const seq = Object.keys(session.state.messageRefs.byRaw).length;
-    const header = `${BILI_SNAPSHOT_TAG_PREFIX}conv="${session.id}" seq="${seq}" blocks="${active.map((b) => b.blockId).join("+")}" />`;
+    const header = [
+        BILI_CHECKPOINT_MARKER,
+        "Earlier messages were condensed so the conversation fits the model's context window; nothing was deleted, and the full history is still stored by the client.",
+    ].join(" ");
     if (active.length === 0) return header;
     return [header, ...active.map((b) => renderForgedSummary(b))].join("\n\n");
 }
 
 /** Landing recognition: a freshly-landed AUTHORED checkpoint is a user-role
- *  plain-text message whose text contains the identity tag. Same carrier +
- *  novelty discipline as carriesDshLocalCompactionSummary (#2621): tool
- *  results, reasoning, assistant prose and OLD ids (historical quotes of the
- *  tag) are structurally incapable of being a fresh landing. */
+ *  plain-text message whose text carries the checkpoint marker (new builds) or
+ *  the legacy `<bili-snapshot v1 …/>` header (older builds — already on disk,
+ *  so they must keep being recognized). Same carrier + novelty discipline as
+ *  carriesDshLocalCompactionSummary (#2621): tool results, reasoning, assistant
+ *  prose and OLD ids (historical quotes of the marker) are structurally
+ *  incapable of being a fresh landing. */
 export function carriesBiliSnapshotCheckpoint(
     msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
     knownIds?: ReadonlySet<string>,
@@ -61,7 +74,8 @@ export function carriesBiliSnapshotCheckpoint(
         if (m.role !== "user" || (m.contentType !== undefined && m.contentType !== "text")) continue;
         if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : contentText(m.content);
-        if (text !== "" && text.includes(BILI_SNAPSHOT_TAG_PREFIX)) return true;
+        if (text === "") continue;
+        if (text.includes(BILI_CHECKPOINT_MARKER) || text.includes(BILI_SNAPSHOT_TAG_PREFIX)) return true;
     }
     return false;
 }

@@ -33,6 +33,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { DSH_COMPACTION_INSTRUCTION_PREFIX, DSH_CHECKPOINT_OPEN_TAG, DSH_CHECKPOINT_PREAMBLE_PREFIX } from "../src/server/dsh-compaction-guard.ts";
 import {
+    BILI_CHECKPOINT_MARKER,
     BILI_SNAPSHOT_TAG_PREFIX,
     buildDshCompactionForgeBody,
     carriesBiliSnapshotCheckpoint,
@@ -57,10 +58,10 @@ test("unit: checkpoint = identity header + kernel-rendered block summaries", () 
     };
     const text = renderDshAuthoredCheckpoint(session as never);
     const lines = text.split("\n");
-    assert.ok(lines[0].startsWith(BILI_SNAPSHOT_TAG_PREFIX), "first line is the identity header");
-    assert.match(lines[0], /conv="s-3733"/);
-    assert.match(lines[0], /seq="42"/);
-    assert.match(lines[0], /blocks="b1\+b2"/);
+    assert.ok(lines[0].startsWith(BILI_CHECKPOINT_MARKER), "first line is plain, self-describing prose");
+    assert.ok(!text.includes("\x3cbili-snapshot"), "no bili-only XML tag: DSH compacts this text again after uninstall");
+    assert.ok(!/conv="s-3733"/.test(text) && !/seq="42"/.test(text) && !/blocks="b1/.test(text), "no ids/refs injected into the client history");
+    assert.ok(!text.includes("\x3cacp"), "no ACP tags survive into the client history");
     assert.ok(text.includes("[Compressed conversation section] — setup"), "kernel render format (topic)");
     assert.ok(text.includes("setup folded"));
     assert.ok(text.includes("[Compressed conversation section]"), "kernel render format (no topic)");
@@ -73,7 +74,8 @@ test("unit: inactive blocks are skipped; empty active set renders header only", 
         state: { messageRefs: { byRaw: {} }, blocks: [{ blockId: "b1", summary: "SECRET-INACTIVE", active: false }] },
     };
     const text = renderDshAuthoredCheckpoint(session as never);
-    assert.ok(text.startsWith(BILI_SNAPSHOT_TAG_PREFIX));
+    assert.ok(text.startsWith(BILI_CHECKPOINT_MARKER));
+    assert.ok(!text.includes("\x3cbili-snapshot"));
     assert.ok(!text.includes("SECRET-INACTIVE"), "inactive block content absent");
 });
 
@@ -127,7 +129,7 @@ test("unit: openai SSE forge body", () => {
     const deltas = frames.filter((f) => (f.data as { choices?: { delta?: { content?: unknown } }[] })?.choices?.[0]?.delta?.content !== undefined);
     assert.ok(deltas.length >= 1, "at least one content delta");
     const joined = deltas.map((f) => (f.data as { choices: { delta: { content: string } }[] }).choices[0].delta.content).join("");
-    assert.ok(joined.includes(BILI_SNAPSHOT_TAG_PREFIX), "checkpoint text delivered");
+    assert.ok(joined.includes(BILI_SNAPSHOT_TAG_PREFIX), "checkpoint text delivered verbatim (fixture is a legacy-tagged payload)");
     const finish = frames.find((f) => (f.data as { choices?: { finish_reason?: string }[] })?.choices?.[0]?.finish_reason === "stop");
     assert.ok(finish, "finish_reason stop frame");
 });
@@ -321,7 +323,7 @@ test("e2e: authored compaction answers locally — zero egress, tagged checkpoin
         ]);
         assert.equal(r.status, 200, r.body);
         assert.match(r.contentType, /text\/event-stream/);
-        assert.ok(r.body.includes(BILI_SNAPSHOT_TAG_PREFIX), "identity header in the forged stream");
+        assert.ok(r.body.includes(BILI_CHECKPOINT_MARKER), "plain checkpoint text in the forged stream");
         assert.ok(r.body.includes(SUMMARY), "block summary in the forged stream");
         assert.equal(h.bodies.length, before, "upstream never contacted (zero egress)");
         const s = h.sessionOf("s-auth")!;
@@ -341,7 +343,7 @@ test("e2e: stream:false honored — JSON body with the checkpoint text", async (
         assert.equal(r.status, 200, r.body);
         assert.match(r.contentType, /application\/json/);
         const j = JSON.parse(r.body);
-        assert.ok(j.choices[0].message.content.includes(BILI_SNAPSHOT_TAG_PREFIX));
+        assert.ok(j.choices[0].message.content.includes(BILI_CHECKPOINT_MARKER));
     });
 });
 
@@ -402,7 +404,7 @@ test("e2e: landed checkpoint is recognized on replay — rebase + authored-lande
             .map((j) => j?.choices?.[0]?.delta?.content)
             .filter((c: unknown): c is string => typeof c === "string");
         const payload = deltas.join("");
-        assert.ok(payload.includes(BILI_SNAPSHOT_TAG_PREFIX));
+        assert.ok(payload.includes(BILI_CHECKPOINT_MARKER));
         const checkpointText = `${DSH_CHECKPOINT_PREAMBLE_PREFIX}:\n\n${DSH_CHECKPOINT_OPEN_TAG}\n${payload}\n\x3c/compacted-summary\x3e`;
         // Next turn: dsh replays [checkpoint, retained tail] against the same session.
         // #2432/#3733 recognition is dsh-lane scoped: the replay carries the
@@ -519,7 +521,7 @@ test("e2e: responses wire — authored answer + landed checkpoint recognized on 
         const r1 = await post([{ type: "message", role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense the conversation above.` }]);
         assert.equal(r1.status, 200);
         const streamText = await r1.text();
-        assert.ok(streamText.includes(BILI_SNAPSHOT_TAG_PREFIX), "identity header in the forged responses stream");
+        assert.ok(streamText.includes(BILI_CHECKPOINT_MARKER), "plain checkpoint text in the forged responses stream");
         assert.ok(streamText.includes(SUMMARY), "block summary in the forged responses stream");
         assert.equal(bodies.length, before, "upstream never contacted (zero egress)");
         assert.equal(sessionOf()?.metadata["dshAuthoredCompactions"], 1, "authored counter");
@@ -531,7 +533,7 @@ test("e2e: responses wire — authored answer + landed checkpoint recognized on 
             .find((j): j is Record<string, unknown> & { text: string } => j !== null && j.type === "response.output_text.done" && typeof j.text === "string");
         assert.ok(done, "output_text.done frame present in the forged stream");
         const payload = done.text;
-        assert.ok(payload.includes(BILI_SNAPSHOT_TAG_PREFIX), "checkpoint payload extracted from the real stream");
+        assert.ok(payload.includes(BILI_CHECKPOINT_MARKER), "checkpoint payload extracted from the real stream");
         const checkpointText = `${DSH_CHECKPOINT_PREAMBLE_PREFIX}:\n\n${DSH_CHECKPOINT_OPEN_TAG}\n${payload}\n\x3c/compacted-summary\x3e`;
         const r2 = await post([
             { type: "message", role: "user", content: checkpointText },
