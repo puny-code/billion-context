@@ -361,5 +361,45 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  resolver is content-blind and keys by order+id with fragment guards,
  *  so those parameters are simply gone. */
 export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string): string {
-    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel).key;
+    return personaConversationResolution(rawId, history, personaTag, declaredModel).key;
+}
+
+/** Same verdict, full shape. Kept separate from personaConversationOrder so the
+ *  hot path has no extra work; the request path uses this one to LOG the
+ *  decision (F2, see identityDecisionNote). */
+export function personaConversationResolution(rawId: string, history: unknown, personaTag?: string, declaredModel?: string): SessionOrderResolution {
+    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel);
+}
+
+/** Below this many wire cells a history is a persona probe (dsh fires a
+ *  one-blob auto-review before nearly every tool call; those fork by design —
+ *  #1916/#1307), not a main conversation whose fold ledger can be lost. NOTE:
+ *  "cells" is the wire array's length, not turn pairs — the responses lane
+ *  carries ~3-5 cells per turn, so 20 cells is a handful of turns there and
+ *  ~10 on anthropic. The floor only separates "probe" from "conversation"; it
+ *  is not a turn count. */
+export const IDENTITY_NOTE_MIN_CELLS = 20;
+
+/** Wire ids come from client headers (session-id.ts trims but cannot sanitize),
+ *  so a raw newline would forge a second log line. Keep them printable and
+ *  bounded — they are opaque tokens, never user text. */
+function printableId(id: string): string {
+    return id.replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 200);
+}
+
+/** F2: the request path historically kept only the resolver's `key`, so the
+ *  two decisions that can strand a conversation's fold ledger on a lane the
+ *  next request never visits — a `reanchor` and an order/persona fork — were
+ *  invisible in the log (2026-10-21 incident: the main lane's 86 blocks stayed
+ *  under `|sub:…` while the request path re-claimed the empty raw record;
+ *  nothing in bili.log said so). Return the line to log, or null when the
+ *  decision is the routine claim/continue or the history is too small to be a
+ *  main conversation. Pure so the shape is unit-testable without a server. */
+export function identityDecisionNote(rawId: string, resolution: SessionOrderResolution, cells: number): string | null {
+    if (resolution.action === "claim" || resolution.action === "continue") return null;
+    if (!Number.isFinite(cells) || cells < IDENTITY_NOTE_MIN_CELLS) return null;
+    const reason = resolution.reason === undefined || resolution.reason === ""
+        ? ""
+        : ` reason="${resolution.reason.replace(/[\u0000-\u001f\u007f"]/g, "'")}"`;
+    return `[identity] action=${resolution.action} cells=${cells} raw=${printableId(rawId)} key=${printableId(resolution.key)}${reason}`;
 }

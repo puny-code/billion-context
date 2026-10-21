@@ -332,6 +332,72 @@ export const OUTPUT_RESTORE_ABSOLUTE_FLOOR = 32768;
 // NOT treated as a legal bound and the floor still overrides it.
 const OUTPUT_HIGH_WATER_TRUST_MIN = 4096;
 
+// F8: the input-side margin for the restore bound — the same formula the #453
+// clamp uses downstream (`clampOutputBudget`, src/server/budget.ts: margin =
+// max(2048, ceil(inputEstimate * 0.05)); its constants are module-private, so
+// the numbers are restated here and must stay in step).
+const OUTPUT_RESTORE_MARGIN_PCT = 0.05;
+const OUTPUT_RESTORE_MIN_MARGIN = 2048;
+/** The downstream clamp's surrender line (`OUTPUT_CLAMP_FLOOR`, budget.ts):
+ *  below it the #453 clamp refuses to write anything, so a restore landing there
+ *  would be fighting it. At/above it the value is legal and safe — input + bound
+ *  + margin == window by construction. It is NOT #3071's 32,768: that floor is
+ *  the capability target for a restore, not a legality line for the write. */
+const OUTPUT_RESTORE_LEGAL_FLOOR = 1024;
+
+/** F8: bound a restore target by the INPUT side. restoreOutputBudget restores
+ *  the client's output budget up to a capability ceiling with no regard for how
+ *  much of the window the messages already occupy; on the overflow incident's
+ *  lane it restored 1 -> 384,000 on a ~1.24M-token input, and the restored value
+ *  then both added itself to the billed total (messages + completion) and shrank
+ *  the judged window through the output-headroom reservation — a guaranteed
+ *  over-window 400 either way. Inputs are read off the session (no threading
+ *  needed):
+ *   - window: `metadata.nativeContextLimit`, the provider's own ceiling BEFORE
+ *     the output-headroom reservation (handle.ts records it every turn next to
+ *     effectiveContextLimit). Deliberately NOT `effectiveContextLimit`: that one
+ *     is POST-reservation, so fencing on it subtracts the reservation twice and
+ *     can refuse a restore the provider would accept — #3833's own shape (W=1M,
+ *     last max_tokens 256K → effective 750K, input 827,069) yields a negative
+ *     bound while input+ceiling 958,141 fits the 1M window;
+ *   - inputUpperBound: `stats.localInputEstimate`, the post-fold OUTBOUND upper
+ *     bound recorded by the last prepare (#728) — the same quantity the #453
+ *     clamp consumes. Deliberately NOT `estimateRawBodyTokens(parsed)`: the raw
+ *     inbound estimate is exactly the number the client used to starve the
+ *     budget (#546), so fencing on it would disable the rescue this function
+ *     exists for.
+ *  Either value absent (fresh session, no previous prepare, or a caller that
+ *  only passes { id, metadata }) skips the fence — the pre-F8 behavior is kept
+ *  rather than inventing a bound. */
+function boundRestoreTargetByInput(
+    target: number,
+    session: { metadata: Record<string, unknown>; stats?: { localInputEstimate?: number } },
+): { target: number; window?: number; inputUpperBound?: number; margin?: number } {
+    const rawWindow = session.metadata.nativeContextLimit;
+    const window = typeof rawWindow === "number" && Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : undefined;
+    const rawInput = session.stats?.localInputEstimate;
+    const inputUpperBound = typeof rawInput === "number" && Number.isFinite(rawInput) && rawInput > 0 ? rawInput : undefined;
+    if (window === undefined || inputUpperBound === undefined) return { target };
+    const margin = Math.max(OUTPUT_RESTORE_MIN_MARGIN, Math.ceil(inputUpperBound * OUTPUT_RESTORE_MARGIN_PCT));
+    return { target: Math.min(target, Math.floor(window - inputUpperBound - margin)), window, inputUpperBound, margin };
+}
+
+// F8: one-shot refusal warning per session. Without it a lane whose input fills
+// the window logs the refusal on EVERY turn (the same estimate keeps producing
+// the same bound) — the refusal itself is deliberately NOT a latch, because a
+// fold on a later turn may legitimately free the room.
+const warnedRestoreRefused = new Set<string>();
+const WARNED_RESTORE_REFUSED_CAP = 4096;
+function noteRestoreRefused(sessionId: string): boolean {
+    if (warnedRestoreRefused.has(sessionId)) return false;
+    if (warnedRestoreRefused.size >= WARNED_RESTORE_REFUSED_CAP) warnedRestoreRefused.clear();
+    warnedRestoreRefused.add(sessionId);
+    return true;
+}
+export function _resetRestoreRefusedForTest(): void {
+    warnedRestoreRefused.clear();
+}
+
 // #1840/#3071: one-shot "restore has no ceiling" warnings, keyed by SESSION+MODEL.
 // #1840 keyed them by MODEL alone, but the degradation is SESSION-scoped: the
 // session actually being starved got no warn because another session hit the same
@@ -430,7 +496,14 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  deliberately small budget elsewhere is intent, not collapse. */
 export function restoreOutputBudget(
     parsed: unknown,
-    session: { id: string; metadata: Record<string, unknown> },
+    session: {
+        id: string;
+        metadata: Record<string, unknown>;
+        /** F8: the post-fold outbound upper bound recorded by the last prepare
+         *  (`src/session.ts` stats.localInputEstimate); absent on callers that
+         *  pass a bare session literal, which keeps the pre-F8 behavior. */
+        stats?: { localInputEstimate?: number };
+    },
     log: (level: string, msg: string) => void,
     outputCeiling?: number,
     /** #3438: true when this lane's host stamps the model-declared maxTokens onto every main turn by contract (dsh/pi-ai buildBaseOptions default) — see the doc above. */
@@ -500,7 +573,29 @@ export function restoreOutputBudget(
         target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
     }
     if (typeof target === "number") {
-        writeOutputBudget(p, field, target);
+        // F8: bound the restore by the INPUT side before writing. On an
+        // already-over-window lane the capability ceiling is not a rescue: it
+        // adds itself to messages+completion and also shrinks the judged window
+        // via the output-headroom reservation. When nothing meaningful is left,
+        // keep the client's starvation (recoverable) instead of writing a value
+        // that guarantees an over-window rejection (no body to inspect).
+        const bounded = boundRestoreTargetByInput(target, session);
+        // Refuse only when the INPUT bound is what limits the restore AND what it
+        // leaves is below the downstream clamp's own surrender line (1024 —
+        // `OUTPUT_CLAMP_FLOOR` in budget.ts, restated here for the same reason
+        // the margin constants above are). A value at/above that line is a real,
+        // safe budget: `input + bound + margin = window` by construction, so it
+        // composes with the #453 clamp instead of fighting it; refusing it would
+        // keep the client's `max_tokens: 1`, which cannot self-heal (a 1-token
+        // reservation never starts a fold, so the same bound recurs every turn).
+        // Note the smaller number matters, not #3071's 32,768: that floor is the
+        // capability target for a restore, not a legality line for the write.
+        if (bounded.window !== undefined && bounded.target < target && bounded.target < OUTPUT_RESTORE_LEGAL_FLOOR) {
+            if (noteRestoreRefused(session.id)) {
+                log("warn", `[${session.id}] output budget restore REFUSED ${value} -> (would have been ${target}, bound ${bounded.target}): the input side fills the window (window ${bounded.window} - input upper bound ${bounded.inputUpperBound} - margin ${bounded.margin}), below the ${OUTPUT_RESTORE_LEGAL_FLOOR}-token legality floor — keeping the client's ${value} (#F8)`);
+            }
+            return;
+        }
         const note = ceiling !== undefined
             ? (highWater === undefined
                 ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)"
@@ -515,7 +610,12 @@ export function restoreOutputBudget(
         const origin = collapsed && value > SIDE_REQUEST_MAX_TOKENS
             ? "#3438: dsh-lane mid-band collapse above the <=200 starve gate"
             : "#546: client shrank it from its raw-history estimate";
-        log("info", `[${session.id}] output budget restored ${value} -> ${target} (${origin}${note})`);
+        const inputBoundNote = bounded.target < target
+            ? `; bounded by the input side to ${bounded.target} (window ${bounded.window} - input upper bound ${bounded.inputUpperBound} - margin ${bounded.margin}, #F8)`
+            : "";
+        target = bounded.target;
+        writeOutputBudget(p, field, target);
+        log("info", `[${session.id}] output budget restored ${value} -> ${target} (${origin}${note}${inputBoundNote})`);
     }
     // #2904: persist the no-ceiling degraded state for the user-visible surfaces.
     // With the #3071 absolute floor a ceiling-less starve is ALWAYS restored (never

@@ -35,10 +35,14 @@ import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { DshRestoreError, resolveSessionLogPath as resolveDshSessionLogPath } from "./dsh-restore.js";
+import { auditDshSessions, checkDshSessionLog, renderDshAuditReport } from "./dsh-session-audit.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
@@ -155,6 +159,8 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
+    bili restore <session-dir|file>   # READ-ONLY audit: seq continuity + compaction state (never writes)
+    bili restore --all                # audit every DSH session; never modifies a log
 
 Options (override config file / env):
   -F <url>                         upstream proxy to forward through (gost-style;
@@ -177,7 +183,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "restore";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -197,6 +203,12 @@ type Parsed = {
     sessionsSub?: "ls" | "rm" | "archive" | "restore";
     sessionsTarget?: string;
     sessionsNoVacuum?: boolean;
+    restoreTarget?: string;
+    restoreWrite?: boolean;
+    restoreAll?: boolean;
+    restoreRoot?: string;
+    restoreMinIdleMin?: number;
+    restoreAllowGaps?: boolean;
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
@@ -227,6 +239,12 @@ export function parseArgs(argv: string[]): Parsed {
     let sessionsSub: Parsed["sessionsSub"];
     let sessionsTarget: string | undefined;
     let sessionsNoVacuum = false;
+    let restoreTarget: string | undefined;
+    let restoreWrite = false;
+    let restoreAll = false;
+    let restoreRoot: string | undefined;
+    let restoreMinIdleMin: number | undefined;
+    let restoreAllowGaps = false;
     let storageDays: number | undefined;
     let storageVacuum: Parsed["storageVacuum"];
     let storageDryRun = false;
@@ -302,6 +320,38 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--fix":
                 doctorFix = true;
+                break;
+            case "--all":
+                restoreAll = true;
+                break;
+            case "--root": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error("bili: --root requires a value");
+                    process.exit(2);
+                }
+                restoreRoot = val;
+                break;
+            }
+            case "--min-idle-min": {
+                const val = argv[++i];
+                if (val === undefined || !Number.isFinite(Number(val))) {
+                    console.error("bili: --min-idle-min requires a number");
+                    process.exit(2);
+                }
+                restoreMinIdleMin = Number(val);
+                break;
+            }
+            case "--allow-gaps":
+                // Repairs a session whose log itself lost some shadowed events
+                // (nothing can bring those back) instead of refusing the rest.
+                restoreAllowGaps = true;
+                break;
+            case "--write":
+                // bili restore: rewrite the log in place (after a timestamped
+                // backup). Every other command ignores it — no destructive path
+                // exists outside `bili restore`.
+                restoreWrite = true;
                 break;
             case "--no-vacuum":
                 sessionsNoVacuum = true;
@@ -476,17 +526,27 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
                 process.exit(2);
             }
+        } else if (cmd === "restore") {
+            // Offline DSH session repair: un-shadows a transcript that a lossy
+            // NATIVE compaction collapsed. Standalone (no proxy, no store).
+            command = "restore";
+            restoreTarget = positional[1];
+            if (restoreTarget === undefined && !restoreAll) {
+                console.error('bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--write] [--json]');
+                console.error('             bili restore --all [--write] [--root <dir>] [--min-idle-min N]   # whole DSH session tree');
+                process.exit(2);
+            }
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite, restoreAll, restoreRoot, restoreMinIdleMin, restoreAllowGaps };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite, restoreAll, restoreRoot, restoreMinIdleMin, restoreAllowGaps } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -606,6 +666,54 @@ export async function main(): Promise<void> {
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
+        }
+        return;
+    }
+    if (command === "restore") {
+        // READ-ONLY audit of DSH session logs. The old `--write` mode removed
+        // compaction events without renumbering `seq`, and DSH then refused 10
+        // sessions as corrupt (2026-10-21). A plugin must never write the host's
+        // append-only log, so --write is refused here too.
+        try {
+            if (restoreWrite) {
+                console.error(
+                    "bili restore: --write was REMOVED. bili never writes DSH session logs: deleting events leaves gaps in the append-only seq chain and the host then refuses to open the session (2026-10-21: 10 sessions corrupt). Nothing was changed.",
+                );
+                process.exit(2);
+            }
+            if (restoreAll) {
+                const root = restoreRoot ?? join(homedir(), ".dsh", "sessions");
+                const audit = auditDshSessions(root);
+                process.stdout.write(jsonOutput ? JSON.stringify(audit) + "\n" : renderDshAuditReport(audit));
+                if (audit.corrupt > 0 || audit.errors > 0) process.exit(1);
+                return;
+            }
+            if (restoreTarget === undefined) {
+                console.error("bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--json]   (read-only audit)");
+                console.error("             bili restore --all [--root <dir>]                                              (audit every session)");
+                process.exit(2);
+            }
+            const check = checkDshSessionLog(resolveDshSessionLogPath(restoreTarget));
+            const status: "ok" | "compacted" | "corrupt" = check.gap !== null ? "corrupt" : check.compactionEvents > 0 ? "compacted" : "ok";
+            const entry = { path: restoreTarget, status, check };
+            process.stdout.write(
+                jsonOutput
+                    ? JSON.stringify(entry) + "\n"
+                    : renderDshAuditReport({
+                          root: restoreTarget,
+                          scanned: 1,
+                          ok: status === "ok" ? 1 : 0,
+                          compacted: status === "compacted" ? 1 : 0,
+                          corrupt: status === "corrupt" ? 1 : 0,
+                          errors: 0,
+                          entries: [entry],
+                      }),
+            );
+            if (status === "corrupt") process.exit(1);
+        } catch (error) {
+            const code = error instanceof DshRestoreError && (error.code === "nothing-to-do" || error.code === "unparseable") ? 2 : 1;
+            console.error(`bili restore: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(code);
         }
         return;
     }

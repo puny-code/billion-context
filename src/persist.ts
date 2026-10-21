@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 const { join } = path;
@@ -279,6 +279,11 @@ function hostLabel(upstreamOrigin?: string): string {
         return "unknown-" + createHash("sha256").update(upstreamOrigin, "utf8").digest("hex").slice(0, 6);
     }
 }
+
+/** Bytes of a state file read to recover its envelope id in a DISCOVERY pass
+ *  (knownSessionIds). The envelope writes `id` before `payload`, so this always
+ *  covers it; the payload itself is never decoded there. */
+const ENVELOPE_HEAD_BYTES = 512;
 
 /** Relative path (under the sessions dir) for a session, namespaced by
  *  protocol and upstream host so a human can tell sessions apart at a glance:
@@ -1471,6 +1476,53 @@ export class SessionStore {
         if (refs > 0 && blocks === 0) {
             this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks (compressions=${compressions}) — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
         }
+    }
+
+    /** Every session id this store can enumerate, for cross-lane recovery
+     *  (fork-adoption.ts `recoverFoldsFromSibling`). DISCOVERY ONLY — loads
+     *  still go through loadSync, which stays legacy-first in shadow mode, so a
+     *  stale replica row can never be served as state. Unions the replica index
+     *  with the walked file tree: the index is backfilled asynchronously, so
+     *  right after a restart it can be MISSING a lane whose file is already on
+     *  disk — exactly the window in which a crashed lane asks for recovery
+     *  (the incident's cold load happened seconds after a restart). The walk is
+     *  bounded (one head read per file, no payload decode) and this method is
+     *  only reached by a bounded recovery attempt, never per request. */
+    knownSessionIds(): string[] {
+        if (!this.enabled) return [];
+        const ids = new Set<string>();
+        if (this.shadow) {
+            try {
+                for (const id of this.shadow.listSessionIds()) ids.add(id);
+            } catch {
+                // Replica offline/unavailable — the tree below still answers.
+            }
+        }
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
+            if (!existsSync(root)) continue;
+            for (const file of walkJsonFilesSync(root)) {
+                if (path.basename(file).endsWith(".content-store.json")) continue;
+                // Bounded head read, not a full parse: the envelope writes
+                // `id` before `payload`, and a discovery pass over a tree of
+                // multi-MB records must not cost a full decode each.
+                try {
+                    const fd = openSync(file, "r");
+                    let head = "";
+                    try {
+                        const buf = Buffer.alloc(ENVELOPE_HEAD_BYTES);
+                        const n = readSync(fd, buf, 0, ENVELOPE_HEAD_BYTES, 0);
+                        head = buf.subarray(0, n).toString("utf8");
+                    } finally {
+                        closeSync(fd);
+                    }
+                    const m = /"id"\s*:\s*"([^"]+)"/.exec(head);
+                    if (m?.[1]) ids.add(m[1]);
+                } catch {
+                    // Corrupt member: #3157 quarantine owns it, discovery skips.
+                }
+            }
+        }
+        return [...ids];
     }
 
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {

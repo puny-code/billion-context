@@ -33,10 +33,10 @@ import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHos
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
-import { personaConversationOrder } from "../session-resolve.js";
+import { identityDecisionNote, personaConversationResolution } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
-import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
+import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork, maybeRecoverFoldsFromSibling } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
@@ -52,6 +52,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
+import { OVERFLOW_REFOLD_MIN_SHRINK_PCT, refoldShrank, wireBodyBytes } from "./budget.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
@@ -989,6 +990,20 @@ async function handleRequest(
               : protocol === "google"
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
+        // F2: the request path keeps only the resolver's key. The two verdicts
+        // that can strand a conversation's fold ledger on a lane the next
+        // request never visits — `reanchor` (fold pointer moves) and an
+        // order/persona fork (new lane with 0 blocks) — used to be invisible
+        // (2026-10-21 incident: the main lane's 86 blocks stayed under
+        // `|sub:…` while the request path re-claimed the empty raw record).
+        // Routine claim/continue and the one-blob reviewer probes stay silent.
+        const identityKey = (rawId: string, history: unknown, tag: string): string => {
+            const resolution = personaConversationResolution(rawId, history, tag, pluginReportedModel(req.headers));
+            const cells = Array.isArray(history) ? history.length : 0;
+            const note = identityDecisionNote(rawId, resolution, cells);
+            if (note !== null) log("info", note);
+            return resolution.key;
+        };
         const conversation = protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
@@ -1003,11 +1018,10 @@ async function handleRequest(
             ? (dshPersona && !sideRequestLike
                 ? (personaSystemText === ""
                       ? (googleIdentity?.value ?? googleSignal)
-                      : personaConversationOrder(
+                      : identityKey(
                           googleIdentity?.value ?? googleSignal,
                           (parsed as GoogleRequestBody).contents,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
                       ))
                 : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1032,20 +1046,18 @@ async function handleRequest(
                           // empty-tag traffic through the order resolver
                           // (codex turn-1 shape keys by its session header).
                           ? (anthropicIdentity?.value ?? anthropicSignal)
-                          : personaConversationOrder(
+                          : identityKey(
                               anthropicIdentity?.value ?? anthropicSignal,
                               (parsed as AnthropicRequestBody).messages,
                               personaSystemText,
-                              pluginReportedModel(req.headers),
                           ))
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
               ? (dshPersona && !sideRequestLike && personaSystemText !== ""
-                    ? personaConversationOrder(
+                    ? identityKey(
                           openaiIdentity?.value ?? openaiSignal,
                           (parsed as OpenAIRequestBody).messages,
                           personaSystemText,
-                          pluginReportedModel(req.headers),
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1063,11 +1075,10 @@ async function handleRequest(
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
                    // Empty instructions = non-anchoring (verbatim id).
-                    ? personaConversationOrder(
+                    ? identityKey(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                           (parsed as ResponsesRequestBody).input,
                           (parsed as ResponsesRequestBody).instructions ?? "",
-                          pluginReportedModel(req.headers),
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1103,11 +1114,10 @@ async function handleRequest(
                             // verbatim id (codex turn-1 / metadata-less roots).
                             ((parsed as ResponsesRequestBody).instructions ?? "") === ""
                               ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
-                              : personaConversationOrder(
+                              : identityKey(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                                 (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
-                                pluginReportedModel(req.headers),
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
@@ -1438,6 +1448,39 @@ async function handleRequest(
             } catch (err) {
                 log("warn", `[fork-adoption] failed (${String(err)}); continuing with fresh state (#629)`);
             }
+        }
+        // Fold-state recovery (#4046): the resolver keys state by conversation
+        // id PLUS a `|sub:` persona/fork fingerprint, so a model or system-prompt
+        // change forks a NEW lane with zero fold state and switching back
+        // re-enters the raw lane — whose record may be a refs-only husk while the
+        // sibling lane still owns the folded blocks. The client then replays its
+        // whole history (1.29M tokens vs a 1M window in the incident), which
+        // preflight cannot fold down inside one turn. Recover the sibling's
+        // ledger BEFORE prepare*/processTurn assigns refs; the recovery is a
+        // no-op on a healthy lane, on a non-replay and when nothing covers the
+        // replay (it then logs what it saw and folds from scratch, as today).
+        try {
+            maybeRecoverFoldsFromSibling({
+                session,
+                protocol,
+                parsed,
+                upstreamOrigin,
+                log,
+                // Cheap signals only: the hook must not clone/convert the body
+                // before its gate (43-60 ms on a 3.9 MB replay, paid per request).
+                incomingCount: (() => {
+                    const p = parsed as Record<string, unknown> | null;
+                    if (p === null || typeof p !== "object") return 0;
+                    const list = protocol === "google" ? p.contents : protocol === "responses" ? p.input : p.messages;
+                    return Array.isArray(list) ? list.length : 0;
+                })(),
+                // Decoded body size, not the compressed wire size: a gzip client
+                // would never cross the giant-replay trigger with the raw byte
+                // count taken before decodeRequestBody.
+                incomingBytes: bodyText !== undefined ? Buffer.byteLength(bodyText, "utf8") : inboundBytes,
+            });
+        } catch (err) {
+            log("warn", `[fold-recovery] ${session.id}: failed (${String(err)}); continuing with the lane's own state`);
         }
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the
@@ -2078,6 +2121,12 @@ async function handleRequest(
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
         const nativeWindow = reqConfig.modelContextLimit;
+        // F8 (#4046 review): the NATIVE pre-reservation window, recorded apart
+        // from effectiveContextLimit. The output-restore fence has to judge
+        // input+output against the provider's ceiling exactly ONCE; fencing on
+        // the post-reservation window subtracts the reservation twice and can
+        // refuse a restore the provider would accept (#3833's own shape).
+        session.metadata.nativeContextLimit = nativeWindow;
         if (shouldReserveOutputHeadroom(protocol)) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
@@ -2623,8 +2672,20 @@ async function handleRequest(
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
+                          const previousBytes = wireBodyBytes(pendingForward.body);
                           const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
-                          if (!next || String(next.body) === String(pendingForward.body)) return null;
+                          if (!next) return null;
+                          const nextBytes = wireBodyBytes(next.body);
+                          // overflow-refold-noop: the body can differ byte-wise from the rejected one
+                          // merely because fold-reconcile re-anchored covered ids —
+                          // nothing folded. Re-sending it at the same size is not a
+                          // retry, it is the identical doomed request again (billed
+                          // twice, and the client waits out its whole timeout). Only a
+                          // material shrink earns a resend.
+                          if (!refoldShrank(previousBytes, nextBytes)) {
+                              log("warn", `[${session.id}] overflow refold produced no material shrink (${previousBytes} -> ${nextBytes} bytes, need <= ${Math.round((1 - OVERFLOW_REFOLD_MIN_SHRINK_PCT) * 100)}% of the rejected size) — not re-sending the payload the upstream just rejected; the armed overflow baseline folds the next request first`);
+                              return null;
+                          }
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
                           return next;
