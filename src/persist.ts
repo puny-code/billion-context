@@ -398,6 +398,13 @@ export class SessionStore {
     __ownWriteStampedForTests(id: string): boolean {
         return this.ownCommit.get(id)?.written !== undefined;
     }
+    /** #4041 test seam: whether the unified sidecar actually opened. The
+     *  disk-pressure repro poisons <dir>/index.db so UnifiedStore.open
+     *  throws and maybeOpen degrades to null — assertions must prove the
+     *  degraded state instead of assuming it. */
+    __sidecarOpenForTests(): boolean {
+        return this.shadow !== undefined;
+    }
     private readonly codec?: StateStoreCodec;
     private readonly readCodec: StateStoreCodec;
     private boundedReads = false;
@@ -1328,7 +1335,14 @@ export class SessionStore {
         // in an in-flight chain) must still hydrate the pooled envelope off
         // disk — without this the legacy fallback silently returns null and
         // the session looks nonexistent until a full boot walk.
-        if (!this.diskFilesSeeded && this.shadow) {
+        // #4041: the gate is the REQUESTED mode, not the live instance —
+        // when UnifiedStore.open fails (disk pressure, locked/corrupt db)
+        // maybeOpen degrades to null and this.shadow stays undefined;
+        // gating on the instance disabled this very fallback exactly when
+        // the index was unavailable (the #3769-family hydration flakes
+        // going red under parallel CI load). Legacy mode keeps its old
+        // posture unchanged: the kernel's boot walk owns discovery there.
+        if (!this.diskFilesSeeded && this.storageMode !== "legacy") {
             this.diskFiles = [
                 ...walkJsonFilesSync(this.sessionsDir),
                 ...(existsSync(`${this.sessionsDir}-cold`) ? walkJsonFilesSync(`${this.sessionsDir}-cold`) : []),
