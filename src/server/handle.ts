@@ -1460,9 +1460,24 @@ async function handleRequest(
         // no-op on a healthy lane, on a non-replay and when nothing covers the
         // replay (it then logs what it saw and folds from scratch, as today).
         try {
-            maybeRecoverFoldsFromSibling({ session, protocol, parsed, upstreamOrigin, log });
+            maybeRecoverFoldsFromSibling({
+                session,
+                protocol,
+                parsed,
+                upstreamOrigin,
+                log,
+                // Cheap signals only: the hook must not clone/convert the body
+                // before its gate (43-60 ms on a 3.9 MB replay, paid per request).
+                incomingCount: (() => {
+                    const p = parsed as Record<string, unknown> | null;
+                    if (p === null || typeof p !== "object") return 0;
+                    const list = protocol === "google" ? p.contents : protocol === "responses" ? p.input : p.messages;
+                    return Array.isArray(list) ? list.length : 0;
+                })(),
+                incomingBytes: inboundBytes,
+            });
         } catch (err) {
-            log("warn", `[fold-recovery] failed (${String(err)}); continuing with the lane's own state`);
+            log("warn", `[fold-recovery] ${session.id}: failed (${String(err)}); continuing with the lane's own state`);
         }
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the

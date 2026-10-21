@@ -241,8 +241,15 @@ export function planForkAdoption(
 /** Seed a fresh fork session from the plan. Copy-on-fork: every value is a
  *  clone; the parent session is never touched. */
 export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
+    // A block id is session-unique and carries the summary's meaning: two lanes
+    // can mint the same `bN` (the counter is per lane), so an adoption into a
+    // session that already holds that id must SKIP it — pushing a second record
+    // with the same id would make the fold ledger point one id at two summaries.
+    const have = new Set(session.state.blocks.map((b) => b.blockId));
     for (const b of plan.blocks) {
+        if (have.has(b.blockId)) continue;
         session.state.blocks.push(b);
+        have.add(b.blockId);
         const content = parent.blockContents.get(b.blockId);
         if (content) session.blockContents.set(b.blockId, structuredClone(content));
     }
@@ -588,6 +595,28 @@ const RECOVERY_MIN_INCOMING = 8;
  *  full replay (a tail-only probe covers fewer blocks than a whole transcript).
  *  Bounded, because each attempt parses up to RECOVERY_MAX_DONORS lane files. */
 const RECOVERY_MAX_TRIES = 3;
+/** Minimum wall-clock gap between two attempts on one lane. The hook runs on
+ *  the request path and the tries above are a LIFETIME budget: three requests
+ *  arriving inside one second (a retry storm, a client reconnect) would
+ *  otherwise spend it before the donor lane has even been written. */
+const RECOVERY_BACKOFF_MS = 30_000;
+/** A lane that has never served a request is normally a brand-new conversation
+ *  and must not pay a sibling scan. The exception is a genuinely GIANT first
+ *  replay (a fork/derived lane's first request replays the whole history; the
+ *  incident's body was 4.0 MiB) — bytes are a safe *trigger* (never a
+ *  rejection), because a false positive only costs one bounded scan. */
+const RECOVERY_GIANT_REPLAY_BYTES = 4_000_000;
+
+/** Cheap inbound message count — NO structuredClone. `incomingCoreMessages`
+ *  clones and converts the whole body (43-60 ms on a 3.9 MB replay), so it must
+ *  only run after the gate has already decided the lane is worth looking at. */
+export function countIncomingMessages(protocol: WireProtocol, parsed: unknown): number {
+    if (!SUPPORTED.has(protocol)) return 0;
+    if (parsed === null || typeof parsed !== "object") return 0;
+    const p = parsed as Record<string, unknown>;
+    const list = protocol === "google" ? p.contents : protocol === "responses" ? p.input : p.messages;
+    return Array.isArray(list) ? list.length : 0;
+}
 
 /** The CONVERSATION a session id belongs to: the client's own id, i.e. the text
  *  before the resolver's first `|` suffix. Pure. */
@@ -777,15 +806,17 @@ export function recoverFoldsFromSibling(args: {
         );
         return { adopted: 0, donorId: null, scanned: siblings.length, straddled: 0 };
     }
-    applyForkAdoption(session, best.plan, best.donor);
     // Same CCR carry as a fork: the adopted summaries cite refs as retrievable,
     // so the originals behind them must come along or every citation misses.
     // MERGED, not replaced: adoptContentStore swaps the whole store, and this
     // lane already owned originals of its own (a deleted block keeps its
-    // content, #2695) — replacing would destroy them.
+    // content, #2695) — replacing would destroy them. Computed BEFORE the apply
+    // so the mutation window between "blocks pushed" and "originals adopted" is
+    // one statement wide (the block push is what marks the session dirty).
     const wanted = new Set(Object.keys(best.plan.refs.byRef));
     const donorSlice = cloneStoreForRefs(contentStoreOf(best.donor), wanted);
     const mergedStore = mergeAdoptedContentStore(contentStoreOf(session), donorSlice);
+    applyForkAdoption(session, best.plan, best.donor);
     if (mergedStore !== null) adoptContentStore(session, mergedStore);
     session.metadata.foldRecoveredFrom = best.donor.id;
     session.metadata.foldRecoveredBlocks = best.plan.adoptedActive;
@@ -800,15 +831,29 @@ export function recoverFoldsFromSibling(args: {
 /** Should this request attempt the cross-lane recovery, and how many attempts
  *  has the lane already spent? Pure so the gate itself is testable (an
  *  unreachable gate is not a gate): a missed attempt is retried up to
- *  RECOVERY_MAX_TRIES, a lane that still owns active blocks or has never served
- *  a request is left alone, and a replay too small to matter is skipped. */
-export function foldRecoveryGate(session: Session, incomingCount: number): { run: boolean; tries: number } {
+ *  RECOVERY_MAX_TRIES with a backoff, a lane that still owns active blocks is
+ *  left alone, a virgin lane only pays for a giant first replay, and a replay
+ *  too small to matter is skipped. `now`/`incomingBytes` are injectable so the
+ *  time and size branches are reachable from tests. */
+export function foldRecoveryGate(
+    session: Session,
+    incomingCount: number,
+    opts?: { incomingBytes?: number; now?: number },
+): { run: boolean; tries: number } {
     if (session.id.includes("|sub:task:")) return { run: false, tries: 0 };
     if (session.metadata.foldRecoveryTried === true) return { run: false, tries: 0 };
     const tries = typeof session.metadata.foldRecoveryTries === "number" ? session.metadata.foldRecoveryTries : 0;
     if (tries >= RECOVERY_MAX_TRIES) return { run: false, tries };
     if (session.state.blocks.some((b) => b.active)) return { run: false, tries };
-    if ((session.stats.requests ?? 0) <= 0) return { run: false, tries };
+    // Evidence gate: a lane that never served a request is not a husk — only a
+    // giant first replay (a fork lane replaying the whole transcript) is worth a
+    // scan there, and bytes are only ever a TRIGGER here, never a rejection.
+    if ((session.stats.requests ?? 0) <= 0 && (opts?.incomingBytes ?? 0) < RECOVERY_GIANT_REPLAY_BYTES) {
+        return { run: false, tries };
+    }
+    const lastTry = typeof session.metadata.foldRecoveryLastTryTs === "number" ? session.metadata.foldRecoveryLastTryTs : 0;
+    const now = opts?.now ?? Date.now();
+    if (lastTry > 0 && now - lastTry < RECOVERY_BACKOFF_MS) return { run: false, tries };
     if (incomingCount < RECOVERY_MIN_INCOMING) return { run: false, tries };
     return { run: true, tries };
 }
@@ -823,13 +868,23 @@ export function maybeRecoverFoldsFromSibling(args: {
     parsed: unknown;
     upstreamOrigin: string;
     log: (level: string, msg: string) => void;
+    /** Cheap inbound message count from the caller (avoids the body clone). */
+    incomingCount?: number;
+    /** Raw body size, used only as the giant-replay trigger. */
+    incomingBytes?: number;
 }): void {
     const { session, protocol, parsed, upstreamOrigin, log } = args;
     if (!SUPPORTED.has(protocol)) return;
-    const incoming = incomingCoreMessages(protocol, parsed);
-    const gate = foldRecoveryGate(session, incoming?.length ?? 0);
+    // Gate FIRST on the cheap count: incomingCoreMessages() structuredClones and
+    // converts the whole body (43-60 ms on a 3.9 MB replay), and a healthy lane
+    // must not pay that on every request.
+    const count = args.incomingCount ?? countIncomingMessages(protocol, parsed);
+    const gate = foldRecoveryGate(session, count, { incomingBytes: args.incomingBytes });
     if (!gate.run) return;
+    const incoming = incomingCoreMessages(protocol, parsed);
+    if (!incoming || incoming.length < RECOVERY_MIN_INCOMING) return;
     session.metadata.foldRecoveryTries = gate.tries + 1;
+    session.metadata.foldRecoveryLastTryTs = Date.now();
     const store = getStore();
     let result: FoldRecoveryResult = { adopted: 0, donorId: null, scanned: 0, straddled: 0 };
     try {

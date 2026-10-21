@@ -1433,7 +1433,11 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
             child.metadata.publicSnapshotTextComparable = true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
-            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            // nativeContextLimit rides along with effectiveContextLimit: the
+            // output-restore fence (F8) reads it, and a forked child that only
+            // inherited the post-reservation window would be fenced blind on its
+            // first request.
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "nativeContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);

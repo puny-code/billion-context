@@ -370,6 +370,28 @@ test("#4046 foldRecoveryGate refuses every non-replay shape and bounds the retri
     assert.deepEqual(foldRecoveryGate(lastChance, 40), { run: true, tries: 2 }, "the last allowed attempt still runs");
 });
 
+test("#4046 foldRecoveryGate: virgin lanes pay only for a giant replay, and retries back off", () => {
+    // A brand-new conversation must not pay a sibling scan on every request;
+    // a first request that replays a whole transcript (>4 MB — the incident's
+    // body) is the one exception, and bytes are only ever a TRIGGER here.
+    const virgin = fakeSession("conv-new", [], []);
+    virgin.stats.requests = 0;
+    assert.equal(foldRecoveryGate(virgin, 40).run, false, "a normal new conversation never scans");
+    assert.equal(foldRecoveryGate(virgin, 40, { incomingBytes: 3_999_999 }).run, false, "just under the trigger");
+    assert.equal(foldRecoveryGate(virgin, 40, { incomingBytes: 4_000_000 }).run, true, "a giant first replay may recover");
+
+    // The three lifetime attempts must survive a retry storm: three requests in
+    // one second would otherwise burn the budget before the donor is written.
+    const lane = fakeSession("conv-storm", [], []);
+    lane.metadata.foldRecoveryTries = 1;
+    lane.metadata.foldRecoveryLastTryTs = 1_000_000;
+    assert.equal(foldRecoveryGate(lane, 40, { now: 1_001_000 }).run, false, "1s after the last attempt -> wait");
+    assert.equal(foldRecoveryGate(lane, 40, { now: 1_030_000 }).run, true, "30s after it -> the next attempt is allowed");
+    // A lane with no recorded attempt is not held by the backoff.
+    const fresh = fakeSession("conv-fresh", [], []);
+    assert.equal(foldRecoveryGate(fresh, 40, { now: 1 }).run, true);
+});
+
 test("#4046 mergeAdoptedContentStore keeps the lane's own originals", () => {
     // adoptContentStore swaps the whole store, so handing it the donor slice
     // alone would delete originals this lane already owned (a deleted block keeps
