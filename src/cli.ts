@@ -39,6 +39,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { DshRestoreError, renderDshRestoreReport, runDshRestoreFile } from "./dsh-restore.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
@@ -155,6 +156,8 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
+    bili restore <session-dir|file>   # un-shadow a DSH session that a lossy native compaction collapsed (dry-run; add --write)
+    bili restore ~/.dsh/sessions/<proj>/<session> --write   # restore in place, after a timestamped backup
 
 Options (override config file / env):
   -F <url>                         upstream proxy to forward through (gost-style;
@@ -177,7 +180,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "restore";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -197,6 +200,8 @@ type Parsed = {
     sessionsSub?: "ls" | "rm" | "archive" | "restore";
     sessionsTarget?: string;
     sessionsNoVacuum?: boolean;
+    restoreTarget?: string;
+    restoreWrite?: boolean;
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
@@ -227,6 +232,8 @@ export function parseArgs(argv: string[]): Parsed {
     let sessionsSub: Parsed["sessionsSub"];
     let sessionsTarget: string | undefined;
     let sessionsNoVacuum = false;
+    let restoreTarget: string | undefined;
+    let restoreWrite = false;
     let storageDays: number | undefined;
     let storageVacuum: Parsed["storageVacuum"];
     let storageDryRun = false;
@@ -302,6 +309,12 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--fix":
                 doctorFix = true;
+                break;
+            case "--write":
+                // bili restore: rewrite the log in place (after a timestamped
+                // backup). Every other command ignores it — no destructive path
+                // exists outside `bili restore`.
+                restoreWrite = true;
                 break;
             case "--no-vacuum":
                 sessionsNoVacuum = true;
@@ -476,17 +489,26 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
                 process.exit(2);
             }
+        } else if (cmd === "restore") {
+            // Offline DSH session repair: un-shadows a transcript that a lossy
+            // NATIVE compaction collapsed. Standalone (no proxy, no store).
+            command = "restore";
+            restoreTarget = positional[1];
+            if (restoreTarget === undefined) {
+                console.error('bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--write] [--json]');
+                process.exit(2);
+            }
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, restoreTarget, restoreWrite } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -606,6 +628,24 @@ export async function main(): Promise<void> {
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
+        }
+        return;
+    }
+    if (command === "restore") {
+        // Offline un-shadow of a DSH session log (#4046 follow-up). Standalone:
+        // no proxy, no store — it reads the log and (with --write) rewrites it
+        // after a timestamped backup. Default is a dry-run.
+        try {
+            if (restoreTarget === undefined) {
+                console.error("bili restore: usage: bili restore <session-dir|session.v4.jsonl[.zstd]> [--write] [--json]");
+                process.exit(2);
+            }
+            const result = runDshRestoreFile(restoreTarget, { write: restoreWrite });
+            process.stdout.write(jsonOutput ? JSON.stringify(result) + "\n" : renderDshRestoreReport(result));
+        } catch (error) {
+            const code = error instanceof DshRestoreError && (error.code === "nothing-to-do" || error.code === "unparseable") ? 2 : 1;
+            console.error(`bili restore: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(code);
         }
         return;
     }
