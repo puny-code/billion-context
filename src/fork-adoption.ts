@@ -1,5 +1,5 @@
 import { anthropicToCore, googleToCore, openaiToCore } from "acp-kernel/wire";
-import { BLOCKED_REF, STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
+import { BLOCKED_REF, STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { stripRawStage } from "./marker/engine.js";
 import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
@@ -247,6 +247,16 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
         if (content) session.blockContents.set(b.blockId, structuredClone(content));
     }
     for (const [raw, ref] of Object.entries(plan.refs.byRaw)) {
+        // Injectivity guard (#4046 review): a ref number denotes exactly one
+        // message forever. The FORK path starts from an empty ref space, so this
+        // never bites there; it bites when a caller adopts onto a lane that
+        // already bound the number, where writing byRaw[raw]=ref anyway would
+        // make two raws share one ref and let decompress resolve a citation to
+        // the wrong message.
+        if (ref !== BLOCKED_REF) {
+            const owner = session.state.messageRefs.byRef[ref];
+            if (owner !== undefined && owner !== raw) continue;
+        }
         if (!(raw in session.state.messageRefs.byRaw)) session.state.messageRefs.byRaw[raw] = ref;
         // #2620: byRef must never hold the kernel BLOCKED sentinel (shared by many
         // protected messages) — reserve byRaw only; mirrors planForkAdoption above.
@@ -641,11 +651,14 @@ export interface FoldRecoveryDeps {
 }
 
 /** Outcome of one recovery attempt: how many blocks were adopted, from which
- *  lane, and how many sibling lanes were examined. */
+ *  lane, how many sibling lanes were examined, and how many adopted blocks
+ *  straddled the replay's head (a straddled block means the replay is a TAIL,
+ *  not the full transcript — more may become adoptable later). */
 export interface FoldRecoveryResult {
     adopted: number;
     donorId: string | null;
     scanned: number;
+    straddled: number;
 }
 
 /** Why this plan cannot be adopted into `session` without corrupting its ref
@@ -676,6 +689,31 @@ export function foldRecoveryConflict(session: Session, plan: ForkAdoptionPlan): 
     return null;
 }
 
+/** Merge the donor's CCR slice ONTO the lane's own content store. The adopted
+ *  summaries cite refs as retrievable, so the originals behind them must come
+ *  along — but `adoptContentStore` swaps the whole store, and a cross-lane
+ *  target (unlike a fresh fork) already owns originals of its own (its deleted
+ *  blocks keep their content, #2695). Handing the donor slice over alone would
+ *  DELETE those entries and rewrite the sidecar on the next save. First write
+ *  wins per ref: the lane's own entries stay authoritative, the donor fills the
+ *  rest. Returns null when there is nothing to adopt at all. */
+export function mergeAdoptedContentStore(
+    own: MessageContentStore | undefined,
+    donorSlice: MessageContentStore | null,
+): MessageContentStore | null {
+    if (!donorSlice) return own ?? null;
+    if (!own) return donorSlice;
+    const byRef: MessageContentStore["byRef"] = { ...own.byRef };
+    const byHash: MessageContentStore["byHash"] = { ...own.byHash };
+    for (const [ref, entry] of Object.entries(donorSlice.byRef)) {
+        if (ref in byRef) continue;
+        byRef[ref] = { ...entry };
+        const text = donorSlice.byHash[entry.hash];
+        if (text !== undefined && !(entry.hash in byHash)) byHash[entry.hash] = text;
+    }
+    return { version: 1, byHash, byRef };
+}
+
 /** Adopt a sibling lane's fold ledger into `session` when the lane lost it.
  *  Returns what it did so callers/tests can assert; never throws on a donor
  *  that fails to load (a corrupt sibling must not fail the request). */
@@ -688,7 +726,7 @@ export function recoverFoldsFromSibling(args: {
 }): FoldRecoveryResult {
     const { session, incomingIds, deps, log } = args;
     const maxDonors = args.maxDonors ?? RECOVERY_MAX_DONORS;
-    const nothing = { adopted: 0, donorId: null, scanned: 0 };
+    const nothing: FoldRecoveryResult = { adopted: 0, donorId: null, scanned: 0, straddled: 0 };
     // The lane still owns fold state: nothing was lost, nothing to recover.
     if (session.state.blocks.some((b) => b.active)) return nothing;
     let known: string[];
@@ -737,14 +775,18 @@ export function recoverFoldsFromSibling(args: {
             "warn",
             `[fold-recovery] ${session.id}: lane has no active fold state and none of ${siblings.length} sibling lane(s) covers this replay — folding from scratch`,
         );
-        return { adopted: 0, donorId: null, scanned: siblings.length };
+        return { adopted: 0, donorId: null, scanned: siblings.length, straddled: 0 };
     }
     applyForkAdoption(session, best.plan, best.donor);
     // Same CCR carry as a fork: the adopted summaries cite refs as retrievable,
     // so the originals behind them must come along or every citation misses.
+    // MERGED, not replaced: adoptContentStore swaps the whole store, and this
+    // lane already owned originals of its own (a deleted block keeps its
+    // content, #2695) — replacing would destroy them.
     const wanted = new Set(Object.keys(best.plan.refs.byRef));
-    const storeSlice = cloneStoreForRefs(contentStoreOf(best.donor), wanted);
-    if (storeSlice) adoptContentStore(session, storeSlice);
+    const donorSlice = cloneStoreForRefs(contentStoreOf(best.donor), wanted);
+    const mergedStore = mergeAdoptedContentStore(contentStoreOf(session), donorSlice);
+    if (mergedStore !== null) adoptContentStore(session, mergedStore);
     session.metadata.foldRecoveredFrom = best.donor.id;
     session.metadata.foldRecoveredBlocks = best.plan.adoptedActive;
     markDirty(session);
@@ -752,7 +794,23 @@ export function recoverFoldsFromSibling(args: {
         "info",
         `[fold-recovery] ${session.id}: adopted ${best.plan.adoptedActive} fold block(s) (~${best.plan.adoptedTokens} tok, ${best.plan.straddled} straddled) from sibling lane ${best.donor.id} — the replay would otherwise have re-sent its whole history unfolded`,
     );
-    return { adopted: best.plan.adoptedActive, donorId: best.donor.id, scanned: siblings.length };
+    return { adopted: best.plan.adoptedActive, donorId: best.donor.id, scanned: siblings.length, straddled: best.plan.straddled };
+}
+
+/** Should this request attempt the cross-lane recovery, and how many attempts
+ *  has the lane already spent? Pure so the gate itself is testable (an
+ *  unreachable gate is not a gate): a missed attempt is retried up to
+ *  RECOVERY_MAX_TRIES, a lane that still owns active blocks or has never served
+ *  a request is left alone, and a replay too small to matter is skipped. */
+export function foldRecoveryGate(session: Session, incomingCount: number): { run: boolean; tries: number } {
+    if (session.id.includes("|sub:task:")) return { run: false, tries: 0 };
+    if (session.metadata.foldRecoveryTried === true) return { run: false, tries: 0 };
+    const tries = typeof session.metadata.foldRecoveryTries === "number" ? session.metadata.foldRecoveryTries : 0;
+    if (tries >= RECOVERY_MAX_TRIES) return { run: false, tries };
+    if (session.state.blocks.some((b) => b.active)) return { run: false, tries };
+    if ((session.stats.requests ?? 0) <= 0) return { run: false, tries };
+    if (incomingCount < RECOVERY_MIN_INCOMING) return { run: false, tries };
+    return { run: true, tries };
 }
 
 /** Server hook: run the recovery once per lane, before prepare* assigns refs,
@@ -768,26 +826,16 @@ export function maybeRecoverFoldsFromSibling(args: {
 }): void {
     const { session, protocol, parsed, upstreamOrigin, log } = args;
     if (!SUPPORTED.has(protocol)) return;
-    // A subagent skeleton lane has no history of its own to recover.
-    if (session.id.includes("|sub:task:")) return;
-    if (session.metadata.foldRecoveryTried === true) return;
-    const tries = typeof session.metadata.foldRecoveryTries === "number" ? session.metadata.foldRecoveryTries : 0;
-    if (tries >= RECOVERY_MAX_TRIES) return;
-    if (session.state.blocks.some((b) => b.active)) return;
-    // A lane that has never served a request is not a replay: skipping it keeps
-    // every brand-new conversation off the discovery path (a session that DID
-    // serve and then lost its ledger is exactly the incident shape). Resumed
-    // transcripts under a fresh id keep their own inheritance path (#1486).
-    if ((session.stats.requests ?? 0) <= 0) return;
     const incoming = incomingCoreMessages(protocol, parsed);
-    if (!incoming || incoming.length < RECOVERY_MIN_INCOMING) return;
-    session.metadata.foldRecoveryTries = tries + 1;
+    const gate = foldRecoveryGate(session, incoming?.length ?? 0);
+    if (!gate.run) return;
+    session.metadata.foldRecoveryTries = gate.tries + 1;
     const store = getStore();
-    let result: FoldRecoveryResult = { adopted: 0, donorId: null, scanned: 0 };
+    let result: FoldRecoveryResult = { adopted: 0, donorId: null, scanned: 0, straddled: 0 };
     try {
         result = recoverFoldsFromSibling({
             session,
-            incomingIds: new Set(incoming.map((m) => m.id)),
+            incomingIds: new Set((incoming ?? []).map((m) => m.id)),
             deps: {
                 knownSessionIds: () => store.knownSessionIds(),
                 loadSession: (id) => store.loadSync(id, { protocol, upstreamOrigin }),
@@ -800,9 +848,9 @@ export function maybeRecoverFoldsFromSibling(args: {
         // this lane is trying to serve.
         log("warn", `[fold-recovery] ${session.id}: recovery threw (${e instanceof Error ? e.message : String(e)}) — folding from scratch`);
     }
-    // A successful adoption is permanent (the healthy-lane predicate above now
-    // short-circuits). A miss is retried, bounded: the donor may not have been
-    // saved yet, and a tail-only replay does not prove that the full transcript
-    // would not cover.
-    if (result.adopted > 0) session.metadata.foldRecoveryTried = true;
+    // Latch only on a COMPLETE adoption: a plan that straddles the replay's head
+    // proved the replay is a tail, not the whole transcript — later turns may
+    // cover more blocks, so keep the bounded retries alive. A miss is retried
+    // for the same reason (the donor may not be saved yet).
+    if (result.adopted > 0 && result.straddled === 0) session.metadata.foldRecoveryTried = true;
 }

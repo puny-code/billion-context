@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import {
     conversationOf,
     foldRecoveryConflict,
+    foldRecoveryGate,
+    mergeAdoptedContentStore,
     pickFoldDonor,
     recoverFoldsFromSibling,
     siblingLaneIds,
     type FoldRecoveryDeps,
     type ForkAdoptionPlan,
 } from "../src/fork-adoption.ts";
+import type { MessageContentStore } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 
@@ -326,4 +329,73 @@ test("#4046 recovery survives a corrupt donor and bounded donor scans", () => {
     const result = recoverFoldsFromSibling({ session: lane, incomingIds: new Set(["raw1"]), deps, log, maxDonors: 3 });
     assert.equal(result.scanned, 3, "the scan is capped");
     assert.equal(result.adopted, 1, "a throwing donor must not abort the others");
+});
+
+test("#4046 foldRecoveryGate refuses every non-replay shape and bounds the retries", () => {
+    // The gate used to live inline in maybeRecoverFoldsFromSibling, where no test
+    // could reach it: deleting a condition (or the whole retry cap) left the
+    // suite green. These assertions make each condition load-bearing.
+    const lane = fakeSession("conv-a", [], []);
+    assert.deepEqual(foldRecoveryGate(lane, 40), { run: true, tries: 0 }, "a lost ledger + a full replay is exactly the case");
+
+    // A lane that still owns blocks is healthy — nothing to recover.
+    const healthy = fakeSession("conv-a", [{ id: "own", rawIds: ["raw1"], tokens: 10 }], ["raw1"]);
+    assert.equal(foldRecoveryGate(healthy, 40).run, false);
+
+    // A subagent skeleton lane has no transcript to recover.
+    const skeleton = fakeSession("conv-a|sub:task:1234abcd", [], []);
+    assert.equal(foldRecoveryGate(skeleton, 40).run, false);
+
+    // Never served a request = not a replay (keeps fresh conversations off the
+    // discovery path).
+    const virgin = fakeSession("conv-a", [], []);
+    virgin.stats.requests = 0;
+    assert.equal(foldRecoveryGate(virgin, 40).run, false);
+
+    // Too small to matter: the scan is synchronous disk I/O on the request path.
+    assert.equal(foldRecoveryGate(lane, 7).run, false, "below RECOVERY_MIN_INCOMING the gate stays shut");
+    assert.equal(foldRecoveryGate(lane, 8).run, true, "and exactly at it, open");
+
+    // Bounded retries: a latch (complete adoption) is permanent, a spent budget
+    // is permanent, and the third attempt is the last one.
+    const latched = fakeSession("conv-a", [], []);
+    latched.metadata.foldRecoveryTried = true;
+    assert.equal(foldRecoveryGate(latched, 40).run, false, "a complete adoption latches");
+
+    const spent = fakeSession("conv-a", [], []);
+    spent.metadata.foldRecoveryTries = 3;
+    assert.equal(foldRecoveryGate(spent, 40).run, false, "RECOVERY_MAX_TRIES is a hard cap");
+    const lastChance = fakeSession("conv-a", [], []);
+    lastChance.metadata.foldRecoveryTries = 2;
+    assert.deepEqual(foldRecoveryGate(lastChance, 40), { run: true, tries: 2 }, "the last allowed attempt still runs");
+});
+
+test("#4046 mergeAdoptedContentStore keeps the lane's own originals", () => {
+    // adoptContentStore swaps the whole store, so handing it the donor slice
+    // alone would delete originals this lane already owned (a deleted block keeps
+    // its content, #2695). The merge is first-write-wins per ref.
+    const own: MessageContentStore = {
+        version: 1,
+        byHash: { h1: "TARGET-ONLY-ORIGINAL" },
+        byRef: { m00001: { hash: "h1", kind: "text", tokens: 5, rawId: "raw1", chars: 5, head: "TARGET" } },
+    };
+    const donor: MessageContentStore = {
+        version: 1,
+        byHash: { h1: "DONOR-DIFFERENT-TEXT", h2: "DONOR-ORIGINAL" },
+        byRef: {
+            m00001: { hash: "h1", kind: "text", tokens: 5, rawId: "raw1", chars: 5, head: "DONOR" },
+            m00002: { hash: "h2", kind: "text", tokens: 7, rawId: "raw2", chars: 7, head: "DONOR" },
+        },
+    };
+    const merged = mergeAdoptedContentStore(own, donor);
+    assert.notEqual(merged, null);
+    assert.equal(merged!.byRef.m00001.hash, "h1", "the lane's own entry stays authoritative for a ref both sides hold");
+    assert.equal(merged!.byHash.h1, "TARGET-ONLY-ORIGINAL", "and its original text is NOT replaced by the donor's");
+    assert.equal(merged!.byRef.m00002.hash, "h2", "the donor fills refs the lane never had");
+    assert.equal(merged!.byHash.h2, "DONOR-ORIGINAL");
+    // Degenerate shapes: nothing to adopt keeps what the lane has; a lane with no
+    // store takes the donor slice as-is.
+    assert.equal(mergeAdoptedContentStore(own, null), own);
+    assert.equal(mergeAdoptedContentStore(undefined, donor), donor);
+    assert.equal(mergeAdoptedContentStore(undefined, null), null);
 });
