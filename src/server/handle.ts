@@ -36,7 +36,7 @@ import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeS
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
-import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
+import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork, maybeRecoverFoldsFromSibling } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
@@ -1439,6 +1439,21 @@ async function handleRequest(
             } catch (err) {
                 log("warn", `[fork-adoption] failed (${String(err)}); continuing with fresh state (#629)`);
             }
+        }
+        // Fold-state recovery (#4046): the resolver keys state by conversation
+        // id PLUS a `|sub:` persona/fork fingerprint, so a model or system-prompt
+        // change forks a NEW lane with zero fold state and switching back
+        // re-enters the raw lane — whose record may be a refs-only husk while the
+        // sibling lane still owns the folded blocks. The client then replays its
+        // whole history (1.29M tokens vs a 1M window in the incident), which
+        // preflight cannot fold down inside one turn. Recover the sibling's
+        // ledger BEFORE prepare*/processTurn assigns refs; the recovery is a
+        // no-op on a healthy lane, on a non-replay and when nothing covers the
+        // replay (it then logs what it saw and folds from scratch, as today).
+        try {
+            maybeRecoverFoldsFromSibling({ session, protocol, parsed, upstreamOrigin, log });
+        } catch (err) {
+            log("warn", `[fold-recovery] failed (${String(err)}); continuing with the lane's own state`);
         }
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the

@@ -539,3 +539,187 @@ export function reconcileDerivedLineage(
     }
     return adopted;
 }
+
+// ── Fold-state recovery from a sibling lane (#4046) ──────────────────────────
+//
+// A conversation can accumulate several LANES: the resolver keys state by
+// (conversation id) + (`|sub:` persona/fork fingerprint, `|sub:task:` kind
+// skeleton), and every model switch or system-prompt re-render that changes the
+// fingerprint forks a NEW lane with zero compression state. Switching back then
+// re-enters the RAW lane through a raw-continuing rung, so the request lands on
+// whatever record sits at the raw key — in the incident that produced this
+// module, a 15-ref/0-block husk — while the 86 folded blocks stayed under the
+// sibling `|sub:` lane, written by the same conversation and never consulted.
+// The client then resends its whole history raw: 1.29M tokens against a 1M
+// window that no amount of summarization can close in one turn (fold coverage
+// is ~5%/round against a ~1.8x overshoot), so the session 400s on every message.
+//
+// The recovery is the fork-adoption machinery applied across lanes instead of
+// down a lineage: a block is adoptable iff every message id it covers is present
+// in the incoming request (raw ids are content hashes, so the same bytes yield
+// the same ids in every lane), which is exactly what a full-history replay
+// provides and exactly why a lost fold ledger is recoverable without an LLM.
+// Nothing is adopted when the current lane still has active blocks, when no
+// sibling covers the replay, or on a lane the resolver owns for a subagent
+// skeleton — the ledger is then simply rebuilt from raw, as today.
+
+/** Most sibling lanes a single recovery will load. Cross-lane siblings are
+ *  minted by model/persona switches, so a handful is already exceptional; the
+ *  cap keeps a pathological tree from turning one request into a disk walk. */
+const RECOVERY_MAX_DONORS = 8;
+/** Below this many inbound messages a replay carries too little history for a
+ *  fold ledger to be worth adopting (and a fresh session's first prompt is not
+ *  a replay at all). */
+const RECOVERY_MIN_INCOMING = 2;
+
+/** The CONVERSATION a session id belongs to: the client's own id, i.e. the text
+ *  before the resolver's first `|` suffix. Pure. */
+export function conversationOf(sessionId: string): string {
+    const i = sessionId.indexOf("|");
+    return i <= 0 ? sessionId : sessionId.slice(0, i);
+}
+
+/** Lane ids of the same conversation other than `sessionId`. The raw lane
+ *  itself is not a sibling of its `|sub:` lanes, and lanes of a different
+ *  conversation are never candidates. Pure and order-preserving (the caller
+ *  bounds the scan). */
+export function siblingLaneIds(known: Iterable<string>, sessionId: string): string[] {
+    const base = conversationOf(sessionId);
+    const out: string[] = [];
+    for (const id of known) {
+        if (id === sessionId || !id.includes("|")) continue;
+        if (conversationOf(id) !== base) continue;
+        out.push(id);
+    }
+    return out;
+}
+
+/** Pick the donor whose plan carries the most folded history. Pure; ties go to
+ *  the larger token total (a block count alone cannot tell a 30K-token fold
+ *  from a 300-token one). */
+export function pickFoldDonor<T extends { plan: { adoptedActive: number; adoptedTokens: number } }>(
+    candidates: readonly T[],
+): T | null {
+    let best: T | null = null;
+    for (const c of candidates) {
+        if (best === null) {
+            best = c;
+            continue;
+        }
+        if (c.plan.adoptedActive > best.plan.adoptedActive) {
+            best = c;
+            continue;
+        }
+        if (c.plan.adoptedActive === best.plan.adoptedActive && c.plan.adoptedTokens > best.plan.adoptedTokens) best = c;
+    }
+    return best;
+}
+
+export interface FoldRecoveryDeps {
+    /** Every session id the store can enumerate (replica index, else tree). */
+    knownSessionIds: () => string[];
+    /** Load a lane by id from disk (null when it cannot be resolved). */
+    loadSession: (id: string) => Session | null;
+    /** In-memory lane, when resident (avoids a disk read). */
+    peek: (id: string) => Session | undefined;
+}
+
+/** Adopt a sibling lane's fold ledger into `session` when the lane lost it.
+ *  Returns what it did so callers/tests can assert; never throws on a donor
+ *  that fails to load (a corrupt sibling must not fail the request). */
+export function recoverFoldsFromSibling(args: {
+    session: Session;
+    incomingIds: ReadonlySet<string>;
+    deps: FoldRecoveryDeps;
+    log: (level: string, msg: string) => void;
+    maxDonors?: number;
+}): { adopted: number; donorId: string | null; scanned: number } {
+    const { session, incomingIds, deps, log } = args;
+    const maxDonors = args.maxDonors ?? RECOVERY_MAX_DONORS;
+    const nothing = { adopted: 0, donorId: null, scanned: 0 };
+    // The lane still owns fold state: nothing was lost, nothing to recover.
+    if (session.state.blocks.some((b) => b.active)) return nothing;
+    let known: string[];
+    try {
+        known = deps.knownSessionIds();
+    } catch {
+        return nothing;
+    }
+    const siblings = siblingLaneIds(known, session.id).slice(0, maxDonors);
+    if (siblings.length === 0) return nothing;
+    const candidates: Array<{ plan: ForkAdoptionPlan; donor: Session }> = [];
+    for (const id of siblings) {
+        try {
+            const donor = deps.peek(id) ?? deps.loadSession(id);
+            if (!donor) continue;
+            if (!donor.state.blocks.some((b) => b.active)) continue;
+            const plan = planForkAdoption(donor, incomingIds as Set<string>, { seedAllRefs: true });
+            if (plan.adoptedActive === 0) continue;
+            candidates.push({ plan, donor });
+        } catch {
+            // A corrupt or half-written sibling is not a reason to fail the
+            // request this lane is trying to serve.
+            continue;
+        }
+    }
+    const best = pickFoldDonor(candidates);
+    if (!best) {
+        log(
+            "warn",
+            `[fold-recovery] ${session.id}: lane has no active fold state and none of ${siblings.length} sibling lane(s) covers this replay — folding from scratch`,
+        );
+        return { adopted: 0, donorId: null, scanned: siblings.length };
+    }
+    applyForkAdoption(session, best.plan, best.donor);
+    // Same CCR carry as a fork: the adopted summaries cite refs as retrievable,
+    // so the originals behind them must come along or every citation misses.
+    const wanted = new Set(Object.keys(best.plan.refs.byRef));
+    const storeSlice = cloneStoreForRefs(contentStoreOf(best.donor), wanted);
+    if (storeSlice) adoptContentStore(session, storeSlice);
+    session.metadata.foldRecoveredFrom = best.donor.id;
+    session.metadata.foldRecoveredBlocks = best.plan.adoptedActive;
+    markDirty(session);
+    log(
+        "info",
+        `[fold-recovery] ${session.id}: adopted ${best.plan.adoptedActive} fold block(s) (~${best.plan.adoptedTokens} tok, ${best.plan.straddled} straddled) from sibling lane ${best.donor.id} — the replay would otherwise have re-sent its whole history unfolded`,
+    );
+    return { adopted: best.plan.adoptedActive, donorId: best.donor.id, scanned: siblings.length };
+}
+
+/** Server hook: run the recovery once per lane, before prepare* assigns refs,
+ *  when the lane has no active blocks and the request is a replay big enough to
+ *  hold a fold ledger. Cheap when the lane is healthy (one predicate) and when
+ *  nothing is recoverable (one log line). */
+export function maybeRecoverFoldsFromSibling(args: {
+    session: Session;
+    protocol: WireProtocol;
+    parsed: unknown;
+    upstreamOrigin: string;
+    log: (level: string, msg: string) => void;
+}): void {
+    const { session, protocol, parsed, upstreamOrigin, log } = args;
+    if (!SUPPORTED.has(protocol)) return;
+    // A subagent skeleton lane has no history of its own to recover.
+    if (session.id.includes("|sub:task:")) return;
+    if (session.metadata.foldRecoveryTried === true) return;
+    if (session.state.blocks.some((b) => b.active)) return;
+    // A lane that has never served a request is not a replay: skipping it keeps
+    // every brand-new conversation off the discovery path (a session that DID
+    // serve and then lost its ledger is exactly the incident shape). Resumed
+    // transcripts under a fresh id keep their own inheritance path (#1486).
+    if ((session.stats.requests ?? 0) <= 0) return;
+    const incoming = incomingCoreMessages(protocol, parsed);
+    if (!incoming || incoming.length < RECOVERY_MIN_INCOMING) return;
+    session.metadata.foldRecoveryTried = true;
+    const store = getStore();
+    recoverFoldsFromSibling({
+        session,
+        incomingIds: new Set(incoming.map((m) => m.id)),
+        deps: {
+            knownSessionIds: () => store.knownSessionIds(),
+            loadSession: (id) => store.loadSync(id, { protocol, upstreamOrigin }),
+            peek: (id) => peekSession(id),
+        },
+        log,
+    });
+}
