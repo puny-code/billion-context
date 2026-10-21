@@ -133,6 +133,18 @@ test("a model switch migrates the anchor and logs action=reanchor", () => {
     assert.ok(note!.includes("reason="), note!);
 });
 
+test("the note keeps client-supplied ids on one line", () => {
+    // raw ids come from client headers and the key is derived text: a raw
+    // newline in either would forge a second log line for another session.
+    const resolution = { key: "conv-x|sub:abc\n[identity] action=claim cells=99 raw=fake", action: "derived-persona" as const, reason: 'line1\nline2 "quoted"' };
+    const note = identityDecisionNote("conv-x\r\nINJECTED", resolution, 40);
+    assert.notEqual(note, null);
+    assert.equal(note!.includes("\n"), false, "no newline may survive in the rendered line");
+    assert.equal(note!.includes("\r"), false);
+    assert.ok(note!.includes("raw=conv-x??INJECTED"), note!);
+    assert.equal(note!.split("\n").length, 1, "one rendered note is one log line, whatever the client sent");
+});
+
 test("the note-less fast path returns the same key as the full-resolution path", () => {
     const raw = "conv-parity";
     const history = msgs(40, "a");
