@@ -1481,9 +1481,13 @@ export class SessionStore {
     /** Every session id this store can enumerate, for cross-lane recovery
      *  (fork-adoption.ts `recoverFoldsFromSibling`). DISCOVERY ONLY — loads
      *  still go through loadSync, which stays legacy-first in shadow mode, so a
-     *  stale replica row can never be served as state. Prefers the replica
-     *  index (one query) and only falls back to reading envelope ids off the
-     *  walked tree when no unified backend is attached. */
+     *  stale replica row can never be served as state. Unions the replica index
+     *  with the walked file tree: the index is backfilled asynchronously, so
+     *  right after a restart it can be MISSING a lane whose file is already on
+     *  disk — exactly the window in which a crashed lane asks for recovery
+     *  (the incident's cold load happened seconds after a restart). The walk is
+     *  bounded (one head read per file, no payload decode) and this method is
+     *  only reached by a bounded recovery attempt, never per request. */
     knownSessionIds(): string[] {
         if (!this.enabled) return [];
         const ids = new Set<string>();
@@ -1494,7 +1498,6 @@ export class SessionStore {
                 // Replica offline/unavailable — the tree below still answers.
             }
         }
-        if (ids.size > 0) return [...ids];
         for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
             if (!existsSync(root)) continue;
             for (const file of walkJsonFilesSync(root)) {

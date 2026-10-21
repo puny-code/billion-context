@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
     conversationOf,
+    foldRecoveryConflict,
     pickFoldDonor,
     recoverFoldsFromSibling,
     siblingLaneIds,
     type FoldRecoveryDeps,
+    type ForkAdoptionPlan,
 } from "../src/fork-adoption.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
@@ -112,6 +114,27 @@ test("#4046 siblingLaneIds keeps same-conversation lanes and never the raw lane"
     assert.deepEqual(siblingLaneIds(known, "conv-a|sub:zzzzzzzzzzzzzzzz"), ["conv-a|sub:aaaaaaaaaaaaaaaa", "conv-a|sub:bbbbbbbbbbbbbbbb"]);
 });
 
+test("#4046 siblingLaneIds drops task-skeleton lanes and orders persona lanes first", () => {
+    // A `|sub:task:` lane carries extracted memory, never a conversation
+    // transcript: its blocks can not cover a replay's refs, so it must not
+    // consume a donor slot (and a pathological tree can mint many of them).
+    const known = [
+        "conv-a",
+        "conv-a|sub:bbbbbbbbbbbbbbbb",
+        "conv-a|sub:task:dddddddd",
+        "conv-a|sub:aaaaaaaaaaaaaaaa",
+        "conv-a|other",
+    ];
+    assert.deepEqual(siblingLaneIds(known, "conv-a"), [
+        "conv-a|sub:aaaaaaaaaaaaaaaa",
+        "conv-a|sub:bbbbbbbbbbbbbbbb",
+        "conv-a|other",
+    ]);
+    // Order is deterministic: the store's enumeration order is not, and a
+    // donor-budget cap that depended on it would be a coin flip.
+    assert.deepEqual(siblingLaneIds([...known].reverse(), "conv-a"), siblingLaneIds(known, "conv-a"));
+});
+
 test("#4046 pickFoldDonor prefers the most folded history, then the larger fold", () => {
     const plan = (adoptedActive: number, adoptedTokens: number) => ({ plan: { adoptedActive, adoptedTokens } });
     assert.equal(pickFoldDonor([]), null);
@@ -198,6 +221,92 @@ test("#4046 recovery skips all-inactive ledgers and other conversations", () => 
     assert.equal(result.adopted, 0);
     assert.deepEqual(loads, ["conv-a|sub:inactive0000000"], "only same-conversation lanes may be read");
     assert.equal(lane.state.blocks.length, 0);
+});
+
+test("#4046 recovery refuses a donor whose ref numbering disagrees with the lane", () => {
+    // The incident husk was refs-only (15 refs), not empty: it had already bound
+    // its first messages to numbers. The kernel's assignRefs never re-numbers an
+    // existing mapping, so adopting a plan that binds an occupied number to a
+    // DIFFERENT message would make compress/decompress act on the wrong live
+    // message — worse than the lost ledger. All-or-nothing: refuse, don't
+    // "mostly adopt".
+    const lane = fakeSession("conv-a", [], ["raw1"]);
+    const donor = fakeSession("conv-a|sub:919f2f1b4676a9ad", [{ id: "b1", rawIds: ["raw2"], tokens: 900 }], []);
+    donor.state.messageRefs.byRaw = { raw2: "m00001" };
+    donor.state.messageRefs.byRef = { m00001: "raw2" };
+    const { log, lines } = logger();
+    const result = recoverFoldsFromSibling({
+        session: lane,
+        incomingIds: new Set(["raw1", "raw2"]),
+        deps: depsOf({ "conv-a": lane, "conv-a|sub:919f2f1b4676a9ad": donor }),
+        log,
+    });
+    assert.equal(result.adopted, 0);
+    assert.equal(result.donorId, null);
+    assert.equal(lane.state.blocks.length, 0, "a refused adoption must not be partial");
+    assert.deepEqual(lane.state.messageRefs.byRaw, { raw1: "m00001" }, "the lane's ref space is untouched");
+    assert.equal(lane.state.messageRefs.byRef.m00001, "raw1");
+    assert.ok(lines.some((l) => l.includes("ref-space safety")), "the refusal must be logged with its reason");
+});
+
+test("#4046 foldRecoveryConflict names the collision and clears a compatible plan", () => {
+    const lane = fakeSession("conv-a", [], ["raw1", "raw2"]);
+    // Same numbering for the messages both lanes know: adoptable (this is the
+    // real incident shape — both lanes derive refs from the same transcript).
+    const agreeing: ForkAdoptionPlan = {
+        blocks: [],
+        blockIds: new Set<string>(),
+        adoptedActive: 1,
+        adoptedTokens: 100,
+        straddled: 0,
+        maxRef: "m00002",
+        refs: { byRaw: { raw1: "m00001", raw2: "m00002" }, byRef: { m00001: "raw1", m00002: "raw2" } },
+        tokenSnapshot: {},
+        nextBlockId: 1,
+        nextRunId: 1,
+    };
+    assert.equal(foldRecoveryConflict(lane, agreeing), null);
+    // And the ref disagreement is reported with both numbers.
+    const refClash: ForkAdoptionPlan = { ...agreeing, refs: { byRaw: { raw1: "m00009" }, byRef: { m00009: "raw1" } } };
+    assert.match(String(foldRecoveryConflict(lane, refClash)), /m00001/);
+});
+
+test("#4046 recovery refuses a donor whose block id the lane already owns", () => {
+    // The husk kept an inactive block record while the donor carries a block of
+    // the same id: adopting would push a duplicate id into one lane (and
+    // overwrite the block's hidden content) — the plan never merges records.
+    const lane = fakeSession("conv-a", [{ id: "b1", rawIds: [], tokens: 0, active: false }], []);
+    const donor = fakeSession("conv-a|sub:919f2f1b4676a9ad", [{ id: "b1", rawIds: ["raw1"], tokens: 900 }], ["raw1"]);
+    const { log, lines } = logger();
+    const result = recoverFoldsFromSibling({
+        session: lane,
+        incomingIds: new Set(["raw1"]),
+        deps: depsOf({ "conv-a": lane, "conv-a|sub:919f2f1b4676a9ad": donor }),
+        log,
+    });
+    assert.equal(result.adopted, 0);
+    assert.equal(lane.state.blocks.length, 1, "the lane's own block record stays as it was");
+    assert.equal(lane.state.blocks[0].active, false, "and is not silently activated by an adoption");
+    assert.ok(lines.some((l) => l.includes("already exists")), "the block collision is the logged reason");
+});
+
+test("#4046 recovery ignores a sibling lane written for another protocol", () => {
+    // Refs, message ids and the block sidecar store are protocol-shaped; a
+    // ledger from another wire protocol cannot be half-adopted safely.
+    const lane = fakeSession("conv-a", [], []);
+    lane.meta.protocol = "anthropic";
+    const donor = fakeSession("conv-a|sub:919f2f1b4676a9ad", [{ id: "b1", rawIds: ["raw1"], tokens: 900 }], ["raw1"]);
+    donor.meta.protocol = "openai";
+    const { log, lines } = logger();
+    const result = recoverFoldsFromSibling({
+        session: lane,
+        incomingIds: new Set(["raw1"]),
+        deps: depsOf({ "conv-a": lane, "conv-a|sub:919f2f1b4676a9ad": donor }),
+        log,
+    });
+    assert.equal(result.adopted, 0);
+    assert.equal(lane.state.blocks.length, 0);
+    assert.ok(lines.some((l) => l.includes("protocol openai")), "a cross-protocol donor must be named in the log");
 });
 
 test("#4046 recovery survives a corrupt donor and bounded donor scans", () => {
