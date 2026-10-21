@@ -2103,6 +2103,12 @@ async function handleRequest(
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
         const nativeWindow = reqConfig.modelContextLimit;
+        // F8 (#4046 review): the NATIVE pre-reservation window, recorded apart
+        // from effectiveContextLimit. The output-restore fence has to judge
+        // input+output against the provider's ceiling exactly ONCE; fencing on
+        // the post-reservation window subtracts the reservation twice and can
+        // refuse a restore the provider would accept (#3833's own shape).
+        session.metadata.nativeContextLimit = nativeWindow;
         if (shouldReserveOutputHeadroom(protocol)) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;

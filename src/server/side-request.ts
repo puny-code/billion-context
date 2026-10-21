@@ -347,10 +347,13 @@ const OUTPUT_RESTORE_MIN_MARGIN = 2048;
  *  the judged window through the output-headroom reservation — a guaranteed
  *  over-window 400 either way. Inputs are read off the session (no threading
  *  needed):
- *   - window: `metadata.effectiveContextLimit`, the window bili actually judges
- *     this session against (written every turn AFTER the output-headroom
- *     reservation), so the bound never re-inflates a window the last turn
- *     already narrowed;
+ *   - window: `metadata.nativeContextLimit`, the provider's own ceiling BEFORE
+ *     the output-headroom reservation (handle.ts records it every turn next to
+ *     effectiveContextLimit). Deliberately NOT `effectiveContextLimit`: that one
+ *     is POST-reservation, so fencing on it subtracts the reservation twice and
+ *     can refuse a restore the provider would accept — #3833's own shape (W=1M,
+ *     last max_tokens 256K → effective 750K, input 827,069) yields a negative
+ *     bound while input+ceiling 958,141 fits the 1M window;
  *   - inputUpperBound: `stats.localInputEstimate`, the post-fold OUTBOUND upper
  *     bound recorded by the last prepare (#728) — the same quantity the #453
  *     clamp consumes. Deliberately NOT `estimateRawBodyTokens(parsed)`: the raw
@@ -364,13 +367,29 @@ function boundRestoreTargetByInput(
     target: number,
     session: { metadata: Record<string, unknown>; stats?: { localInputEstimate?: number } },
 ): { target: number; window?: number; inputUpperBound?: number; margin?: number } {
-    const rawWindow = session.metadata.effectiveContextLimit;
+    const rawWindow = session.metadata.nativeContextLimit;
     const window = typeof rawWindow === "number" && Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : undefined;
     const rawInput = session.stats?.localInputEstimate;
     const inputUpperBound = typeof rawInput === "number" && Number.isFinite(rawInput) && rawInput > 0 ? rawInput : undefined;
     if (window === undefined || inputUpperBound === undefined) return { target };
     const margin = Math.max(OUTPUT_RESTORE_MIN_MARGIN, Math.ceil(inputUpperBound * OUTPUT_RESTORE_MARGIN_PCT));
     return { target: Math.min(target, Math.floor(window - inputUpperBound - margin)), window, inputUpperBound, margin };
+}
+
+// F8: one-shot refusal warning per session. Without it a lane whose input fills
+// the window logs the refusal on EVERY turn (the same estimate keeps producing
+// the same bound) — the refusal itself is deliberately NOT a latch, because a
+// fold on a later turn may legitimately free the room.
+const warnedRestoreRefused = new Set<string>();
+const WARNED_RESTORE_REFUSED_CAP = 4096;
+function noteRestoreRefused(sessionId: string): boolean {
+    if (warnedRestoreRefused.has(sessionId)) return false;
+    if (warnedRestoreRefused.size >= WARNED_RESTORE_REFUSED_CAP) warnedRestoreRefused.clear();
+    warnedRestoreRefused.add(sessionId);
+    return true;
+}
+export function _resetRestoreRefusedForTest(): void {
+    warnedRestoreRefused.clear();
 }
 
 // #1840/#3071: one-shot "restore has no ceiling" warnings, keyed by SESSION+MODEL.
@@ -555,8 +574,19 @@ export function restoreOutputBudget(
         // keep the client's starvation (recoverable) instead of writing a value
         // that guarantees an over-window rejection (no body to inspect).
         const bounded = boundRestoreTargetByInput(target, session);
-        if (bounded.window !== undefined && bounded.target <= SIDE_REQUEST_MAX_TOKENS) {
-            log("warn", `[${session.id}] output budget restore REFUSED ${value} -> (would have been ${target}): the input side fills the window (window ${bounded.window} - input upper bound ${bounded.inputUpperBound} - margin ${bounded.margin} = ${bounded.target}), so the restored value cannot fit alongside the messages and would guarantee an over-window rejection — keeping the client's ${value} (#F8)`);
+        // Refuse only when the INPUT bound is what limits the restore and what it
+        // leaves cannot reach the DOCUMENTED absolute floor (32,768, #3071): a
+        // sub-floor value is the death-rattle zone (too small to emit a compress
+        // call), so keeping the client's own (recoverable) starvation is the
+        // honest choice. A target BELOW the bound is not this fence's business
+        // — that is the session's own proven high-water (#3406), and shrinking or
+        // refusing it would re-introduce #3406. One warn per session: the same
+        // estimate keeps producing the same refusal, and a later fold may free
+        // the room.
+        if (bounded.window !== undefined && bounded.target < target && bounded.target < OUTPUT_RESTORE_ABSOLUTE_FLOOR) {
+            if (noteRestoreRefused(session.id)) {
+                log("warn", `[${session.id}] output budget restore REFUSED ${value} -> (would have been ${target}, bound ${bounded.target}): the input side fills the window (window ${bounded.window} - input upper bound ${bounded.inputUpperBound} - margin ${bounded.margin}), below the ${OUTPUT_RESTORE_ABSOLUTE_FLOOR}-token capability floor — keeping the client's ${value} (#F8)`);
+            }
             return;
         }
         const note = ceiling !== undefined
