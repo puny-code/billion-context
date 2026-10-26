@@ -464,7 +464,7 @@ const en: Dict = {
 };
 
 function readOrigin(): string | undefined {
-    const g = globalThis as { __BILI__?: { origin?: unknown; relay?: unknown } };
+    const g = globalThis as { __BILI__?: { origin?: unknown; relay?: unknown; ui?: unknown } };
     const snap = g.__BILI__;
     // #3373: relay snapshot — the entry serves the admin surface itself, so
     // the base is same-origin ("" = entry-relative paths). Prefix gateways
@@ -472,6 +472,16 @@ function readOrigin(): string | undefined {
     if (snap !== undefined && snap.relay === true) return "";
     const origin = snap?.origin;
     return typeof origin === "string" && origin.length > 0 ? origin : undefined;
+}
+
+// USER-REQUESTED (no issue): global master gate for all three client faces,
+// DEFAULT OFF. The host stamps the effective `dsh.uiFaces` value into the
+// __BILI__ snapshot (src/agent/dsh-native.ts); a missing or non-true flag
+// means the faces stay unregistered — with other context plugins installed
+// the extra tabs are noise.
+function readUiFaces(): boolean {
+    const g = globalThis as { __BILI__?: { ui?: unknown } };
+    return g.__BILI__?.ui === true;
 }
 
 function openExternal(url: string): void {
@@ -608,6 +618,11 @@ export function apply(ctx: ClientContext): void {
         () => ctx.locale.register(NS, { zh: zhDict, en: enDict }),
         "bili: dictionaries",
     );
+    // USER-REQUESTED (no issue): global master gate, default off — register
+    // no faces (settings entry, bundle config panel, Context tab) unless the
+    // host snapshot opted in. The locale registration above stays: it is
+    // inert without faces and keeps the bundle's dictionary contract stable.
+    if (!readUiFaces()) return;
     const t = ctx.locale.bind(NS);
     // #3862: per-session Context tab (conversation.view slot). Native DOM card
     // fed by the proxy's live contextView — see parseCtxStatus for the wire

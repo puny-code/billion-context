@@ -900,6 +900,14 @@ interface DshFileSettings {
      *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
      *  restores the #1729 refusal path). */
     authoredCompaction?: boolean;
+    /** USER-REQUESTED (no issue): global master gate for the dsh client UI
+     *  faces (settings.section entry, plugins.bundle.config panel,
+     *  conversation.view Context tab). DEFAULT OFF — with other context
+     *  plugins installed the extra tabs are noise. `true` or env
+     *  `BILI_DSH_UI_FACES=1` registers the faces; the host stamps the
+     *  effective value into the `__BILI__` snapshot (see
+     *  src/agent/dsh-native.ts) and the client bundle gates on it. */
+    uiFaces?: boolean;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -2517,6 +2525,23 @@ export function resolveNativeAttachLanePriority(): string[] {
  *  restart. */
 export function adminRelayEnabled(): boolean {
     return loadConfigFile().security?.adminRelay === true;
+}
+
+/** USER-REQUESTED (no issue): the dsh client UI faces (settings entry,
+ *  bundle config panel, conversation.view Context tab) sit behind a global
+ *  master gate, DEFAULT OFF — with other context plugins installed the
+ *  extra tabs are noise. Env `BILI_DSH_UI_FACES` wins both ways
+ *  ("1"/"true"/"on" enables, "0"/"false"/"off" disables); otherwise the
+ *  file's `dsh.uiFaces` decides (`true` enables). Read per use — the config
+ *  file cache makes this cheap; the switch takes effect at the next
+ *  snapshot publish (host reload / session load — slot registration
+ *  happens at plugin load, no hot-plug). */
+export function dshUiFacesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+    const norm = (v: string | undefined): string => (v ?? "").trim().toLowerCase();
+    const fromEnv = norm(env.BILI_DSH_UI_FACES);
+    if (fromEnv === "1" || fromEnv === "true" || fromEnv === "on") return true;
+    if (fromEnv === "0" || fromEnv === "false" || fromEnv === "off") return false;
+    return loadConfigFile().dsh?.uiFaces === true;
 }
 
 /** #2877: the native-hook discovery policy. "own-lane" (default) rides only a

@@ -2890,6 +2890,7 @@ export const WEB_CLIENT = `(function () {
         let draft = {};
         try { const p = parseConfigDraft(fe && fe.value ? fe.value : "{}"); draft = p && typeof p === "object" && !Array.isArray(p) ? p : {}; } catch (e) { return; }
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
+        function dshOf(d) { return (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
         const brokenNote = document.createElement("div");
@@ -2912,6 +2913,8 @@ export const WEB_CLIENT = `(function () {
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
             imgRow.inp.checked = draft.imageRescale !== false;
+            const dshSec = dshOf(draft);
+            uiRow.inp.checked = dshSec ? dshSec.uiFaces === true : false;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
@@ -3000,6 +3003,24 @@ export const WEB_CLIENT = `(function () {
         imgHint.className = "dim small";
         imgHint.textContent = t("cfg.q_imgrescale_hint");
         imgRow.ctl.appendChild(imgHint);
+        const uiRow = row("quick-uifaces", t("cfg.q_uifaces"));
+        qCtrls.push(uiRow.inp);
+        uiRow.inp.addEventListener("change", () => commit((d) => {
+            if (uiRow.inp.checked) {
+                if (!dshOf(d)) d.dsh = {};
+                dshOf(d).uiFaces = true;
+            } else {
+                const s = dshOf(d);
+                if (s) {
+                    delete s.uiFaces;
+                    if (Object.keys(s).length === 0) delete d.dsh;
+                }
+            }
+        }));
+        const uiHint = document.createElement("span");
+        uiHint.className = "dim small";
+        uiHint.textContent = t("cfg.q_uifaces_hint");
+        uiRow.ctl.appendChild(uiHint);
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {

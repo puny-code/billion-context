@@ -85,7 +85,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
             assert.equal(listeners.length, 1);
             const table: InjectRow[] = [];
             listeners[0](table);
-            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: proxy.origin } }]);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: proxy.origin, ui: false } }]);
         });
     } finally {
         proxy.close();
@@ -392,7 +392,7 @@ type Mounted = {
 // globals. React hooks are emulated with per-mount state: useState persists
 // across renders, useEffect follows React semantics (#2288) — run on mount,
 // re-run only when their deps change (prior cleanup first).
-async function mountClient(extra: Record<string, unknown>, slotName = "settings.section"): Promise<Mounted> {
+async function mountClient(extra: Record<string, unknown>, slotName = "settings.section", requireSlot = true): Promise<Mounted> {
     const code = await clientCode();
     const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
     const sandbox: Record<string, unknown> = {};
@@ -462,7 +462,7 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
             },
         },
     });
-    assert.ok(components.has(slotName), `slot ${slotName} must be registered`);
+    assert.ok(!requireSlot || components.has(slotName), `slot ${slotName} must be registered`);
     const bound = components.get(slotName)!;
     return {
         // Hook indices restart on every render (React matches hooks by
@@ -487,7 +487,7 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
 test("#1590/#2125: client bundle registers the settings.section entry bili AND the plugins.bundle.config panel (wrapper id, require purity, both render branches)", async () => {
     const opened: string[] = [];
     const extra: Record<string, unknown> = {
-        __BILI__: { origin: "http://127.0.0.1:8787" },
+        __BILI__: { origin: "http://127.0.0.1:8787", ui: true },
         open: (url: string) => opened.push(url),
         // #3100: the embed pre-flight answers HTML here — every build since
         // v0.1.189 serves the query-form UI route.
@@ -619,7 +619,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     // Degraded: no snapshot AND a host without the live route (fetch rejects)
     // — the entry stays degraded in BOTH slots.
     for (const slot of ["settings.section", "plugins.bundle.config"]) {
-        const dm = await mountClient({ open: (_url: string) => {}, fetch: async () => { throw new Error("no route"); }, setTimeout, clearTimeout }, slot);
+        const dm = await mountClient({ __BILI__: { ui: true }, open: (_url: string) => {}, fetch: async () => { throw new Error("no route"); }, setTimeout, clearTimeout }, slot);
         dm.resetHooks();
         const dtree = dm.component() as ElementNode;
         assert.equal(findButton(dtree), undefined, `${slot}: no buttons while degraded`);
@@ -636,6 +636,7 @@ test("#3373: relay mode — probe {origin:null,relay:true} binds same-origin; pr
         // Root relay deployment: no response URL ⇒ base "" (same-origin paths).
         const opened: string[] = [];
         const m = await mountClient({
+            __BILI__: { ui: true },
             open: (url: string) => opened.push(url),
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
@@ -669,6 +670,7 @@ test("#3373: relay mode — probe {origin:null,relay:true} binds same-origin; pr
         // the base-relative fallback form carries the prefix and its response
         // URL becomes the absolute UI base.
         const m = await mountClient({
+            __BILI__: { ui: true },
             document: { baseURI: "https://dsh.example/app/dsh/" },
             URL,
             open: (_url: string) => {},
@@ -696,7 +698,7 @@ test("#3373: relay mode — probe {origin:null,relay:true} binds same-origin; pr
     {
         // Relay snapshot (__BILI__ carries relay:true): first paint is bound.
         const m = await mountClient({
-            __BILI__: { origin: null, relay: true },
+            __BILI__: { origin: null, relay: true, ui: true },
             open: (_url: string) => {},
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
@@ -726,6 +728,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         const opened: string[] = [];
         const fetched: string[] = [];
         const m = await mountClient({
+            __BILI__: { ui: true },
             open: (url: string) => opened.push(url),
             fetch: async (url: string) => {
                 fetched.push(url);
@@ -765,7 +768,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         // it for the whole session.
         const opened: string[] = [];
         const m = await mountClient({
-            __BILI__: { origin: "http://127.0.0.1:8787" },
+            __BILI__: { origin: "http://127.0.0.1:8787", ui: true },
             open: (url: string) => opened.push(url),
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
@@ -815,6 +818,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             if (i >= 0) pending.splice(i, 1);
         }) as unknown as typeof clearTimeout;
         const m = await mountClient({
+            __BILI__: { ui: true },
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
                 polls += 1;
@@ -852,6 +856,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
     {
         let cleared = 0;
         const m = await mountClient({
+            __BILI__: { ui: true },
             fetch: async () => ({ ok: false, json: async () => ({}) }),
             setTimeout,
             clearTimeout: (t: unknown) => {
@@ -875,6 +880,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         const opened: string[] = [];
         const m = await mountClient(
             {
+                __BILI__: { ui: true },
                 open: (url: string) => opened.push(url),
                 fetch: async (url: string) => {
                     if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
@@ -921,6 +927,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             if (i >= 0) pending.splice(i, 1);
         }) as unknown as typeof clearTimeout;
         const m = await mountClient({
+            __BILI__: { ui: true },
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
                 polls += 1;
@@ -971,6 +978,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
             if (i >= 0) pending.splice(i, 1);
         }) as unknown as typeof clearTimeout;
         const m = await mountClient({
+            __BILI__: { ui: true },
             fetch: async () => ({ ok: true, json: async () => ({ origin: null }) }),
             setTimeout: fakeSetTimeout,
             clearTimeout: fakeClearTimeout,
@@ -1001,7 +1009,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         // scenarios) keep the old exact srcs above, proving a DOM-less host
         // stays OS-driven.
         const mkDom = (bg: string): Record<string, unknown> => ({
-            __BILI__: { origin: "http://127.0.0.1:9998" },
+            __BILI__: { origin: "http://127.0.0.1:9998", ui: true },
             document: {
                 documentElement: {},
                 body: { querySelector: (_sel: string): unknown => undefined },
@@ -1174,6 +1182,7 @@ test("#3100: embed pre-flight — a stale proxy build gets the restart notice in
     {
         const opened: string[] = [];
         const m = await mountClient({
+            __BILI__: { ui: true },
             open: (url: string) => opened.push(url),
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) {
@@ -1225,6 +1234,7 @@ test("#3100: embed pre-flight — a stale proxy build gets the restart notice in
             if (i >= 0) pending.splice(i, 1);
         }) as unknown as typeof clearTimeout;
         const m = await mountClient({
+            __BILI__: { ui: true },
             fetch: async (url: string) => {
                 if (String(url).endsWith("/__bili/?embed=1")) {
                     embedCalls += 1;
@@ -1286,6 +1296,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     {
         const opened: string[] = [];
         const m = await mountClient({
+            __BILI__: { ui: true },
             location: { hostname: "vps.example.com" },
             URL,
             open: (url: string) => { opened.push(String(url)); },
@@ -1327,6 +1338,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // access through a LAN IP still reaches the loopback; never shadow a working frame.
     {
         const m = await mountClient({
+            __BILI__: { ui: true },
             location: { hostname: "192.168.1.50" },
             URL,
             open: (_url: string) => {},
@@ -1353,6 +1365,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // desktop posture keeps the plain connecting state.
     {
         const m = await mountClient({
+            __BILI__: { ui: true },
             location: { hostname: "127.0.0.1" },
             URL,
             open: (_url: string) => {},
@@ -1379,6 +1392,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // is plausibly reachable; the adminRelay guidance would mislead.
     {
         const m = await mountClient({
+            __BILI__: { ui: true },
             location: { hostname: "vps.example.com" },
             URL,
             open: (_url: string) => {},
@@ -1405,7 +1419,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // reachable by construction; the #3373 flow must not gain a hint.
     {
         const m = await mountClient({
-            __BILI__: { origin: null, relay: true },
+            __BILI__: { origin: null, relay: true, ui: true },
             location: { hostname: "vps.example.com" },
             URL,
             open: (_url: string) => {},
@@ -1434,6 +1448,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // backup button stays (its loopback link is alive here).
     {
         const m = await mountClient({
+            __BILI__: { ui: true },
             location: { hostname: "192.168.1.50" },
             URL,
             open: (_url: string) => {},
@@ -1508,7 +1523,7 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
     }) as unknown as typeof clearInterval;
 
     const m = await mountClient({
-        __BILI__: { origin: "http://127.0.0.1:8787" },
+        __BILI__: { origin: "http://127.0.0.1:8787", ui: true },
         open: (url: string) => opened.push(url),
         fetch: async (url: string) => {
             const u = String(url);
@@ -1612,7 +1627,7 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
         return st;
     };
     {
-        const st = await subMount({ ok: true, phase: "pre-first-request" }, { origin: "http://127.0.0.1:8787" });
+        const st = await subMount({ ok: true, phase: "pre-first-request" }, { origin: "http://127.0.0.1:8787", ui: true });
         const txt: string[] = [];
         collectText(st, txt);
         assert.ok(txt.join(" ").includes("等待首个模型请求…"), "pre-first-request phase waits, does not guess");
@@ -1621,7 +1636,7 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
     {
         // Older running build: answers the URL (panel string present) but has
         // no structured view yet — say so, point at the restart/Web UI.
-        const st = await subMount({ ok: true, panel: "x" }, { origin: "http://127.0.0.1:8787" });
+        const st = await subMount({ ok: true, panel: "x" }, { origin: "http://127.0.0.1:8787", ui: true });
         const txt: string[] = [];
         collectText(st, txt);
         assert.ok(txt.join(" ").includes("尚未提供结构化上下文数据"), "stale-build notice names the missing data");
@@ -1629,20 +1644,21 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
     {
         // #1357 chain-advisory also carries a panel string but is NOT a stale
         // running build — it must read as not-yet, never as the restart notice.
-        const st = await subMount({ ok: true, phase: "chain-advisory", panel: "x" }, { origin: "http://127.0.0.1:8787" });
+        const st = await subMount({ ok: true, phase: "chain-advisory", panel: "x" }, { origin: "http://127.0.0.1:8787", ui: true });
         const txt: string[] = [];
         collectText(st, txt);
         assert.ok(txt.join(" ").includes("暂无上下文数据"), "chain-advisory reads as not-yet");
         assert.ok(!txt.join(" ").includes("尚未提供结构化上下文数据"), "chain-advisory never claims a stale build");
     }
     {
-        const st = await subMount({ ok: true }, { origin: "http://127.0.0.1:8787" });
+        const st = await subMount({ ok: true }, { origin: "http://127.0.0.1:8787", ui: true });
         const txt: string[] = [];
         collectText(st, txt);
         assert.ok(txt.join(" ").includes("暂无上下文数据"), "no panel and no view reads as not-yet");
     }
     {
         const dm = await mountClient({
+            __BILI__: { ui: true },
             open: (_url: string) => {},
             fetch: async () => { throw new Error("no route"); },
             setTimeout,
@@ -1657,4 +1673,40 @@ test("#3862: conversation.view Context tab renders the live contextView card, po
         assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
         dm.runCleanups();
     }
+});
+
+// USER-REQUESTED (no issue number): the client UI faces (settings.section
+// entry, plugins.bundle.config panel, conversation.view Context tab) sit
+// behind a global master gate, DEFAULT OFF — with other context plugins
+// installed the extra tabs are noise. The host stamps the effective value
+// into the __BILI__ snapshot; the client registers nothing when the flag
+// is absent or false.
+test("ui faces gate: a snapshot without the flag registers zero faces (default off)", async () => {
+    const m = await mountClient({
+        __BILI__: { origin: "http://127.0.0.1:8787" },
+        setTimeout,
+        clearTimeout,
+    }, "settings.section", false);
+    assert.deepEqual(m.slotsOrder, []);
+    assert.equal(m.optionsBySlot.size, 0);
+});
+
+test("ui faces gate: an explicit false flag registers zero faces", async () => {
+    const m = await mountClient({
+        __BILI__: { origin: "http://127.0.0.1:8787", ui: false },
+        setTimeout,
+        clearTimeout,
+    }, "settings.section", false);
+    assert.deepEqual(m.slotsOrder, []);
+    assert.equal(m.optionsBySlot.size, 0);
+});
+
+test("ui faces gate: flag on registers all three faces", async () => {
+    const m = await mountClient({
+        __BILI__: { origin: "http://127.0.0.1:8787", ui: true },
+        setTimeout,
+        clearTimeout,
+    });
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
+    assert.equal(m.optionsBySlot.size, 3);
 });

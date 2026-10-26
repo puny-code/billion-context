@@ -50,7 +50,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } fr
 import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
-import { adminRelayEnabled, resolveResignSettings } from "../config.js";
+import { adminRelayEnabled, dshUiFacesEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
@@ -1385,7 +1385,9 @@ export function apply(ctx: PluginContext): void {
         // #3373: with the admin relay armed the settings entry must talk
         // same-origin (the entry's origin, relayed by the host) — publish the
         // relay marker instead of the loopback origin.
-        table.push({ kind: "global", name: "__BILI__", value: adminRelayEnabled() ? { origin: null, relay: true } : { origin } });
+        // USER-REQUESTED (no issue): stamp the global UI-faces gate — the
+        // client registers no faces unless ui is true (default off).
+        table.push({ kind: "global", name: "__BILI__", value: adminRelayEnabled() ? { origin: null, relay: true, ui: dshUiFacesEnabled() } : { origin, ui: dshUiFacesEnabled() } });
     });
 
     // #2604: follow the host session name (dsh-session-title service). Every
