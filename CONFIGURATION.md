@@ -419,6 +419,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | Launcher channel: MITM whitelist hosts handed to the spawned proxy (distinct from the config-file twin BILI_MITM_DOMAINS). |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | Spawn channel: marks a plugin-agent process. |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design. |
+| `BILI_IMAGE_LOSSY_BYTES` | integer | 5242880 | — | Soft SIZE budget for an outbound request body: above it, the images in the SEND copy are re-encoded (JPEG q88..q56 at native size, or a downscaled PNG when the pixels really carry alpha) so a screenshot-heavy turn stays deliverable. Every image stays present, the stored original is never touched, the per-image quality target is fixed rather than derived from the image count (an appended screenshot does not re-encode the earlier ones, keeping the upstream prefix cache), and encodes are memoized per image. `0` disables. Env-only by design. |
 
 <!-- /bili:gen -->
 

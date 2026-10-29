@@ -419,6 +419,7 @@
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
+| `BILI_IMAGE_LOSSY_BYTES` | integer | 5242880 | — | 出站请求体的软性体积预算：超过后先把**发送副本**里的图片重编码（原生尺寸 JPEG q88..q56；像素真带 alpha 时改为降采样 PNG），让以截图为主的轮次仍能送达。每张图都还在、本地存的原件一个字节不动；每图的画质目标固定，不由本轮图片数量推导（追加一张截图不会把前面几张重编码，前缀缓存得以保留）；编码结果按图记忆化。`0` 关闭。设计上仅环境变量。 |
 
 <!-- /bili:gen -->
 

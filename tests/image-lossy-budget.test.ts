@@ -18,7 +18,8 @@ import assert from "node:assert/strict";
 import { Jimp } from "jimp";
 
 import { clearRescaleEncodeCache } from "../src/image-rescale.ts";
-import { applyLossyImageBudget, clearLossyEncodeCache, resolveLossyBudget } from "../src/image-lossy.ts";
+import { applyLossyImageBudget, clearLossyEncodeCache } from "../src/image-lossy.ts";
+import { imageLossyBudgetBytes } from "../src/knobs.ts";
 
 const MiB = 1024 * 1024;
 
@@ -49,6 +50,46 @@ async function alphaPng(width = 640, height = 480): Promise<{ b64: string; bytes
         data[i * 4 + 1] = 0x00;
         data[i * 4 + 2] = 0x00;
         data[i * 4 + 3] = x < width / 2 ? 0 : 255;
+    }
+    const buf = await img.getBuffer("image/png");
+    return { b64: buf.toString("base64"), bytes: buf.length };
+}
+
+/** A byte-heavy PNG that also carries REAL transparency: noise keeps the file big
+ *  (so a budget can actually bite) while one stripe has alpha 0. An opaque-only
+ *  fixture would let the alpha branch stay unreached and any regression there
+ *  would pass unnoticed. */
+async function heavyAlphaPng(width = 1264, height = 805): Promise<{ b64: string; bytes: number }> {
+    const img = new Jimp({ width, height });
+    const data = img.bitmap.data;
+    let seed = 987654321;
+    for (let i = 0; i < width * height; i++) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        const x = i % width;
+        data[i * 4] = (seed >> 16) & 0xff;
+        data[i * 4 + 1] = (seed >> 8) & 0xff;
+        data[i * 4 + 2] = seed & 0xff;
+        data[i * 4 + 3] = x < 40 ? 0 : 255;
+    }
+    const buf = await img.getBuffer("image/png");
+    return { b64: buf.toString("base64"), bytes: buf.length };
+}
+
+/** Screenshot-shaped but JPEG-friendly (smooth gradient + a few bands): PNG is
+ *  big, JPEG q88 fits at NATIVE size — the quality-ladder path, which the
+ *  incompressible-noise fixture above can never reach. */
+async function gradientPng(width = 1264, height = 805): Promise<{ b64: string; bytes: number }> {
+    const img = new Jimp({ width, height });
+    const data = img.bitmap.data;
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            const band = y < height / 3 ? 0 : y < (2 * height) / 3 ? 1 : 2;
+            data[i] = (x + band * 20) & 0xff;
+            data[i + 1] = (y + band * 40) & 0xff;
+            data[i + 2] = ((x + y) / 2) & 0xff;
+            data[i + 3] = 255;
+        }
     }
     const buf = await img.getBuffer("image/png");
     return { b64: buf.toString("base64"), bytes: buf.length };
@@ -105,13 +146,21 @@ test("lossy budget: over budget, images stay images and the body shrinks under t
 
 test("lossy budget: transparency is never flattened to JPEG (negative: alpha stays PNG)", async () => {
     clearRescaleEncodeCache();
+    clearLossyEncodeCache();
+    // The fixture must genuinely EXCEED the budget, otherwise the pass returns
+    // early and the alpha branch is never reached — a vacuous negative.
     const shots: string[] = [];
-    for (let i = 0; i < 4; i++) shots.push(`data:image/png;base64,${(await alphaPng()).b64}`);
+    for (let i = 0; i < 2; i++) shots.push(`data:image/png;base64,${(await heavyAlphaPng(1264, 805)).b64}`);
     const body = openaiBody(shots);
-    const out = await applyLossyImageBudget(body, "openai", 512 * 1024);
+    const budget = 2 * MiB;
+    assert.ok(Buffer.byteLength(body) > budget, `fixture must exceed the budget (${Buffer.byteLength(body)} > ${budget})`);
+    const out = await applyLossyImageBudget(body, "openai", budget);
+    assert.equal(out.stats.changed, true, "the pass really ran (not the early return)");
+    assert.equal(out.stats.transcoded, 2, "both alpha images were re-encoded");
     const urls = imageUrls(out.body);
-    assert.equal(urls.length, 4);
+    assert.equal(urls.length, 2, "no image was dropped");
     assert.ok(urls.every((u) => u.startsWith("data:image/png;base64,")), "alpha images keep their PNG format");
+    assert.ok(urls.every((u) => !u.startsWith("data:image/jpeg")), "never flattened to JPEG");
 });
 
 test("lossy budget: the receipt lane is left alone (negative: read_original_image)", async () => {
@@ -197,9 +246,106 @@ test("lossy budget: an unreachable budget reports the truth instead of claiming 
     assert.equal(out.stats.finalBytes, Buffer.byteLength(out.body), "finalBytes is the real serialized size");
 });
 
-test("lossy policy: the knob's default is 5 MiB, and 0 disables", () => {
-    assert.equal(resolveLossyBudget(undefined), 5 * 1024 * 1024);
-    assert.equal(resolveLossyBudget("0"), undefined);
-    assert.equal(resolveLossyBudget(""), 5 * 1024 * 1024);
-    assert.equal(resolveLossyBudget("2097152"), 2 * 1024 * 1024);
+test("lossy policy: the PRODUCTION knob resolves 5 MiB by default and 0 disables", () => {
+    // imageLossyBudgetBytes() is the only resolver the relay calls — pinning the
+    // default here is what makes a silent default change (5 -> 6 MiB) fail.
+    const saved = process.env.BILI_IMAGE_LOSSY_BYTES;
+    try {
+        delete process.env.BILI_IMAGE_LOSSY_BYTES;
+        assert.equal(imageLossyBudgetBytes(), 5 * 1024 * 1024, "default budget is 5 MiB (below the measured ~6 MiB cliff)");
+        process.env.BILI_IMAGE_LOSSY_BYTES = "0";
+        assert.equal(imageLossyBudgetBytes(), 0, "0 disables the pass");
+        process.env.BILI_IMAGE_LOSSY_BYTES = "2097152";
+        assert.equal(imageLossyBudgetBytes(), 2 * 1024 * 1024, "an explicit byte budget wins");
+        process.env.BILI_IMAGE_LOSSY_BYTES = "not-a-number";
+        assert.equal(imageLossyBudgetBytes(), 5 * 1024 * 1024, "garbage falls back to the default");
+    } finally {
+        if (saved === undefined) delete process.env.BILI_IMAGE_LOSSY_BYTES;
+        else process.env.BILI_IMAGE_LOSSY_BYTES = saved;
+    }
+});
+
+test("lossy budget: a JPEG-friendly screenshot stays at NATIVE size on the q88 rung (the ladder, not the downscale path)", async () => {
+    clearRescaleEncodeCache();
+    clearLossyEncodeCache();
+    const shot = await gradientPng(1264, 805);
+    const body = openaiBody([`data:image/png;base64,${shot.b64}`]);
+    const budget = Math.max(64 * 1024, Math.floor(Buffer.byteLength(body) * 0.6));
+    assert.ok(Buffer.byteLength(body) > budget, "fixture must exceed the budget");
+    const out = await applyLossyImageBudget(body, "openai", budget);
+    assert.equal(out.stats.changed, true);
+    const urls = imageUrls(out.body);
+    assert.equal(urls.length, 1);
+    assert.ok(urls[0].startsWith("data:image/jpeg;base64,"), "opaque screenshot becomes JPEG");
+    const decoded = await Jimp.read(Buffer.from(urls[0].slice("data:image/jpeg;base64,".length), "base64"));
+    assert.equal(decoded.width, 1264, "no downscale when a quality rung already fits");
+    assert.equal(decoded.height, 805, "no downscale when a quality rung already fits");
+});
+
+test("lossy budget: re-encoding is deterministic (same bytes in, same bytes out)", async () => {
+    clearRescaleEncodeCache();
+    clearLossyEncodeCache();
+    const shot = await heavyPng(900, 620);
+    const body = openaiBody([`data:image/png;base64,${shot.b64}`]);
+    const budget = Math.floor(Buffer.byteLength(body) * 0.5);
+    const runs: string[] = [];
+    for (let i = 0; i < 3; i++) {
+        clearLossyEncodeCache();
+        const out = await applyLossyImageBudget(body, "openai", budget);
+        runs.push(imageUrls(out.body)[0]);
+    }
+    assert.equal(runs[0], runs[1], "run 2 matches run 1");
+
+    assert.equal(runs[0], runs[2], "run 3 matches run 1 (no random quality)");
+});
+
+test("lossy budget: a non-JSON body and an image-free body are byte-identical (negative: guards)", async () => {
+    clearRescaleEncodeCache();
+    clearLossyEncodeCache();
+    const junk = "x".repeat(2 * MiB);
+    const junkOut = await applyLossyImageBudget(junk, "openai", 512 * 1024);
+    assert.equal(junkOut.stats.changed, false, "non-JSON is never parsed into a failure");
+    assert.equal(junkOut.body, junk);
+
+    const textOnly = JSON.stringify({ model: "gpt-x", messages: [{ role: "user", content: "y".repeat(2 * MiB) }] });
+    const textOut = await applyLossyImageBudget(textOnly, "openai", 512 * 1024);
+    assert.equal(textOut.stats.changed, false, "no images means nothing to re-encode");
+    assert.equal(textOut.body, textOnly);
+});
+
+test("lossy budget: the responses and google lanes are re-encoded in place (media type follows the bytes)", async () => {
+    clearRescaleEncodeCache();
+    clearLossyEncodeCache();
+    const shot = await heavyPng(900, 620);
+    const dataUrlIn = `data:image/png;base64,${shot.b64}`;
+
+    const responsesBody = JSON.stringify({
+        model: "gpt-x",
+        input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "shot" }, { type: "input_image", image_url: dataUrlIn }] },
+            ...Array.from({ length: 9 }, (_, i) => ({ type: "message", role: "user", content: [{ type: "input_text", text: `tail ${i}` }] })),
+        ],
+    });
+    const rOut = await applyLossyImageBudget(responsesBody, "responses", 256 * 1024);
+    assert.equal(rOut.stats.changed, true, "responses body was re-encoded");
+    const rParsed = JSON.parse(rOut.body) as { input: Array<{ content?: Array<{ type?: string; image_url?: string }> }> };
+    const rImage = rParsed.input[0].content?.find((p) => p.type === "input_image");
+    assert.ok(rImage?.image_url?.startsWith("data:image/jpeg;base64,"), "responses input_image carries the JPEG bytes and type");
+
+    const googleCamel = JSON.stringify({
+        contents: [{ parts: [{ text: "shot" }, { inlineData: { mimeType: "image/png", data: shot.b64 } }] }],
+    });
+    const gOut = await applyLossyImageBudget(googleCamel, "google", 256 * 1024);
+    assert.equal(gOut.stats.changed, true, "google camelCase inlineData was re-encoded");
+    const gInline = (JSON.parse(gOut.body) as { contents: Array<{ parts: Array<{ inlineData?: { mimeType?: string; data?: string } }> }> }).contents[0].parts[1].inlineData;
+    assert.equal(gInline?.mimeType, "image/jpeg", "google mimeType follows the re-encoded bytes");
+
+    // The Python SDK emits snake_case; missing that shape means those bodies never shrink.
+    const googleSnake = JSON.stringify({
+        contents: [{ parts: [{ text: "shot" }, { inline_data: { mime_type: "image/png", data: shot.b64 } }] }],
+    });
+    const sOut = await applyLossyImageBudget(googleSnake, "google", 256 * 1024);
+    assert.equal(sOut.stats.changed, true, "google snake_case inline_data was re-encoded too");
+    const sInline = (JSON.parse(sOut.body) as { contents: Array<{ parts: Array<{ inline_data?: { mime_type?: string; data?: string } }> }> }).contents[0].parts[1].inline_data;
+    assert.equal(sInline?.mime_type, "image/jpeg", "google snake_case mime_type follows the re-encoded bytes");
 });

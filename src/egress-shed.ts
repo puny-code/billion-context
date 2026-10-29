@@ -166,10 +166,13 @@ export function collectOccurrences(protocol: WireProtocol, body: Part): Occurren
             const parts = c.parts as unknown[];
             parts.forEach((part, pos) => {
                 if (!isObj(part)) return;
-                const inline = part.inlineData;
+                // Both spellings are in the wild: the REST/JS surface uses inlineData,
+                // the Python SDK (google-genai) emits inline_data with mime_type.
+                const inline = isObj(part.inlineData) ? part.inlineData : isObj(part.inline_data) ? part.inline_data : undefined;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
                 if (matchesOriginalImageReceipt(inline.data, parts)) return;
-                const mediaType = typeof inline.mimeType === "string" ? inline.mimeType : "image/png";
+                const declaredType = typeof inline.mimeType === "string" ? inline.mimeType : typeof inline.mime_type === "string" ? inline.mime_type : undefined;
+                const mediaType = declaredType ?? "image/png";
                 occ.push({
                     entryIndex,
                     b64: inline.data,
@@ -178,7 +181,11 @@ export function collectOccurrences(protocol: WireProtocol, body: Part): Occurren
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { text: note }; },
                     applyShrink: (b64) => { inline.data = b64; },
-                    applyReplace: (b64, mediaType) => { inline.data = b64; inline.mimeType = mediaType; },
+                    applyReplace: (b64, mediaType) => {
+                        inline.data = b64;
+                        if (typeof inline.mimeType === "string") inline.mimeType = mediaType;
+                        if (typeof inline.mime_type === "string") inline.mime_type = mediaType;
+                    },
                 });
             });
         });
