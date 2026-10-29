@@ -1298,18 +1298,14 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
-                // the machine-global sessions dir is the supported topology —
-                // informational styling, not a corruption alarm.
-                if (sp.benign === true) {
-                    spb.classList.remove("warn");
-                    spb.classList.add("info");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
-                } else {
-                    spb.classList.remove("info");
-                    spb.classList.add("warn");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
-                }
+                // #5082: several instances opening one index.db is the
+                // supported topology — informational styling, never a
+                // corruption alarm. The real hazard (two instances writing
+                // the SAME session) has its own banner via the #3923
+                // split-brain contest.
+                spb.classList.remove("warn");
+                spb.classList.add("info");
+                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_shared_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_shared", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
             } else {
                 spb.hidden = true;
                 spb.classList.remove("show");
