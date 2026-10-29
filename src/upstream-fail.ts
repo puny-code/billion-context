@@ -132,6 +132,12 @@ export interface UpstreamFailureDetail {
     /** #4254: seconds until the next half-open probe (circuitOpen only) — becomes
      *  the Retry-After header so compliant hosts back off instead of resending. */
     retryAfterSeconds?: number;
+    /** Measured bytes of the body this attempt actually put on the wire. Present
+     *  only when the failure shape makes the measurement meaningful (a
+     *  pre-response reset) — see payloadResetNote. */
+    outboundBytes?: number;
+    /** Wall-clock age of the failed attempt, in milliseconds. */
+    attemptElapsedMs?: number;
 }
 
 const UPSTREAM_FAILURE = Symbol("upstreamFailure");
@@ -209,8 +215,37 @@ export function buildProxyFailureResponse(msg: string, err: unknown): { status: 
     if (uf && uf.host !== undefined) diag.host = uf.host;
     if (uf && uf.circuitOpen === true) diag.circuitOpen = true;
     if (uf && typeof uf.retryAfterSeconds === "number") diag.retryAfterSeconds = uf.retryAfterSeconds;
+    if (uf && typeof uf.outboundBytes === "number") diag.outboundBytes = uf.outboundBytes;
+    if (uf && typeof uf.attemptElapsedMs === "number") diag.attemptElapsedMs = uf.attemptElapsedMs;
     const body = JSON.stringify({ error: errorField, detail: msg, ...(Object.keys(diag).length > 0 ? { upstreamFailure: diag } : {}) });
     return { status, headers, body };
+}
+
+/** Thresholds for the payload-size hypothesis. Deliberately a REPORT, not a
+ *  decision: nothing downstream sheds, retries or rewrites based on these. */
+const PAYLOAD_RESET_MIN_BYTES = 1 << 20;
+const PAYLOAD_RESET_MAX_MS = 1500;
+
+/** Describe an oversized pre-response reset, or return null when the failure
+ *  shape is not the one worth reporting.
+ *
+ *  Shape: a reset that lands within ~1.5s on an upload of >=1MiB. The upstream
+ *  took the connection, read the request head, and closed — too fast to have
+ *  processed it, too big to be a coincidence. The observed field case: a 7.0MiB
+ *  body (6 screenshots at 1264x805, under the rescale gate) died in ~0.4s on
+ *  every attempt while every request under ~6MiB went through, and the user only
+ *  saw `502 "acp-proxy failure"`.
+ *
+ *  What this note must NOT do: claim the cause is proven (the same reset can be
+ *  a plain network drop), and never trigger a shrunken resend — a reset does not
+ *  prove the upstream did not already run the request, so re-sending different
+ *  bytes could double-execute it. Wording stays a hypothesis; tests pin it. */
+export function payloadResetNote(kind: UpstreamFailureKind, outboundBytes: number, elapsedMs: number): string | null {
+    if (kind !== "upstream-reset" && kind !== "proxy-reset") return null;
+    if (!Number.isFinite(outboundBytes) || outboundBytes < PAYLOAD_RESET_MIN_BYTES) return null;
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > PAYLOAD_RESET_MAX_MS) return null;
+    const mib = (outboundBytes / (1024 * 1024)).toFixed(1);
+    return `the connection died ${Math.round(elapsedMs)}ms into a ${mib} MiB upload, before any response byte — if every attempt at this size fails while smaller requests succeed, the endpoint is rejecting payload size`;
 }
 
 /** Fail-fast kinds: the attempt died BEFORE any response byte existed, so a

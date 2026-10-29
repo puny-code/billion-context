@@ -56,7 +56,7 @@ import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
-import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { markExpectedFailFast, payloadResetNote, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
@@ -837,9 +837,19 @@ async function forwardCaptured(
     // FIRST attempt's timer handle separately because upstreamResult may never have been
     // assigned by the time a send failure lands in the catch.
     let firstAttemptClear: (() => void) | undefined;
+    // Measured, not estimated: the bytes this attempt actually put on the wire
+    // (post-v1Wrap) and how long it took to die. Diagnosis only — see
+    // payloadResetNote. No egress decision reads these.
+    const wireBytesSent = typeof init.body === "string" ? Buffer.byteLength(init.body) : init.body instanceof Uint8Array ? init.body.byteLength : 0;
+    let attemptStartedAt = Date.now();
     try {
         const lane = prepared?.sidePassthrough ? "side" : prepared ? "main" : "passthrough";
         const fetchPromise = fetchWithCodexCatalogCache(signal => fetchWithTransportRetry(upstreamUrl, init, undefined, signal, (info) => {
+            // Per-attempt wall clock: this callback fires immediately after an
+            // attempt dies, so re-anchor the clock to when the NEXT attempt will
+            // start (after the backoff). The final measurement in the catch then
+            // describes the last attempt only, not the whole retry budget.
+            attemptStartedAt = Date.now() + info.delayMs;
             log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
         }), upstreamUrl, init, clientAbort.signal, log);
         const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
@@ -861,6 +871,12 @@ async function forwardCaptured(
             recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
             recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
             const failure = describeUpstreamFailure(error, upstreamUrl, proxyUrl, skippedProxy);
+            const attemptElapsedMs = Math.max(0, Date.now() - attemptStartedAt);
+            // Report the shape, never act on it: a pre-response reset does not
+            // prove the upstream skipped the request, so re-sending different
+            // bytes could double-execute (and double-bill) it.
+            const payloadNote = payloadResetNote(failure.detail.kind ?? "unknown", wireBytesSent, attemptElapsedMs);
+            if (payloadNote !== null) log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] ${payloadNote} (measured upload ${wireBytesSent} bytes after ${attemptElapsedMs}ms)`);
             recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failure.message);
             // #604: a network-level failure (socket reset, timeout abort) also never
             // reports usage — arm the emergency shrink like the 5xx branch below.
@@ -868,7 +884,15 @@ async function forwardCaptured(
             // [#1343] no response means the attached full text never reached the model —
             // drop-and-log it (a corrective note surfaces on the next qualifying request).
             if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-            throw withUpstreamFailure(new Error(`upstream request failed: ${failure.message}`, { cause: error }), failure.detail);
+            const failureDetail = payloadNote === null
+                ? failure.detail
+                : {
+                    ...failure.detail,
+                    hint: `${failure.detail.hint ?? ""}${failure.detail.hint ? "; " : ""}${payloadNote}`,
+                    outboundBytes: wireBytesSent,
+                    attemptElapsedMs,
+                };
+            throw withUpstreamFailure(new Error(`upstream request failed: ${failure.message}${payloadNote === null ? "" : ` — ${payloadNote}`}`, { cause: error }), failureDetail);
         }
         // #3701: close 1009 with ZERO events received is a verdict on our frame SIZE, not
         // on endpoint health — the same gateway answers smaller frames fine. Deliberately
