@@ -235,6 +235,8 @@ const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
+/** See imageLossyBudgetBytes(): below the measured ~6 MiB failure cliff, above the 4-6 MiB all-pass band. */
+const DEFAULT_IMAGE_LOSSY_BYTES = 5 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -288,6 +290,18 @@ export function limitsHttpOutboundBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
 }
 
+/** BILI_IMAGE_LOSSY_BYTES > 5 MiB (env-only kill switch: 0 disables). Soft SIZE budget for the
+ *  request body, enforced by re-encoding the images in the OUTBOUND COPY (JPEG q88..q56, PNG
+ *  downscale when the pixels carry real alpha) — never by dropping an image and never touching
+ *  the stored original. Rationale (measured, 2026-10-29): a turn whose bulk was six 1264x805
+ *  screenshots (4.88 MiB of PNG, ~7.0 MiB body) reset in 0.2-0.5s, 29 of 44 requests >= 6 MiB
+ *  failed while 0 of 28 in the 4-6 MiB band did; lossless re-encoding makes those PNGs ~16%
+ *  BIGGER, so only a lossy pass keeps the turn deliverable. Owner decision: prefer a softer
+ *  picture over a request that can never succeed. */
+export function imageLossyBudgetBytes(): number {
+    const v = tInt("BILI_IMAGE_LOSSY_BYTES", undefined);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_IMAGE_LOSSY_BYTES;
+}
 // --- session persistence (was BILI_PERSIST_* env-only) ---
 
 function filePersist() {

@@ -6,6 +6,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Fixed
+- 体积型出站失败有了真正的出口：一次 6 张 1264×805 截图（4.88 MiB PNG，body ≈ 7.0 MiB）的请求在被上游读到 `Content-Length` 时就断开，0.2–0.5 秒结束——同一 host 上 `≥6 MiB` 的 44 次请求失败 29 次，`4–6 MiB` 的 28 次一次没失败；而这些 PNG 做无损重编码反而**大 16%**，所以「压得更小」不可能靠无损实现。现在 body 超过预算（`BILI_IMAGE_LOSSY_BYTES`，默认 5 MiB，`0` 关闭）时，只对**出站副本**重编码图片（不透明图走 JPEG q88→q56 阶梯，像素真带 alpha 的走 PNG 降采样，绝不把透明压平）：**一张图都不删**，会话里保存的原始图一个字节不改；预算内的请求逐字节原样发出（含「无损负例」与「关闸后原样」两条负例）。它放在签名之前的统一出站点，因此覆盖 `prepare` 之后的每一次改写，也覆盖绕过 `prepare` 的 side/绝对 URL 请求。日志一行 `[image-lossy] pre-send: re-encoded N image(s) …`。
 - 出站不变量判官新增 I3 配对不变量（#4862 出口校验缺口）：此前判官只对账入站↔出站连续性（I1/I2），折叠区内完全免检，于是「折叠拆断一对 tool_use/tool_result」的出站体拿到 clean fold verdict 直接放行，直到上游用 400 `tool_use ids were found without tool_result blocks` 说出真相。现在每个 tool-call 必须有同 id 的 tool-result 在其后、每个 tool-result 必须有同 id 的 tool-call 在其前，折叠区不再豁免；归因保持“谁的错”职责（宿主自己发来的断对不计 bili、compress 在途调用豁免、id 重铸不可洗白）。纯检测不拦截，受 diagnostics.invariantJudge 旋钮控制。
 - 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
 - 优雅停机(SIGTERM → dispose)的 writer 标记现在记录 `stoppedAt`:重启流程(杀旧进程→立即重绑)不再对已确认死亡的前任实例误报 [split-brain]——30s 新鲜度回退从此只覆盖无法证明死亡的崩溃场景(#3923;release-gate lane A 代理重启时观察到误报)。

@@ -32,7 +32,8 @@ import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
-import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { applyLossyImageBudget } from "../image-lossy.js";
+import { dumpReqAllowed as knobDumpReqAllowed, imageLossyBudgetBytes, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
@@ -586,6 +587,7 @@ async function forwardCaptured(
             }
         }
     }
+
     // #1884: sign the FINAL wire body right before the send — everything
     // upstream of this point (prepare* injection, compat, steering) already
     // mutated it, so any inbound signature is stale here.
@@ -653,6 +655,40 @@ async function forwardCaptured(
                     res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
                 }
                 return;
+            }
+        }
+    }
+    // Deliverability rung (owner-approved 2026-10-29): a turn whose bulk is
+    // screenshots can be refused for SIZE alone — measured on one host, >= 6 MiB
+    // bodies reset 0.2-0.5s in (29/44 failed) while 0/28 in the 4-6 MiB band did,
+    // and re-encoding those PNGs LOSSLESSLY makes them ~16% bigger. So above the
+    // budget the OUTBOUND COPY gets its images re-encoded (JPEG q88..q56, or PNG
+    // downscale when pixels really carry alpha): every image stays PRESENT, the
+    // stored original is untouched, and a softer screenshot beats a turn that can
+    // never be delivered. Placed here — after every body rewrite (prepare, shed,
+    // count cap, chain stamp) and BEFORE the signature — so the signed bytes are
+    // the bytes that leave, and so it also covers side/absolute-URL requests that
+    // bypass prepare entirely (they carry screenshots too).
+    const lossyProtocol = prepared?.protocol ?? route?.explicitProtocol ?? resolveDeclaredProtocol(opts.routes, upstreamUrl) ?? inferWireProtocol(req.url ?? "");
+    if (req.method !== "GET" && req.method !== "HEAD" && lossyProtocol !== null && lossyProtocol !== undefined) {
+        const lossyBudget = imageLossyBudgetBytes();
+        if (lossyBudget > 0 && (typeof wireBody === "string" || Buffer.isBuffer(wireBody))) {
+            const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+            if (Buffer.byteLength(wireText) > lossyBudget) {
+                const lossy = await applyLossyImageBudget(wireText, lossyProtocol, lossyBudget);
+                if (lossy.stats.changed) {
+                    wireBody = lossy.body;
+                    if (prepared) {
+                        prepared.session.metadata.imageLossy = {
+                            at: Date.now(),
+                            phase: "pre-send",
+                            originalBytes: lossy.stats.originalBytes,
+                            finalBytes: lossy.stats.finalBytes,
+                            transcoded: lossy.stats.transcoded,
+                        };
+                    }
+                    log("info", `[${prepared?.session.id ?? affinity ?? "passthrough"}] [image-lossy] pre-send: re-encoded ${lossy.stats.transcoded} image(s) to fit ${lossyBudget} bytes (${lossy.stats.originalBytes} -> ${lossy.stats.finalBytes} bytes); originals untouched in session storage`);
+                }
             }
         }
     }

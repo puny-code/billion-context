@@ -51,7 +51,7 @@ interface ShedOptions {
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
 }
 
-interface Occurrence {
+export interface Occurrence {
     /** Top-level entry index (chronological order). */
     entryIndex: number;
     b64: string;
@@ -61,6 +61,10 @@ interface Occurrence {
     archived: boolean;
     applyArchive: (note: string) => void;
     applyShrink: (b64: string) => void;
+    /** Replace the payload AND its media type — the lossy budget rung turns an
+     *  opaque screenshot into JPEG, so a payload-only write would leave the part
+     *  claiming image/png. */
+    applyReplace: (b64: string, mediaType: string) => void;
 }
 
 function byteLen(s: string): number {
@@ -133,7 +137,7 @@ function isExemptOutput(protocol: WireProtocol, item: Part, names: Map<string, s
     return typeof id === "string" && names.get(id) === READ_ORIGINAL_IMAGE_TOOL_NAME;
 }
 
-function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
+export function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const occ: Occurrence[] = [];
     const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean): void => {
         parts.forEach((part, pos) => {
@@ -150,6 +154,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 archived: false,
                 applyArchive: (note) => { parts[pos] = { type: "text", text: note }; },
                 applyShrink: (b64) => { src.data = b64; },
+                applyReplace: (b64, mediaType) => { src.data = b64; src.media_type = mediaType; },
             });
         });
     };
@@ -173,6 +178,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { text: note }; },
                     applyShrink: (b64) => { inline.data = b64; },
+                    applyReplace: (b64, mediaType) => { inline.data = b64; inline.mimeType = mediaType; },
                 });
             });
         });
@@ -200,6 +206,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { type: "input_text", text: note }; },
                     applyShrink: (b64) => { part.image_url = dataUrl(d.mediaType, b64); },
+                    applyReplace: (b64, mediaType) => { part.image_url = dataUrl(mediaType, b64); },
                 });
             });
         });
@@ -234,6 +241,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     archived: false,
                     applyArchive: (note) => { content[pos] = { type: "text", text: note }; },
                     applyShrink: (b64) => { p.image_url = typeof iu === "string" ? dataUrl(d.mediaType, b64) : { ...(iu ?? {}), url: dataUrl(d.mediaType, b64) }; },
+                    applyReplace: (b64, mediaType) => { p.image_url = typeof iu === "string" ? dataUrl(mediaType, b64) : { ...(iu ?? {}), url: dataUrl(mediaType, b64) }; },
                 });
             } else if (p.type === "tool_result" && Array.isArray(p.content)) {
                 addAnthropicImages(p.content, entryIndex, true);
