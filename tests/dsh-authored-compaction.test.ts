@@ -1,20 +1,5 @@
-// #3733: bili-authored dsh client compaction.
-//
-// The #1729 guard refuses dsh's native compaction summarize calls. Post-#3644
-// (snapshot doctrine) a landed client checkpoint is benign for the server
-// substrate — but a NATIVE checkpoint is still a foreign summary we can only
-// recognize fuzzily, and it may not match what the upstream actually sees.
-// Authored compaction answers the SAME call locally (zero egress, autoModeForge
-// discipline): the response we hand back is OUR folded snapshot, carrying an
-// identity header line. dsh writes it into its history as the checkpoint, so
-// the client file shrinks (fixes #3723's unbounded growth) while the content
-// stays exactly what the model already has upstream.
-//
-// This file pins the contract BEFORE the implementation (打桩): unit shapes
-// (header / forge bodies / detector) and the end-to-end lane (interception,
-// zero upstream contact, ledger marks, knob-off fallthrough to refusal,
-// no-block fallthrough, stream honoring, allow-precedence, and the landing
-// recognition on the post-compaction replay).
+// Historical authored-checkpoint helpers remain compatible; live DSH native
+// compaction relays original bytes without kernel state or accounting changes.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -216,7 +201,7 @@ function conversation(): { role: string; content: string }[] {
     return out;
 }
 
-type Harness = { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string; sessionOf: (label: string) => { meta: { label: string }; state: { blocks: { id: string; active: boolean }[] }; metadata: Record<string, unknown> } | undefined };
+type Harness = { proxy: http.Server; upstream: http.Server; bodies: string[]; url: string; sessionOf: (label: string) => { meta: { label: string }; state: { blocks: { id: string; active: boolean }[] }; metadata: Record<string, unknown>; stats: Record<string, unknown> } | undefined };
 
 async function withHarness(fn: (h: Harness) => Promise<void>, optsOverride: Partial<ProxyOptions> = {}): Promise<void> {
     const bodies: string[] = [];
@@ -225,6 +210,17 @@ async function withHarness(fn: (h: Harness) => Promise<void>, optsOverride: Part
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             bodies.push(Buffer.concat(chunks).toString("utf8"));
+            const parsed = JSON.parse(bodies[bodies.length - 1]);
+            if (bodies[bodies.length - 1].includes(DSH_COMPACTION_INSTRUCTION_PREFIX)) {
+                if (parsed.stream === false) {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ id: "native", choices: [{ message: { role: "assistant", content: "NATIVE-CHECKPOINT" }, finish_reason: "stop" }], usage: { prompt_tokens: 31, completion_tokens: 7, total_tokens: 38 } }));
+                } else {
+                    res.writeHead(200, { "content-type": "text/event-stream" });
+                    res.end(sse({ id: "native", choices: [{ delta: { content: "NATIVE-CHECKPOINT" }, finish_reason: "stop" }], usage: { prompt_tokens: 31, completion_tokens: 7, total_tokens: 38 } }) + "data: [DONE]\n\n");
+                }
+                return;
+            }
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             if (bodies.length === 1) {
                 // First turn: the model compresses the oldest pair → active block.
@@ -294,7 +290,7 @@ async function withHarness(fn: (h: Harness) => Promise<void>, optsOverride: Part
 async function turn(h: Harness, label: string, messages: unknown[], extraHeaders: Record<string, string> = {}, stream = true): Promise<{ status: number; body: string; contentType: string }> {
     const r = await fetch(h.url, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-acp-session": label, ...extraHeaders },
+        headers: { "content-type": "application/json", "x-acp-session": label, "x-bili-plugin": messages.some((m) => JSON.stringify(m).includes(DSH_COMPACTION_INSTRUCTION_PREFIX)) ? "dsh" : "", ...extraHeaders },
         body: JSON.stringify({ model: "gpt-test", messages, stream }),
     });
     return { status: r.status ?? 0, body: await r.text(), contentType: r.headers.get("content-type") ?? "" };
@@ -309,122 +305,44 @@ async function armBlock(h: Harness, label: string): Promise<void> {
     assert.ok(s!.state.blocks.some((b) => b.active), "setup created an active block");
 }
 
-test("e2e: authored compaction answers locally — zero egress, tagged checkpoint, ledger marks", async () => {
+function accounting(h: Harness, label: string): string {
+    const s = h.sessionOf(label);
+    return JSON.stringify({ state: s?.state, metadata: s?.metadata, stats: s?.stats });
+}
+
+for (const knob of ["1", "0"]) {
+    for (const stream of [true, false]) {
+        test(`e2e: native compaction relays verbatim with active folds (authored knob=${knob}, stream=${stream})`, async () => {
+            await withHarness(async (h) => {
+                await armBlock(h, "s-auth");
+                process.env.BILI_DSH_AUTHORED_COMPACTION = knob;
+                const before = accounting(h, "s-auth");
+                const count = h.bodies.length;
+                const messages = [{ role: "user", content: "x".repeat(600_000) }, { role: "user", content: DSH_COMPACTION_INSTRUCTION_PREFIX + " Condense." }];
+                const r = await turn(h, "s-auth", messages, {}, stream);
+                assert.equal(r.status, 200, r.body);
+                assert.match(r.contentType, stream ? /text\/event-stream/ : /application\/json/);
+                assert.ok(r.body.includes("NATIVE-CHECKPOINT"), "real upstream checkpoint returned");
+                assert.ok(!r.body.includes(BILI_SNAPSHOT_TAG_PREFIX), "no authored forge");
+                assert.ok(!r.body.includes(SUMMARY), "no substituted block summary");
+                assert.equal(h.bodies.length, count + 1, "exactly one native upstream request");
+                assert.equal(h.bodies.at(-1), JSON.stringify({ model: "gpt-test", messages, stream }), "original request bytes");
+                assert.equal(accounting(h, "s-auth"), before, "folds, metadata and usage accounting unchanged");
+            });
+        });
+    }
+}
+
+test("e2e: native compaction without active blocks relays despite a stale allow option", async () => {
     await withHarness(async (h) => {
-        await armBlock(h, "s-auth");
-        const before = h.bodies.length;
-        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
-        const r = await turn(h, "s-auth", [
-            { role: "system", content: "sys" },
-            { role: "user", content: "x".repeat(600_000) },
-            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense the conversation above.` },
-        ]);
+        const messages = [{ role: "user", content: DSH_COMPACTION_INSTRUCTION_PREFIX + " Condense." }];
+        const r = await turn(h, "s-cold", messages);
         assert.equal(r.status, 200, r.body);
-        assert.match(r.contentType, /text\/event-stream/);
-        assert.ok(r.body.includes(BILI_SNAPSHOT_TAG_PREFIX), "identity header in the forged stream");
-        assert.ok(r.body.includes(SUMMARY), "block summary in the forged stream");
-        assert.equal(h.bodies.length, before, "upstream never contacted (zero egress)");
-        const s = h.sessionOf("s-auth")!;
-        assert.equal(s.metadata["dshAuthoredCompactions"], 1, "authored counter");
-        assert.ok(typeof s.metadata["dshCompactionRefusedBytes"] === "number", "raw ledger high-water still marked");
-        assert.equal(s.metadata["dshCompactionRefusals"], undefined, "not counted as a refusal");
-    });
+        assert.ok(r.body.includes("NATIVE-CHECKPOINT"));
+        assert.equal(h.bodies.length, 1);
+        assert.equal(h.sessionOf("s-cold"), undefined, "cold raw relay does not create a kernel session");
+    }, { allowDshCompaction: true } as unknown as Partial<ProxyOptions>);
 });
-
-test("e2e: stream:false honored — JSON body with the checkpoint text", async () => {
-    await withHarness(async (h) => {
-        await armBlock(h, "s-json");
-        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
-        const r = await turn(h, "s-json", [
-            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
-        ], {}, false);
-        assert.equal(r.status, 200, r.body);
-        assert.match(r.contentType, /application\/json/);
-        const j = JSON.parse(r.body);
-        assert.ok(j.choices[0].message.content.includes(BILI_SNAPSHOT_TAG_PREFIX));
-    });
-});
-
-test("e2e: knob off → the #1729 refusal still stands (status quo pinned)", async () => {
-    await withHarness(async (h) => {
-        await armBlock(h, "s-off");
-        // #3901 flip: authored compaction is ON by default since 0.1.203's
-        // dogfood window — the off leg must pin the explicit escape hatch.
-        process.env.BILI_DSH_AUTHORED_COMPACTION = "0";
-        const r = await turn(h, "s-off", [
-            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
-        ]);
-        assert.equal(r.status, 422, r.body);
-        assert.equal(JSON.parse(r.body).error.code, "dsh_compaction_refused");
-        assert.equal(h.bodies.filter((b) => b.includes(DSH_COMPACTION_INSTRUCTION_PREFIX)).length, 0, "never forwarded");
-    });
-});
-
-test("e2e: no active blocks → authored mode falls through to refusal", async () => {
-    await withHarness(async (h) => {
-        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
-        const r = await turn(h, "s-cold", [
-            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
-        ]);
-        assert.equal(r.status, 422, "nothing to checkpoint — refuse like today");
-    });
-});
-
-test("e2e: a stale allowDshCompaction=true no longer lifts the guard — authored mode answers (#3666)", async () => {
-    const staleOptIn: (h: Harness) => Promise<void> = async (h) => {
-        await armBlock(h, "s-allow");
-        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
-        const r = await turn(h, "s-allow", [
-            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
-        ]);
-        assert.equal(r.status, 200, r.body);
-        assert.equal(h.bodies.filter((b) => b.includes(DSH_COMPACTION_INSTRUCTION_PREFIX)).length, 0, "never forwarded — the removed knob no longer lifts the guard");
-        const s = h.sessionOf("s-allow")!;
-        assert.equal(s.metadata["dshAuthoredCompactions"], 1, "authored answer stands over the stale value");
-    };
-    // The key no longer exists on ProxyOptions (#3666); the cast simulates a
-    // stale value reaching options, which the proxy must ignore.
-    await withHarness(staleOptIn, { allowDshCompaction: true } as unknown as Partial<ProxyOptions>);
-});
-
-test("e2e: landed checkpoint is recognized on replay — rebase + authored-landed mark", async () => {
-    await withHarness(async (h) => {
-        await armBlock(h, "s-land");
-        process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
-        const forged = await turn(h, "s-land", [
-            { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense.` },
-        ]);
-        assert.equal(forged.status, 200);
-        // Extract the checkpoint text the way dsh would record it (preamble +
-        // tags around our payload).
-        const frames = forged.body.split("\n\n").filter((b) => b.startsWith("data: ") && !b.includes("[DONE]"));
-        const deltas = frames.map((f) => { try { return JSON.parse(f.slice(6)); } catch { return null; } })
-            .map((j) => j?.choices?.[0]?.delta?.content)
-            .filter((c: unknown): c is string => typeof c === "string");
-        const payload = deltas.join("");
-        assert.ok(payload.includes(BILI_SNAPSHOT_TAG_PREFIX));
-        const checkpointText = `${DSH_CHECKPOINT_PREAMBLE_PREFIX}:\n\n${DSH_CHECKPOINT_OPEN_TAG}\n${payload}\n\x3c/compacted-summary\x3e`;
-        // Next turn: dsh replays [checkpoint, retained tail] against the same session.
-        // #2432/#3733 recognition is dsh-lane scoped: the replay carries the
-        // dsh plugin identity so laneDecisions.profile.compactsClientSide is
-        // true (the guard + forge above are marker-based and lane-agnostic).
-        const r = await turn(h, "s-land", [
-            { role: "user", content: checkpointText },
-            { role: "assistant", content: "ack" },
-            { role: "user", content: "continue the work" },
-        ], { "x-bili-plugin": "dsh" });
-        assert.equal(r.status, 200, r.body);
-        const s = h.sessionOf("s-land")!;
-        assert.equal(s.metadata["dshAuthoredCheckpointLanded"], true, "authored landing recognized");
-    });
-});
-
-// ---------------------------------------------------------------------------
-// E2E: real proxy + mock upstream on the RESPONSES wire — dsh desktop's actual
-// compaction lane (#2360). The landing recognition must hold there too, not
-// just on the openai wire above: authored answer (delegated to the codex
-// prompt-forge body) + replay through x-bili-plugin: dsh rebases and marks
-// dshAuthoredCheckpointLanded.
 
 function respSse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -452,7 +370,7 @@ function respConversation(): { type: string; role: string; content: string }[] {
     return out;
 }
 
-test("e2e: responses wire — authored answer + landed checkpoint recognized on replay", async () => {
+test("e2e: responses wire — native compaction relays without state or accounting changes", async () => {
     const bodies: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -465,6 +383,7 @@ test("e2e: responses wire — authored answer + landed checkpoint recognized on 
                 const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00008", topic: "setup", summary: SUMMARY }] });
                 res.write(respFcEvents("call_p", args));
             }
+            if (bodies.at(-1)?.includes(DSH_COMPACTION_INSTRUCTION_PREFIX)) res.write(respSse("response.output_text.done", { type: "response.output_text.done", text: "NATIVE-RESPONSES-CHECKPOINT" }));
             res.write(respCompleted(9_000));
             res.end();
         });
@@ -513,34 +432,18 @@ test("e2e: responses wire — authored answer + landed checkpoint recognized on 
         await r0.text();
         assert.ok(sessionOf()?.state.blocks.some((b) => b.active), "setup created an active block");
 
-        // Authored compaction on dsh desktop's production wire: zero egress, forge body.
         process.env.BILI_DSH_AUTHORED_COMPACTION = "1";
-        const before = bodies.length;
-        const r1 = await post([{ type: "message", role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Condense the conversation above.` }]);
+        const before = JSON.stringify(listSessions().find((x) => x.meta.label === "s-resp"));
+        const count = bodies.length;
+        const input = [{ type: "message", role: "user", content: DSH_COMPACTION_INSTRUCTION_PREFIX + " Condense the conversation above." }];
+        const r1 = await post(input, { "x-bili-plugin": "dsh" });
         assert.equal(r1.status, 200);
         const streamText = await r1.text();
-        assert.ok(streamText.includes(BILI_SNAPSHOT_TAG_PREFIX), "identity header in the forged responses stream");
-        assert.ok(streamText.includes(SUMMARY), "block summary in the forged responses stream");
-        assert.equal(bodies.length, before, "upstream never contacted (zero egress)");
-        assert.equal(sessionOf()?.metadata["dshAuthoredCompactions"], 1, "authored counter");
-
-        // dsh records the last assistant message item as its checkpoint and
-        // replays [checkpoint, retained tail] with its plugin identity.
-        const done = streamText.split("\n\n")
-            .map((f) => { try { return f.startsWith("data: ") ? (JSON.parse(f.slice(6)) as Record<string, unknown>) : null; } catch { return null; } })
-            .find((j): j is Record<string, unknown> & { text: string } => j !== null && j.type === "response.output_text.done" && typeof j.text === "string");
-        assert.ok(done, "output_text.done frame present in the forged stream");
-        const payload = done.text;
-        assert.ok(payload.includes(BILI_SNAPSHOT_TAG_PREFIX), "checkpoint payload extracted from the real stream");
-        const checkpointText = `${DSH_CHECKPOINT_PREAMBLE_PREFIX}:\n\n${DSH_CHECKPOINT_OPEN_TAG}\n${payload}\n\x3c/compacted-summary\x3e`;
-        const r2 = await post([
-            { type: "message", role: "user", content: checkpointText },
-            { type: "message", role: "assistant", content: "ack" },
-            { type: "message", role: "user", content: "continue the work" },
-        ], { "x-bili-plugin": "dsh" });
-        assert.equal(r2.status, 200);
-        await r2.text();
-        assert.equal(sessionOf()?.metadata["dshAuthoredCheckpointLanded"], true, "authored landing recognized on the responses wire");
+        assert.ok(streamText.includes("NATIVE-RESPONSES-CHECKPOINT"));
+        assert.ok(!streamText.includes(BILI_SNAPSHOT_TAG_PREFIX), "no authored checkpoint");
+        assert.equal(bodies.length, count + 1);
+        assert.equal(bodies.at(-1), JSON.stringify({ model: "gpt-test", stream: true, session_id: "s-resp", instructions: "You are the test coding agent.", input }));
+        assert.equal(JSON.stringify(listSessions().find((x) => x.meta.label === "s-resp")), before, "session and accounting unchanged");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

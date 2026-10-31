@@ -61,7 +61,9 @@ export function carriesBiliSnapshotCheckpoint(
         if (m.role !== "user" || (m.contentType !== undefined && m.contentType !== "text")) continue;
         if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : contentText(m.content);
-        if (text !== "" && text.includes(BILI_SNAPSHOT_TAG_PREFIX)) return true;
+        const trimmed = text.trimStart();
+        if (trimmed.startsWith(BILI_SNAPSHOT_TAG_PREFIX)) return true;
+        if (trimmed.startsWith("This is an automatically generated checkpoint") && trimmed.includes("\x3ccompacted-summary\x3e") && trimmed.includes(BILI_SNAPSHOT_TAG_PREFIX)) return true;
     }
     return false;
 }

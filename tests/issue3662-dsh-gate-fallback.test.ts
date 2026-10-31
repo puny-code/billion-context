@@ -2,9 +2,9 @@
 // provider of biliBasicCompactionPolicy while the bundle patch kept gating all
 // four web-profile presets on it — dsh then booted with every preset pending
 // forever and session creation bricked (new + resume + preset list). The gate
-// now lives in its own always-on entry; these tests pin both trigger paths
-// (entry disabled / env kill-switch ⇒ absent verdict) and that the fallback is
-// STOCK dsh compaction, not a third state.
+// now lives in its own always-on entry; these tests pin service availability
+// with bili-native absent or active. Both states preserve STOCK dsh compaction
+// and the host's backend rather than claiming exclusive compaction ownership.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -102,7 +102,7 @@ test("#3662: bili-native absent (disabled / kill-switched) — service still pro
     }
 });
 
-test("#3662: normal boot (verdict active) — the gate entry disables the compaction rows", () => {
+test("#3662: normal boot (verdict active) — service stays available without disabling or replacing native compaction", () => {
     try {
         _resetDshCompactionVerdictForTest();
         declareDshCompactionActive();
@@ -115,19 +115,22 @@ test("#3662: normal boot (verdict active) — the gate entry disables the compac
         const plugins = presetPlugins();
         const cfg: Record<string, unknown> = { plugins, x: 1 };
         const out = mw.call(PRESET_SELF, null, () => cfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
+        assert.equal(out, cfg, "active verdict must also preserve the resolved object");
+        assert.equal(out.plugins, plugins, "native plugin array is not replaced");
         assert.equal(out.x, 1);
+        assert.equal(out.plugins?.[0], plugins[0], "Basic row identity preserved");
+        assert.equal(out.plugins?.[0]?.config, plugins[0].config, "Basic backend/config identity preserved");
         assert.deepEqual(out.plugins?.[0]?.config, { auto: true });
-        assert.equal(out.plugins?.[0]?.disabled, true);
-        assert.equal(out.plugins?.[1]?.disabled, true);
+        assert.equal(out.plugins?.[0]?.disabled, undefined);
+        assert.equal(out.plugins?.[1]?.disabled, undefined);
         assert.equal(out.plugins?.[2]?.disabled, undefined);
-        // #4147: non-agent-preset entries pass through verbatim ONLY when
-        // they nest no compaction rows — a custom preset nesting them is
-        // rewritten (structural match), unrelated config keeps identity.
         const otherCfg: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-other" }] };
         assert.equal(mw.call({ entry: { options: { name: "something-else" } } }, null, () => otherCfg), otherCfg);
         const customCfg: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
         const customOut = mw.call({ entry: { options: { name: "preset-general" } } }, null, () => customCfg) as { plugins?: Array<Record<string, unknown>> };
-        assert.equal(customOut.plugins?.[0]?.disabled, true);
+        assert.equal(customOut, customCfg, "custom presets are not rewritten either");
+        assert.equal(customOut.plugins, customCfg.plugins);
+        assert.equal(customOut.plugins?.[0]?.disabled, undefined);
     } finally {
         _resetDshCompactionVerdictForTest();
     }

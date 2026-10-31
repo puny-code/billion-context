@@ -1,25 +1,8 @@
-// #2709: the passthrough lane (x-bili-passthrough, #1117) relays byte-untouched
-// with "no session, no injection, no guard" — which made it the one lane dsh's
-// agentless background compaction could still LAND through: the takeover gate
-// refuses attribution for agentless callers while the settings overlay has
-// already routed the URL to /bili/, so the native patch stamps the request and
-// it relays verbatim BELOW the #1835 pipeline guard (field report on the
-// anthropic lane: 49 compaction starts, 45 refused through the pipeline,
-// 4 landed through this lane, each landing destroying the compression
-// substrate and later tripping #1001 as "unannounced").
-//
-// These tests pin the lane-local guard added for #2709:
-//   1. marker-shaped passthrough POST → 422 refusal, upstream receives nothing;
-//   2. ordinary passthrough POST (title-gen shape, marker string only mentioned
-//      mid-text) → byte-identical verbatim relay (no false positive);
-//   3. gzip-encoded marker body → still refused (decode-then-sniff path);
-//   4. legacy allowDshCompaction opt-in (file/env) → STILL refused (#3666 removed it);
-//   5. unparseable body → verbatim relay (fail-open);
-//   6. GET passthrough (e.g. /models) → untouched (method gate).
+// Native DSH compaction and ordinary passthrough traffic relay verbatim.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { gzipSync } from "node:zlib";
+import { gzipSync, gunzipSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
@@ -47,7 +30,7 @@ async function startHarness(): Promise<{ proxyPort: number; upstreamPort: number
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
-            captured.push({ url: req.url ?? "", body: Buffer.concat(chunks).toString("utf8"), method: req.method ?? "" });
+            captured.push({ url: req.url ?? "", body: (req.headers["content-encoding"] === "gzip" ? gunzipSync(Buffer.concat(chunks)) : Buffer.concat(chunks)).toString("utf8"), method: req.method ?? "" });
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({
                 id: "chatcmpl_2709",
@@ -110,7 +93,7 @@ function compactionBody(): string {
     return JSON.stringify({ model: "gpt-test", messages: [...filler, { role: "user", content: INSTRUCTION }] });
 }
 
-test("#2709: passthrough compaction call is refused 422, never forwarded", async () => {
+test("#2709: passthrough compaction call relays without refusal accounting", async () => {
     const before = dshPassthroughGuardStats.refusals;
     const h = await startHarness();
     try {
@@ -120,15 +103,12 @@ test("#2709: passthrough compaction call is refused 422, never forwarded", async
             headers: { "content-type": "application/json", "x-bili-passthrough": "1" },
             body,
         });
-        assert.equal(resp.status, 422);
+        assert.equal(resp.status, 200);
         const text = await resp.text();
-        assert.match(text, /dsh_compaction_refused/);
-        // the refusal must state the unconditional contract like the pipeline guard (#3666)
-        assert.match(text, /unconditional/);
-        // upstream saw NOTHING — the call must not land
-        assert.equal(h.captured.length, 0);
-        // process-level count (no session ledger on this lane)
-        assert.equal(dshPassthroughGuardStats.refusals, before + 1);
+        assert.equal(JSON.parse(text).choices[0].message.content, "ok");
+        assert.equal(h.captured.length, 1);
+        assert.equal(h.captured[0].body, body, "native request bytes are untouched");
+        assert.equal(dshPassthroughGuardStats.refusals, before, "no refusal recorded");
     } finally {
         await h.close();
     }
@@ -154,7 +134,7 @@ test("#2709: ordinary passthrough traffic relays byte-identical (no false positi
     }
 });
 
-test("#2709: gzip-encoded compaction body is still refused (decode path)", async () => {
+test("#2709: gzip-encoded compaction body relays with its encoding", async () => {
     const h = await startHarness();
     try {
         const gz = gzipSync(Buffer.from(compactionBody(), "utf8"));
@@ -163,14 +143,15 @@ test("#2709: gzip-encoded compaction body is still refused (decode path)", async
             headers: { "content-type": "application/json", "content-encoding": "gzip", "x-bili-passthrough": "1" },
             body: gz,
         });
-        assert.equal(resp.status, 422);
-        assert.equal(h.captured.length, 0);
+        assert.equal(resp.status, 200);
+        assert.equal(h.captured.length, 1);
+        assert.equal(h.captured[0].body, compactionBody());
     } finally {
         await h.close();
     }
 });
 
-test("#2709/#3666: the removed allowDshCompaction opt-in no longer relays (legacy env ignored)", async () => {
+test("#2709/#3666: native relay does not depend on the removed allowDshCompaction opt-in", async () => {
     process.env.BILI_ALLOW_DSH_COMPACTION = "1";
     try {
         const h = await startHarness();
@@ -181,8 +162,9 @@ test("#2709/#3666: the removed allowDshCompaction opt-in no longer relays (legac
                 headers: { "content-type": "application/json", "x-bili-passthrough": "1" },
                 body,
             });
-            assert.equal(resp.status, 422, "legacy env opt-in is ignored — refusal stands");
-            assert.equal(h.captured.length, 0, "still nothing reaches upstream");
+            assert.equal(resp.status, 200, "native relay remains available with a stale env value");
+            assert.equal(h.captured.length, 1);
+            assert.equal(h.captured[0].body, body);
         } finally {
             await h.close();
         }

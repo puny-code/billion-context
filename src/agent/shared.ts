@@ -427,6 +427,15 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
     return json as Record<string, unknown>;
 }
 
+/** DSH only: service liveness is insufficient after SQLite fails open to legacy.
+ * Unknown/old status is not affirmative permission to own host compression. */
+export async function fetchDshTakeoverReady(proxyBase: string): Promise<boolean> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/status`, undefined, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return false;
+    const storage = (json as { storage?: { effective?: unknown; degraded?: unknown } }).storage;
+    return storage?.effective === "full" && storage.degraded === false;
+}
+
 /** Liveness + version probe for status UIs: same loopback origin as the
  *  status endpoint, so a 404 status + a live manifest means "proxy up,
  *  conversation not seen yet" — an armed-but-idle state, not an error. */

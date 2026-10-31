@@ -17,7 +17,7 @@ import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
-import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { carriesDshLocalCompactionSummary } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
@@ -122,23 +122,12 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
-        // #3756 snapshot render: the outbound prefix renders from the unified
-        // transcript (server-authoritative, fold-time ids — immune to identity
-        // re-mints #3752); only the live tail keeps the client's bytes.
-        // No-op returns `msgs` when the lane is inactive/degraded.
-        // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
-        // #4241: the render lane replaced the view (reference-inequality is the
-        // discriminator — maybeSnapshotView returns the SAME array when idle),
-        // so the judged baseline is the rendered transcript, not the inbound.
-        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
@@ -157,8 +146,8 @@ export async function prepareOpenai(
         // that DO transit. First notice = this request replaying
         // [checkpoint summary, retained tail…] against the same session id.
         // Same signature+rebase pattern as codex local compaction (#2373):
-        // dsh-bound session + checkpoint framing in resent history + decimated
-        // fold coverage → mark AND rebase NOW so this turn's processTurn seeds
+        // dsh-bound session + novel standalone checkpoint + any lost covered id
+        // → mark AND rebase NOW so this turn's processTurn seeds
         // fresh refs onto the compacted view instead of poisoning anchors
         // first (without it: syncBlocks keeps partially-alive blocks forever,
         // fold anchors self-destruct, and every later compress fails "cannot
@@ -176,19 +165,29 @@ export async function prepareOpenai(
             // historical quote/replay of the marker string hits an old id.
             if (dshGap && (carriesDshLocalCompactionSummary(msgs, knownRefsBefore) || carriesBiliSnapshotCheckpoint(msgs, knownRefsBefore))) {
                 const missing = dshGap.expected - dshGap.matched;
-                if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
-                    // #3733: a checkpoint carrying our <bili-snapshot v1 …/> tag is one
-                    // WE authored (answered locally at the #1729 guard) — same rebase
-                    // as a foreign one, but recorded + logged as the intended event.
-                    const authored = carriesBiliSnapshotCheckpoint(msgs, knownRefsBefore);
-                    if (authored) session.metadata.dshAuthoredCheckpointLanded = true;
-                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                    log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
-                    markNativeCompactionBoundary(session);
-                    dshRebased = reconcileNativeCompactionBoundary(session);
-                }
+                // #3733: a checkpoint carrying our <bili-snapshot v1 …/> tag is one
+                // WE authored (answered locally at the #1729 guard) — same rebase
+                // as a foreign one, but recorded + logged as the intended event.
+                const authored = carriesBiliSnapshotCheckpoint(msgs, knownRefsBefore);
+                if (authored) session.metadata.dshAuthoredCheckpointLanded = true;
+                recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
+                markNativeCompactionBoundary(session);
+                dshRebased = reconcileNativeCompactionBoundary(session);
             }
         }
+        // Landed checkpoints retire the old prefix before any snapshot captures it.
+        // #3756 snapshot render: the outbound prefix renders from the unified
+        // transcript (server-authoritative, fold-time ids — immune to identity
+        // re-mints #3752); only the live tail keeps the client's bytes.
+        // No-op returns `msgs` when the lane is inactive/degraded.
+        // reconcileFoldCoverage below still observes the CLIENT view.
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts). The verdict

@@ -48,14 +48,13 @@ import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, 
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
-import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
-import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
+import { detectPassthroughDshCompactionCall, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
@@ -289,6 +288,8 @@ async function handleRequest(
     // in startServer() (above), which is the only reliable path — Node routes
     // upgrade requests there and never to this request handler.
     let bodyBuffer: Buffer;
+    let originalBody: Buffer;
+    const originalEncoding = headerValue(req, "content-encoding");
     let urlPath: string;
     let responsesCompact: boolean;
     let route: ReturnType<typeof resolveUpstream>;
@@ -315,8 +316,10 @@ async function handleRequest(
     // #1117: read before the body decode below — a passthrough-marked request
     // must relay its ORIGINAL bytes (content-encoding included) untouched.
     const passthroughMark = headerValue(req, BILI_PASSTHROUGH_HEADER) === "1";
+    let nativeDshCompaction = false;
     try {
         bodyBuffer = await readBody(req);
+        originalBody = bodyBuffer;
         inboundBytes = bodyBuffer.length;
         const url = req.url ?? "";
         urlPath = url.split("?", 2)[0];
@@ -387,9 +390,13 @@ async function handleRequest(
         // body holds none, so this is the only source for every model-keyed
         // decision on that wire.
         vertexModel = protocol === "anthropic" ? vertexAnthropicModelFromPath(urlPath) : undefined;
+        if (!passthroughMark && pluginAgentHeader(req.headers) === "dsh"
+            && await detectPassthroughDshCompactionCall(protocol, bodyBuffer, headerValue(req, "content-encoding"), async (enc, buf) => (await decodeRequestBody(enc, buf, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) })).body)) {
+            nativeDshCompaction = true;
+        }
         // Issue #99: decode body only for known protocols — passthrough requests
         // (e.g. GET /models) must forward raw bytes without content-encoding decode.
-        if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
+        if (!passthroughMark && !nativeDshCompaction && protocol !== null && bodyBuffer.length > 0) {
             try {
                 const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) });
                 bodyBuffer = decoded.body;
@@ -424,6 +431,11 @@ async function handleRequest(
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
     }
+    if (nativeDshCompaction) {
+        log("info", "dsh native compaction — relaying verbatim, kernel bypassed");
+        await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, clientConversationHeader(req.headers) ?? pluginConversationHeader(req.headers));
+        return;
+    }
     // #1757: resolve compat.dropFields once, ahead of the verbatim branches
     // that forward before reaching the final boundary (they can't use
     // forward()'s own resolution). Same destination derivation as
@@ -435,36 +447,6 @@ async function handleRequest(
     // without the overlay: no session, no injection, no guard. Same raw
     // forward as the #920 bypass.
     if (passthroughMark) {
-        // #2709: ...except the compaction guard. dsh's background compaction is
-        // agentless by nature (no active initiator attribution), so the takeover
-        // gate refuses it INTO this lane — and a verbatim relay below the #1835
-        // pipeline guard is exactly how 4/49 compaction calls landed in the field
-        // report (45 were refused through the pipeline). Same refusal, applied at
-        // this lane too: marker-decisive (#2193), unconditional (#3651 removed
-        // the #2028 opt-out), fail-open on undecodable bodies (#1835 failure
-        // direction — relay verbatim, today's behavior). The check decodes only
-        // a COPY: the relay still forwards the original bytes with content-
-        // encoding intact.
-        if (protocol !== null && req.method === "POST" && bodyBuffer.length > 0
-            && await detectPassthroughDshCompactionCall(protocol, bodyBuffer, headerValue(req, "content-encoding"), async (enc, buf) => (await decodeRequestBody(enc, buf, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) })).body)) {
-            dshPassthroughGuardStats.refusals += 1;
-            // #3013/#3022 (A3): first refusal warns; then every
-            // DSH_REFUSAL_STORM_LOG_EVERY-th refusal logs an info so an
-            // agentless retry storm stays visible without spamming (the
-            // field-reported storm re-fired every ~328ms — per-refusal warn
-            // would have written thousands of lines). This log line, not the
-            // #2490 ledger, is the only record on this lane.
-            if (dshPassthroughGuardStats.refusals === 1 || dshPassthroughGuardStats.refusals % DSH_REFUSAL_STORM_LOG_EVERY === 0) {
-                log(dshPassthroughGuardStats.refusals === 1 ? "warn" : "info", `[passthrough] dsh native compaction call identified on the unattributed passthrough lane (#1117/#2709) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1772/#1206). No session exists on this lane, so this log line (not the #2490 ledger) is the record; passthrough refusals so far: ${dshPassthroughGuardStats.refusals}` + (dshPassthroughGuardStats.refusals === 1 ? "" : ` — retrying will keep failing (terminal, bili_final; #3013): disable dsh auto-compaction (#2474)`));
-            }
-            const refusal = dshCompactionRefusal(protocol);
-            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
-                res.writeHead(refusal.status, { "content-type": "application/json" });
-                res.end(JSON.stringify(refusal.body));
-            }
-            logRequestCost(log, "passthrough", null, inboundBytes, reqT0);
-            return;
-        }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
         return;
@@ -1387,6 +1369,13 @@ async function handleRequest(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
+        if ((pluginAgent === "dsh" || session.metadata.pluginAgent === "dsh" || session.metadata.clientHint === "dsh")
+            && isDshCompactionCall(protocol, parsed)) {
+            log("info", `[${session.id}] dsh native compaction — relaying verbatim, kernel bypassed`);
+            if (originalEncoding !== undefined) req.headers["content-encoding"] = originalEncoding;
+            await forward(req, res, opts, originalBody, null, core, reqConfig, log, route, instanceId, affinity);
+            return;
+        }
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
@@ -1946,86 +1935,6 @@ async function handleRequest(
         // Resolved once here so the side-request guard below AND the main-path
         // reservation measure against the SAME capped window.
         const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
-        // #1729: dsh native compaction guard — a compaction summarize call
-        // (replayed prefix + COMPACTION_INSTRUCTION as the final user message)
-        // is refused BEFORE any pipeline work: not forwarded, kernel state
-        // untouched. MARKER-DECISIVE since #2193: message count no longer gates
-        // — rc.2 replays the full shadowed region (~1100+ msgs) and the old ≤4
-        // bar made the guard silently pass through, letting a checkpoint land
-        // and destroy the compression substrate. Protocol coverage (#2360):
-        // openai + anthropic + responses lanes are all marker-decisive — the
-        // pre-#2360 whitelist short-circuited responses (dsh desktop's actual
-        // wire) before the marker was ever examined. Unconditional (#3651
-        // removed the #2028 opt-out) — auto pressure, overflow recovery, and
-        // manual /compact share one envelope, and a landed checkpoint durably
-        // shadows the raw history (irreversible), while every cost of refusing
-        // is dsh-side, caught, and recoverable. Runs before the #388
-        // side-request lane: the compaction call is a full-budget request, so
-        // only this guard can catch it.
-        if (protocol !== null && isDshCompactionCall(protocol, parsed)) {
-            // #3733: AUTHORED compaction — when the knob is on and the session
-            // holds active fold blocks, answer the call LOCALLY with our folded
-            // snapshot instead of refusing: zero egress (autoModeForge #2740
-            // discipline), dsh records our tagged checkpoint and its file shrinks
-            // (#3723), and the recorded content is exactly what the upstream
-            // already sees. Replaces the default refusal only — since #3651
-            // removed the #2028 opt-out there is no native-forward path left:
-            // an authored answer is bili answering the call, never passing it
-            // through. Undecidable shapes (null forge) fall through to the
-            // refusal below.
-            const authored = dshAuthoredCompactionEnabled() && session.state.blocks.some((b) => b.active)
-                ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", renderDshAuthoredCheckpoint(session), { inputTokens: Math.max(1, Math.round(inboundBytes / 4)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
-                : null;
-            if (authored !== null) {
-                log("info", `[${session.id}] dsh compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
-            } else if (session.metadata.dshCompactionRefused !== true) {
-                session.metadata.dshCompactionRefused = true;
-                const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
-                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
-            }
-            // #2490: remember the replayed envelope SIZE. The host's raw ledger is
-            // invisible to bili's folded view (folds never shrink what dsh itself
-            // counts), so the next turn's output clamp must plan against the raw
-            // scale or a monster output rides a small folded input out the door
-            // (the 384K-token/7.5MB turn-37 single-message kill chain). High-water
-            // mark, not a sum: the replay is the whole ledger every time, so the
-            // max already bounds every future re-send; a sum would compound on each
-            // retry. Write-only by design: nothing decays or clears this value —
-            // dshLedgerFloorTokens() in budget.ts documents why the mark stays
-            // sticky and consumes it.
-            const prevBytes = typeof session.metadata["dshCompactionRefusedBytes"] === "number" ? session.metadata["dshCompactionRefusedBytes"] as number : 0;
-            session.metadata["dshCompactionRefusedBytes"] = Math.max(prevBytes, inboundBytes);
-            if (authored !== null) {
-                // #3733 counters + the same raw-ledger high-water as a refusal
-                // (the envelope still proves the raw scale the output clamp must
-                // plan against); NOT counted in dshCompactionRefusals.
-                session.metadata["dshAuthoredCompactions"] = (typeof session.metadata["dshAuthoredCompactions"] === "number" ? session.metadata["dshAuthoredCompactions"] as number : 0) + 1;
-                markDirty(session);
-                if (!res.headersSent && !res.writableEnded && !res.destroyed) {
-                    res.writeHead(200, { "content-type": authored.contentType });
-                    res.end(authored.body);
-                }
-                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
-                return;
-            }
-            session.metadata["dshCompactionRefusals"] = (typeof session.metadata["dshCompactionRefusals"] === "number" ? session.metadata["dshCompactionRefusals"] as number : 0) + 1;
-            // #3013/#3022 (A3): after the once-warn above, refusals were fully
-            // silent — the field storm burned 5051 refusals with zero further
-            // log lines while the user saw a stuck "生成中". Every
-            // DSH_REFUSAL_STORM_LOG_EVERY-th refusal re-surfaces with the
-            // running count and the actual levers.
-            if ((session.metadata["dshCompactionRefusals"] as number) % DSH_REFUSAL_STORM_LOG_EVERY === 0) {
-                log("info", `[${session.id}] dsh native compaction refusal #${session.metadata["dshCompactionRefusals"]} on this session (raw-ledger high-water ${(session.metadata["dshCompactionRefusedBytes"] as number)} bytes) — dsh keeps retrying because its own raw pressure ledger never shrinks (#2490), and every retry of this call will be refused (terminal, #3013). Disable dsh auto-compaction (profile recipe #2474) or manage context via bili's compress. If bili's own compression looks idle while this repeats, the nudge channel may be dead — report it (#3004/#3013).`);
-            }
-            markDirty(session);
-            const refusal = dshCompactionRefusal(protocol);
-            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
-                res.writeHead(refusal.status, { "content-type": "application/json" });
-                res.end(JSON.stringify(refusal.body));
-            }
-            logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
-            return;
-        }
         // #388: side requests (title-gen etc.) share the main session key but
         // must not touch kernel state (processTurn/snapshot/usage would pollute
         // the main view). Forward with a minimal prepared marked sidePassthrough:

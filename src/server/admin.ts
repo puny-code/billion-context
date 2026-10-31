@@ -288,7 +288,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
         const aux = auxProxyShot(opts);
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, guardedShutdown: true, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -538,6 +538,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // binds the freed port itself. Loopback-gated like every /__bili/ route;
     // the response is immediate — exit completes asynchronously (≤10s backstop).
     if (req.method === "POST" && req.url === "/__bili/shutdown") {
+        const expectedId = req.headers["x-bili-expected-instance-id"];
+        const expectedPid = req.headers["x-bili-expected-pid"];
+        if ((expectedId !== undefined || expectedPid !== undefined) && (expectedId !== instanceId || expectedPid !== String(process.pid))) {
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "instance identity changed" }));
+            return;
+        }
+        const expectedOwner = req.headers["x-bili-expected-owner-pid"];
+        if (expectedOwner !== undefined && (initialWatcherPid === null || !proxyWatchers.has(Number(expectedOwner)) || [...proxyWatchers].some((pid) => pid !== Number(expectedOwner)))) {
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "instance ownership changed" }));
+            return;
+        }
         ctx.requestShutdown?.("rotation-requested (#3544)");
         log("info", `[admin] POST /__bili/shutdown — graceful shutdown requested`);
         res.writeHead(202, { "content-type": "application/json" });

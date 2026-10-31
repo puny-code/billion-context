@@ -27,7 +27,7 @@ test("#2605: dsh.bundle.patch.yml restates every default code + MALFORMED_RESPON
     // byte-exact multi-line includes; .gitattributes pins eol=lf as the first
     // line of defense, this protects checkouts that bypass it.
     const bundle = fs.readFileSync(path.join(REPO_ROOT, "..", "dsh.bundle.patch.yml"), "utf8").replaceAll("\r\n", "\n");
-    assert.ok(bundle.includes(COMPACT_ROW), "compaction-basic auto:false row must stay intact");
+    assert.equal(bundle.includes(COMPACT_ROW), false, "bili must not disable host compaction");
     assert.ok(bundle.includes(RETRY_ROW_DS), "llm-deepseek retry row missing or drifted");
     assert.ok(bundle.includes(RETRY_ROW_DSA), "llm-deepseek-account retry row missing or drifted");
 });
@@ -38,7 +38,7 @@ test("#2605: launcher overlay and bundle patch carry byte-identical retry rows",
         const file = writeDshAcpPatch(home, "billion-context");
         assert.ok(file, "writeDshAcpPatch must produce the overlay file");
         const overlay = fs.readFileSync(file, "utf8");
-        assert.ok(overlay.includes(COMPACT_ROW), "compaction-basic auto:false row must stay intact");
+        assert.equal(overlay.includes(COMPACT_ROW), false, "bili must not disable host compaction");
         assert.ok(overlay.includes(RETRY_ROW_DS), "overlay llm-deepseek retry row missing or drifted");
         assert.ok(overlay.includes(RETRY_ROW_DSA), "overlay llm-deepseek-account retry row missing or drifted");
     } finally {
