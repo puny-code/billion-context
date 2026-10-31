@@ -165,7 +165,8 @@ billion-context/
 │   │   ├── pi-native.ts          #   pi native bootstrap gate
 │   │   ├── omp.ts                #   omp plugin = createBiliPlugin("omp") re-export of pi factory
 │   │   ├── omp-native.ts         #   omp native bootstrap gate
-│   │   ├── dsh-native.ts         #   dsh native bootstrap gate (+ persona fingerprint, #1916)
+│   │   ├── dsh-native.ts         #   dsh native bootstrap + full-storage takeover readiness and bounded recovery (+ persona fingerprint, #1916)
+│   │   ├── dsh-recovery-budget.ts #   Per-activation recovery allowance: initial free, three recoveries with 30s spacing; singleflight joins free
 │   │   ├── dsh-acp.ts            #   dsh /acp command panel
 │   │   ├── dsh-native-client.ts  #   Poll host live-origin route until armed (#1809)
 │   │   └── dsh-native-client-react-shim.d.ts #  Ambient "react" types for the dsh bundle (#1590)

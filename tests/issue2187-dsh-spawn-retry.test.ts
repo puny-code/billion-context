@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { apply, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
+import { apply, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest, _setRecoveryNowForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 delete process.env.BILLION_CONTEXT_ATTACH;
@@ -123,6 +123,8 @@ test("#2187 boot-time spawn failure self-heals with zero model traffic — timer
             { DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_DSH_RECOVERY_INTERVAL_MS: "20", BILI_DSH_RETRY_INTERVAL_MS: "20" },
             async () => {
                 _resetRegisterForTest(undefined); // base-less spawn plan
+                let now = 0;
+                _setRecoveryNowForTest(() => now);
                 let attempts = 0;
                 _setSpawnForTest(() => {
                     attempts += 1;
@@ -132,9 +134,13 @@ test("#2187 boot-time spawn failure self-heals with zero model traffic — timer
                     const ctx = mockCtx();
                     ctx.setInitiator({ session: { id: "dsh-2187-session" } });
                     apply(ctx);
-                    // two consecutive boot failures — before the fix nothing
-                    // would ever retry after this point
-                    await waitFor(() => attempts >= 3, "a third attempt fires after two failed boots");
+                    await waitFor(() => attempts === 1, "initial boot attempt");
+                    await _settleNativeForTest();
+                    now += 30_000;
+                    await waitFor(() => attempts === 2, "first recovery after its cooldown");
+                    await _settleNativeForTest();
+                    now += 30_000;
+                    await waitFor(() => attempts === 3, "second recovery after its cooldown");
                     await waitFor(() => ctx.registeredTools.length === 1, "timer-driven registration with zero model traffic");
                     assert.equal(ctx.registeredTools[0].name, "compress");
                     await waitFor(
@@ -143,6 +149,7 @@ test("#2187 boot-time spawn failure self-heals with zero model traffic — timer
                     );
                 } finally {
                     _setSpawnForTest(undefined);
+                    _setRecoveryNowForTest();
                 }
             },
         );
@@ -153,13 +160,15 @@ test("#2187 boot-time spawn failure self-heals with zero model traffic — timer
     }
 });
 
-test("#2187 persistent spawn failure keeps retrying instead of degrading permanently", async () => {
+test("#2187 persistent spawn failure receives three cooldown-spaced recoveries", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2187-persist-"));
     try {
         await withEnv(
             { DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_DSH_RECOVERY_INTERVAL_MS: "20", BILI_DSH_RETRY_INTERVAL_MS: "20" },
             async () => {
                 _resetRegisterForTest(undefined);
+                let now = 0;
+                _setRecoveryNowForTest(() => now);
                 let attempts = 0;
                 _setSpawnForTest(() => {
                     attempts += 1;
@@ -167,11 +176,19 @@ test("#2187 persistent spawn failure keeps retrying instead of degrading permane
                 });
                 try {
                     apply(mockCtx());
-                    // the old behavior was exactly ONE attempt for the whole
-                    // process lifetime; the recovery timer must keep firing
-                    await waitFor(() => attempts >= 4, "retries keep firing while every attempt fails");
+                    await waitFor(() => attempts === 1, "initial failed attempt");
+                    for (let expected = 2; expected <= 4; expected += 1) {
+                        await _settleNativeForTest();
+                        now += 30_000;
+                        await waitFor(() => attempts === expected, `cooldown-spaced attempt ${expected}`);
+                    }
+                    await _settleNativeForTest();
+                    now += 300_000;
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                    assert.equal(attempts, 4, "initial plus three recoveries exhaust the activation");
                 } finally {
                     _setSpawnForTest(undefined);
+                    _setRecoveryNowForTest();
                 }
             },
         );

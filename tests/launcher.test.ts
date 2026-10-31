@@ -4237,7 +4237,7 @@ test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: file:\/\/.+dsh-native\.js$/m);
         // #3662: the always-on gate entry mounts alongside bili-native in the URL lane too
         assert.match(txt, /^ {4}- id: bili-compaction-gate\n {6}name: file:\/\/.+dsh-compaction-gate\.js$/m);
-        assert.match(txt, /^- id: compaction-basic\n  config:\n    auto: false\n/m);
+        assert.doesNotMatch(txt, /^- id: compaction-basic\n/m);
         assert.match(txt, /^- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n/m);
         assert.match(txt, /^- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n$/m);
         rmrf(`${dir}-bili`);
@@ -4660,7 +4660,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         // client scanner attach the browser half), not the legacy file URL;
         // NODE_PATH points the scanner's CJS resolution at the base home.
         assert.ok(/- id: bili-native\n {6}name: billion-context\n/.test(patchTxt));
-        assert.match(patchTxt, /^- id: compaction-basic\n  config:\n    auto: false\n/m);
+        assert.doesNotMatch(patchTxt, /^- id: compaction-basic\n/m);
         assert.match(patchTxt, /^- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n/m);
         assert.match(patchTxt, /^- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n$/m);
         assert.ok(String(seenEnv.NODE_PATH ?? "").startsWith(path.join(dshHome, "node_modules")), `NODE_PATH seeds the scanner: ${seenEnv.NODE_PATH}`);

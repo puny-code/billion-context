@@ -63,10 +63,11 @@ import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "..
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchDshTakeoverReady, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
-import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
+import { declareDshCompactionInactive } from "./dsh-compaction-disable.js";
+import { DshRecoveryBudget } from "./dsh-recovery-budget.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
@@ -290,22 +291,6 @@ let regAdoptLogged = false;
 // (#3806 boot warning + #2474 fallback); only the untested-future direction is
 // covered.
 export { DSH_BUILD_CHECK } from "./client-build-note.js";
-
-/** #3962: one-line overlay-coverage suffix for the durable profile notes.
- * The bundle-patch gate rows target four factory preset ids a profile may not
- * ship (their miss is visible only in the host loader log); the #4147
- * structural transform records every entry it actually rewrote on the shared
- * globalThis channel, so the note can state real coverage instead of leaving
- * the gate rows' fate implied. Best-effort by necessity: preset configs
- * resolve lazily, so "so far" is the honest frame. */
-function gateCoverageSuffix(): string {
-    const t = dshCompactionGateTelemetry();
-    if (t === null || t.covered.length === 0) {
-        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
-    }
-    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
-    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
-}
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
  *  once bound (attach synchronously, spawn after bootstrap), else the preset
@@ -708,12 +693,38 @@ export function persistClientEvent(msg: string): void {
     logHostEvent("warn", "[dsh-client]", msg);
 }
 
-async function bootstrap(): Promise<string | undefined> {
-    // #3616: superseded flights must not bind the newer world's origin plane.
+let activationSpawnFlight: Promise<string | undefined> | undefined;
+let activationInitialSpawnUsed = false;
+let recoveryNow: () => number = Date.now;
+let activationRecoveryBudget = new DshRecoveryBudget(() => recoveryNow());
+let activationRecoveryRemaining = 3;
+
+/** One actual bring-up flight across timer, fetch recovery and storage probes. */
+function startActivationProxy(): Promise<string | undefined> {
+    if (activationSpawnFlight !== undefined) return activationSpawnFlight;
+    const permit = activationRecoveryBudget.tryAcquire(activationInitialSpawnUsed ? "recovery" : "initial");
+    activationRecoveryRemaining = permit.remaining;
+    if (!permit.allowed) return Promise.resolve(undefined);
+    activationInitialSpawnUsed = true;
     const gen = originGen;
+    const spawn = _spawnForTest;
+    const flight = Promise.resolve().then(() => {
+        if (gen !== originGen) return undefined;
+        return spawn !== undefined ? spawn() : bootstrap(gen);
+    }).finally(() => {
+        if (activationSpawnFlight === flight) activationSpawnFlight = undefined;
+    });
+    activationSpawnFlight = flight;
+    return flight;
+}
+
+async function bootstrap(gen: number): Promise<string | undefined> {
+    // Capture generation before scheduling: a superseded activation must not
+    // start work or borrow the newer activation's identity.
+    if (gen !== originGen) return undefined;
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "dsh" },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "dsh", recoverDegradedDsh: true },
             { scriptPath: nativeProxyScriptPath() },
         );
         if (gen !== originGen) return handle.origin;
@@ -726,6 +737,7 @@ async function bootstrap(): Promise<string | undefined> {
         // lifecycles goes through ensureProxyRunning's instance discovery.
         return handle.origin;
     } catch (err) {
+        if (gen !== originGen) return undefined;
         const msg = `proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`;
         persistClientEvent(msg);
         // #4811: a one-shot bootstrap failure must not become permanent. Plan-time
@@ -854,7 +866,7 @@ async function spawnFallback(attachOrigin: string, note: string, gen: number): P
     state.attach = false;
     if (state.origin === attachOrigin) state.origin = undefined;
     markNativeHost(process.env, "dsh");
-    const start = singleFlight(_spawnForTest ?? bootstrap);
+    const start = startActivationProxy;
     state.respawn = start;
     state.onGiveUp = fireGiveUp;
     const landed = start().then((origin) => {
@@ -1055,6 +1067,7 @@ function recoveryIntervalMs(): number {
 }
 function armRecoveryTimer(): void {
     if (recoveryTimer !== undefined) return;
+    if (register.base === undefined && activationInitialSpawnUsed && activationRecoveryRemaining === 0 && activationSpawnFlight === undefined) return;
     if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.BILI_DSH_RECOVERY_INTERVAL_MS === undefined) return;
     recoveryTimer = setInterval(() => {
         // #4755: a given-up register is base-less while toolsReady stays true
@@ -1062,7 +1075,7 @@ function armRecoveryTimer(): void {
         // toolsReady alone disarmed the driver in exactly that state, leaving
         // a given-up lane with no self-heal until an /acp command or a host
         // restart. Healthy means tools ready AND a live base.
-        if (register.dead || (register.toolsReady && register.base !== undefined)) {
+        if (register.dead || (register.toolsReady && register.base !== undefined) || (register.base === undefined && activationInitialSpawnUsed && activationRecoveryRemaining === 0 && activationSpawnFlight === undefined)) {
             if (recoveryTimer !== undefined) clearInterval(recoveryTimer);
             recoveryTimer = undefined;
             return;
@@ -1096,7 +1109,7 @@ function maybeRetry(ctx: PluginContext): void {
             // respawn armed stays dead forever; arm the fallback here so the
             // retry chain below has something to drive.
             if (_spawnForTest === undefined && process.env.NODE_TEST_CONTEXT !== undefined) return;
-            respawn = singleFlight(_spawnForTest ?? bootstrap);
+            respawn = startActivationProxy;
             state.respawn = respawn;
         }
         register.retryAt = Date.now() + retryIntervalMs();
@@ -1762,15 +1775,67 @@ export function apply(ctx: PluginContext): void {
     // write this world's register/state). Off-mode arms nothing and bumps
     // nothing: invalidating recoveries on a kill-switch could strand the lane.
     originGen += 1;
+    activationSpawnFlight = undefined;
+    activationInitialSpawnUsed = false;
+    activationRecoveryBudget = new DshRecoveryBudget(() => recoveryNow());
+    activationRecoveryRemaining = 3;
 
-    // #3354/#3662: declare that THIS process owns compression so the always-on
-    // gate entry's load-time overlay (#3354) actually disables the web-profile
-    // preset instances no patch layer can address by id (#1772/#2360). The
-    // declaration — not the registration — is what's gated on plan.mode: a
-    // kill-switched or disabled bili-native never declares, and the gate then
-    // leaves every row stock while its service still lets the presets boot
-    // (disabling the plugin must not brick session creation, #3662).
-    declareDshCompactionActive();
+    // Native compaction stays host-owned; bili never disables preset generations.
+    declareDshCompactionInactive();
+    // Ownership starts native; a reachable manifest alone cannot prove storage.
+    // Revalidate on dispatch rather than trusting the lifetime toolsReady latch.
+    let readinessFlight: Promise<boolean> | undefined;
+    let readinessEpoch = 0;
+    let readinessAt = 0;
+    let readinessOrigin: string | undefined;
+    let takeoverReady = false;
+    let readinessDisposed = false;
+    state.nativeBypass = async (force = false, proxyOrigin?: string) => {
+        if (readinessDisposed) return true;
+        if (attrHealth.state === "threw") {
+            // A prior disposed scope is not a permanent verdict on a new Agent.
+            // Keep this synchronous and cheap; never settle-retry on hand-back.
+            if (attributionOf(ctx).state !== "ok") return true;
+            noteAttrRecovery();
+        }
+        const base = register.base;
+        if (proxyOrigin !== undefined && proxyOrigin !== base) return true;
+        if (base === undefined || !register.toolsReady) { takeoverReady = false; return true; }
+        if (!force && base === readinessOrigin && Date.now() - readinessAt < 1000) return !takeoverReady;
+        if (force || readinessFlight === undefined) {
+            const gen = originGen;
+            const epoch = ++readinessEpoch;
+            const flight = fetchDshTakeoverReady(base).catch(() => false).then((ready) => {
+                if (readinessDisposed || gen !== originGen || epoch !== readinessEpoch || register.base !== base) return false;
+                takeoverReady = ready;
+                readinessOrigin = base;
+                readinessAt = Date.now();
+                // Recovery is background-only: model/compaction calls return to
+                // native immediately rather than waiting on a shutdown/spawn.
+                if (!ready && !readinessDisposed && activationRecoveryRemaining > 0 && storageRecoveryFlight === undefined && process.env.NODE_TEST_CONTEXT === undefined) {
+                    // An explicit attach may belong to somebody else: re-probe it
+                    // but never replace it. Discovery-owned DSH instances use the
+                    // guarded launcher path, not version-only attach validation.
+                    const pinned = nativeAttachOrigin(process.env);
+                    const recoverStorage = pinned !== undefined
+                        ? async () => { await fetchDshTakeoverReady(pinned); }
+                        : startActivationProxy;
+                    storageRecoveryFlight = recoverStorage().catch(() => undefined).finally(() => { storageRecoveryFlight = undefined; });
+                }
+                return ready;
+            }).finally(() => { if (readinessFlight === flight) readinessFlight = undefined; });
+            readinessFlight = flight;
+        }
+        return !(await readinessFlight);
+    };
+    let storageRecoveryFlight: Promise<unknown> | undefined;
+    // DSH retains native compaction in every health state. Its summary calls
+    // must not be diverted into bili's refusal/authored-checkpoint machinery.
+    state.nativeCompactionPassthrough = true;
+    ctx.effect?.(() => () => {
+        readinessDisposed = true;
+        if (activeCtx === ctx) originGen += 1;
+    }, "bili: storage readiness lifetime");
 
     // #2082: a fresh activation invalidates the "host tearing down" verdict.
     // Without this reset, ONE registerTools rejection carrying "inactive
@@ -1968,10 +2033,11 @@ export function apply(ctx: PluginContext): void {
             // against a DIFFERENT origin than the one we attached to, rebind the
             // tools there (the context lives where the models go). Fire-and-forget
             // with a liveness check: only converge on a target we can actually reach.
+            const routedEvidenceGen = originGen;
             state.onRoutedOriginObserved = (origin) => {
-                if (register.base === origin) return;
+                if (routedEvidenceGen !== originGen || register.base === origin) return;
                 void fetchProxyVersion(origin).catch(() => undefined).then((version) => {
-                    if (version === undefined || register.base === origin) return;
+                    if (routedEvidenceGen !== originGen || version === undefined || register.base === origin) return;
                     register.base = origin;
                     state.origin = origin;
                     const line = `bili-native-dsh: model channel pinned to ${origin} — rebinding bili tools there`;
@@ -1984,7 +2050,7 @@ export function apply(ctx: PluginContext): void {
         }
     } else if (process.env.NODE_TEST_CONTEXT === undefined) {
         markNativeHost(process.env, "dsh");
-        const start = singleFlight(bootstrap);
+        const start = startActivationProxy;
         state.respawn = start;
         state.onGiveUp = fireGiveUp;
         state.ready = trackChain(start());
@@ -2620,18 +2686,8 @@ export function apply(ctx: PluginContext): void {
         }
     }
 
-    // #1772/#3354: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
-    // compaction-basic instance sits inside an agent preset (preset-standard's
-    // config.plugins) where no patch layer can address the NESTED row by id
-    // (#1772/#2360). Since #3354 bili disables those preset rows at LOAD TIME
-    // (the always-on bili-compaction-gate entry, active while this module's
-    // verdict holds — #3662; vendored from
-    // deshark42/dsh-compaction-basic-disable, MIT), so native auto-compaction
-    // is off in these profiles too. The durable note confirms the stance and
-    // keeps the #2474 full-snapshot recipe as the fallback for dsh builds
-    // whose internal 'internal/config' hook moved. Surface it once through the
-    // durable channel (GUI hosts swallow stderr); ACP compression is
-    // unaffected.
+    // Durable diagnostics describe coexistence, not the retired disable overlay.
+    // Native auto/manual compaction remains host-owned in every profile.
     if (!webProfileWarned) {
         let bundles: readonly string[] | undefined;
         try {
@@ -2647,13 +2703,7 @@ export function apply(ctx: PluginContext): void {
         }
         if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
             webProfileWarned = true;
-            // #3806: overlay failed to latch -> escalate the passive note into a boot-time alarm.
-            const gap = detectCompactionOverlayGap(ctx);
-            if (gap !== null) {
-                persistClientEvent(`profile bundles include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
-            } else {
-                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
-            }
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — DSH native compaction remains enabled and its summary requests go DIRECT. bili is an optional enhancement: unavailable or degraded storage hands model traffic back to the host; no preset override is required.");
         } else if (bundles !== undefined && !nonWebTraceLogged) {
             // #3651: the web-profile note above is the ONLY confirmation that
             // the #3354 overlay took effect, and it is scoped to dsh-web-app
@@ -2662,7 +2712,7 @@ export function apply(ctx: PluginContext): void {
             // trace so a field log can tell "overlay registered" from "profile
             // shape unconfirmed".
             nonWebTraceLogged = true;
-            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — DSH native compaction remains enabled; bili does not disable host presets or manual compaction commands.");
         }
     }
 
@@ -2688,6 +2738,10 @@ export function apply(ctx: PluginContext): void {
  *  drive apply() repeatedly with a fresh mock ctx. (#4215: optional
  *  toolsReady so gate scenarios can arm the registration state directly.) */
 export function _resetRegisterForTest(base: string | undefined, toolsReady = false): void {
+    activationSpawnFlight = undefined;
+    activationInitialSpawnUsed = false;
+    activationRecoveryBudget = new DshRecoveryBudget(() => recoveryNow());
+    activationRecoveryRemaining = 3;
     // #3616: invalidate every in-flight recovery chain from earlier scenarios —
     // their late landings must not write this scenario's register/state.
     originGen += 1;
@@ -2764,6 +2818,9 @@ export function _stateTakeoverGateForTest(): ((url: string, body?: { bytes: numb
 /** Test hook (#3370): expose the beforeSend/onResponse hooks so suites can
  * drive the incremental conversion + ack seams directly (the fetch patch is
  * not installed under NODE_TEST_CONTEXT). */
+export function _setRecoveryNowForTest(now?: () => number): void { recoveryNow = now ?? Date.now; }
+export function _stateNativeBypassForTest(): NativeInterceptState["nativeBypass"] { return state.nativeBypass; }
+
 export function _stateBeforeSendForTest(): ((url: string, init: RequestInit | undefined) => Promise<void>) | undefined {
     return state.beforeSend;
 }

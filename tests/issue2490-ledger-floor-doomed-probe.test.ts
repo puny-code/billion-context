@@ -234,7 +234,7 @@ test("unit #2490: the floor only ever TIGHTENS — small floors, absent requests
     assert.equal(legacy.max_tokens, 8_000);
 });
 
-test("e2e #2490 a: the guard records the refused replay SIZE on the session (high-water, counted)", async () => {
+test("e2e #2490 a: native replay relays without recording a refusal or ledger high-water", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-2490-"));
     const cfgFile = path.join(root, "billion-context.json");
     writeFileSync(cfgFile, '{"providers":{}}\n', "utf8");
@@ -251,23 +251,24 @@ test("e2e #2490 a: the guard records the refused replay SIZE on the session (hig
                 { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} ${"x".repeat(prefixChars)}` },
             ],
         });
-        // 400KB replay, then a 100KB retry — the high-water mark must keep 400KB.
+        // Native replay is not a refused-ledger planning sample.
         const big = envelope(400_000);
         const small = envelope(100_000);
-        const postRaw = (body: string) => fetch(ctx.url, { method: "POST", headers: { ...ctx.headers }, body });
+        const postRaw = (body: string) => fetch(ctx.url, { method: "POST", headers: { ...ctx.headers, "x-bili-plugin": "dsh" }, body });
         let r = await postRaw(big);
-        assert.equal(r.status, 422, "guard refuses (default)");
+        assert.equal(r.status, 200, "native replay relays");
         await r.text();
         r = await postRaw(small);
-        assert.equal(r.status, 422, "guard refuses the retry too");
+        assert.equal(r.status, 200, "native retry relays too");
         await r.text();
 
         const s = getSession("s-2490-a");
         assert.ok(s, "session exists");
-        assert.equal(s.metadata.dshCompactionRefused, true, "flag (from #1835) still set");
-        assert.equal(s.metadata.dshCompactionRefusedBytes, Buffer.byteLength(big), "recorded the FIRST (larger) replay's exact body bytes");
-        assert.equal(s.metadata.dshCompactionRefusals, 2, "every refusal counted");
-        assert.equal(calls.length, 0, "nothing reaches the upstream");
+        assert.equal(s.metadata.dshCompactionRefused, undefined);
+        assert.equal(s.metadata.dshCompactionRefusedBytes, undefined, "native traffic must not create a planning floor");
+        assert.equal(s.metadata.dshCompactionRefusals, undefined);
+        assert.equal(calls.length, 2, "both envelopes reach upstream without preflight");
+        assert.ok(calls.every((c) => !c.summary));
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prevConfig;

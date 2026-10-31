@@ -2,15 +2,9 @@
 # Mounted automatically when the profile's package.json lists billion-context
 # in dsh.profile.bundles (`dsh plugin --profile <name> add billion-context`);
 # the loader resolves `name` from the profile's node_modules.
-# #1772/#2474/#3354: the `auto: false` below targets the HOST-PLANE
-# compaction-basic row. In profiles bundling @deepseek-ai/dsh-web-app that row
-# is disabled and the running instance lives inside the agent presets, whose
-# nested rows no patch layer can address by id — the preset gate rows below
-# make each Web preset wait for the load-time overlay the bili-compaction-gate
-# entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT,
-# #3354; see src/agent/dsh-compaction-disable.ts). A profile-level full-snapshot
-# override of preset-standard (#2474) remains the fallback for dsh builds
-# whose internal 'internal/config' hook moved.
+# Native Basic and manual compaction stay unchanged on host and preset planes.
+# Bili is an optional enhancement, never an exclusive compaction owner.
+# The compatibility gate only satisfies existing preset inject dependencies.
 # #3662: the gate lives in its OWN always-on entry, not in bili-native —
 # disabling or kill-switching bili-native must leave the gate service alive so
 # the presets fall back to STOCK dsh compaction instead of pending forever
@@ -23,9 +17,6 @@
       name: billion-context
     - id: bili-compaction-gate
       name: billion-context/dsh-compaction-gate
-- id: compaction-basic
-  config:
-    auto: false
 # #3354: keep in sync with writeDshAcpPatch in src/launcher.ts — entry inject
 # lists are REPLACED by patches, not concatenated; if a future dsh ships its
 # own inject list on these entries, merge manually in BOTH layers.

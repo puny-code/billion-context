@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateNativeBypassForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -1148,7 +1148,7 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
     const clientLines = (phrase: string): string[] => fs.existsSync(logFile)
         ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes(phrase))
         : [];
-    const warnLines = (): string[] => clientLines("stays OFF in this profile");
+    const warnLines = (): string[] => clientLines("native compaction remains enabled and");
     const nonWebTraceLines = (): string[] => clientLines("do not include @deepseek-ai/dsh-web-app");
     const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
     // #1791: hermetic fallback seam — a deferred probe must never reach a real
@@ -1162,15 +1162,13 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             ctx.setProfileContext({ startedBundles: webBundles });
             apply(ctx);
             assert.equal(warnLines().length, 1);
-            assert.match(warnLines()[0], /#1772/);
+            assert.match(warnLines()[0], /summary requests go DIRECT/);
             // #3354: the note now states bili disables the preset rows at load
             // time (vendored overlay, attribution preserved) and keeps the
             // #2474 full-snapshot recipe as the documented fallback — pin both
             // pointers so either regression is caught.
-            assert.match(warnLines()[0], /#3354/);
-            assert.match(warnLines()[0], /deshark42\/dsh-compaction-basic-disable/);
-            assert.match(warnLines()[0], /#2474/);
-            assert.match(warnLines()[0], /cordis\.patch\.yml/);
+            assert.match(warnLines()[0], /no preset override is required/);
+            assert.doesNotMatch(warnLines()[0], /stays OFF|Apply the #2474/);
             // #1791: settle each apply's attach chain while the mock is still
             // open — a deferred probe settling against a closed mock runs the
             // spawn fallback mid-way through a LATER test and clobbers the
@@ -1196,8 +1194,8 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(plain);
             assert.equal(warnLines().length, 0);
             assert.equal(nonWebTraceLines().length, 1);
-            assert.match(nonWebTraceLines()[0], /#3354/);
-            assert.match(nonWebTraceLines()[0], /#2474/);
+            assert.match(nonWebTraceLines()[0], /native compaction remains enabled/);
+            assert.doesNotMatch(nonWebTraceLines()[0], /#2474|refuses such native compaction/);
             await _stateToolsReadyForTest();
 
             // once-per-process: a later non-web apply adds no further trace
@@ -1261,10 +1259,9 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
             const lines = clientLines();
             assert.equal(lines.length, 1);
             assert.match(lines[0], /@deepseek-ai\/dsh-web-app/);
-            assert.match(lines[0], /could not latch/i);
-            assert.match(lines[0], /no-config-hook/);
-            assert.match(lines[0], /#2474/);
-            assert.match(lines[0], /ARMED/i);
+            assert.match(lines[0], /native compaction remains enabled/);
+            assert.match(lines[0], /summary requests go DIRECT/);
+            assert.doesNotMatch(lines[0], /could not latch|#2474|ARMED/i);
             assert.doesNotMatch(lines[0], /deshark42\/dsh-compaction-basic-disable/);
             await _stateToolsReadyForTest();
         });
@@ -1275,6 +1272,33 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
         rmrf(stateHome);
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
+    }
+});
+
+test("native hand-back re-probes attribution after a transient disposed scope", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-attr-recover-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            _setThrewRetryForTest({ attempts: 1 });
+            const ctx = mockCtx();
+            const lookup = ctx.agents.currentInitiator;
+            ctx.agents.currentInitiator = () => { throw new Error("temporarily disposed"); };
+            apply(ctx);
+            await _stateToolsReadyForTest();
+            await _stateTakeoverGateForTest()!("https://api.anthropic.com/v1/messages");
+            assert.equal(_attributionHealthForTest().state, "threw");
+            assert.equal(await _stateNativeBypassForTest()!(), true);
+            ctx.agents.currentInitiator = lookup;
+            ctx.setInitiator({ session: { id: "recovered-agent" } });
+            await _stateNativeBypassForTest()!();
+            assert.equal(_attributionHealthForTest().state, "ok", "native posture must not permanently suppress fresh attribution probes");
+        });
+    } finally {
+        proxy.close(); rmrf(home); _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest(); _setThrewRetryForTest();
     }
 });
 
@@ -1291,7 +1315,8 @@ test("#3354/#3662 apply(): declares lane ownership instead of registering the ov
             // bili-compaction-gate entry; bili-native only declares the verdict
             // that transform honors (tests/issue3662-dsh-gate-fallback.test.ts
             // pins the transform + service side).
-            assert.ok(isDshCompactionActive(), "active plan must declare the lane owned");
+            assert.equal(isDshCompactionActive(), false, "activation must never disable retained native compaction generations");
+            assert.equal((globalThis as Record<string, unknown>).__BILI_DSH_COMPACTION_READY_FOR_AGENT__, undefined, "plugin never claims native compaction ownership");
             assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
             assert.equal(ctx.providedServices.length, 0);
             await _stateToolsReadyForTest();
@@ -2545,6 +2570,7 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
         const server = srv;
         if (server) await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
         await new Promise<void>((resolve, reject) => upstream.close((e) => (e ? reject(e) : resolve())));
+        await (await import("../src/persist.ts")).getStore().flushAll();
         rmrf(base);
         rmrf(stateHome);
         rmrf(home);
@@ -3232,8 +3258,11 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
                 upTimer = setTimeout(() => server.listen(port, "127.0.0.1", () => resolve()), 100);
             });
             const recovered = await recoveredPromise;
-            clearTimeout(upTimer);
+            // Recovery may resolve from a still-valid origin verdict before the
+            // simulated external restart fires. Do not cancel the only producer
+            // of `up` and then await that permanently pending promise.
             await up;
+            clearTimeout(upTimer);
             assert.equal(recovered, origin, "recovery lands back on the pinned origin");
             assert.equal(spawnCalls, 0);
             assert.equal(process.env.BILLION_CONTEXT_PROXY, origin);

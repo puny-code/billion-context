@@ -300,6 +300,16 @@ test("#3544 POST /__bili/shutdown (loopback) triggers the graceful-shutdown hook
     assert.ok(reasons[0].includes("#3544"), `reason carries provenance (${reasons[0]})`);
 });
 
+test("guarded shutdown rejects a successor identity and accepts only matching id/pid", async () => {
+    for (const [id, pid, expected] of [["successor", String(process.pid), 409], ["test-instance", "1", 409], ["test-instance", String(process.pid), 202]] as const) {
+        const reasons: string[] = [];
+        const { res, out } = mkRes();
+        await handleAdminRoute(mkReq("127.0.0.1", { "x-bili-expected-instance-id": id, "x-bili-expected-pid": pid }), res, makeCtx((r) => reasons.push(r)));
+        assert.equal(out.code, expected);
+        assert.equal(reasons.length, expected === 202 ? 1 : 0);
+    }
+});
+
 test("#3544 POST /__bili/shutdown refuses non-loopback peers", async () => {
     const reasons: string[] = [];
     const { res, out } = mkRes();

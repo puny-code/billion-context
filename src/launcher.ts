@@ -55,6 +55,7 @@ import {
     type ProxyStartingMarker,
 } from "./instance.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
+import { stateDir } from "./paths.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
@@ -239,6 +240,7 @@ interface LaunchOptions {
      *  wildcard. Without this, pi and codex with identical config shape
      *  silently shared one proxy and cross-wrote each other's state. */
     lane?: string;
+    recoverDegradedDsh?: boolean;
 }
 
 interface ProxyHandle {
@@ -303,7 +305,8 @@ export interface LauncherDeps {
     attachDiag?: (msg: string) => void;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
      *  Default hits the real endpoint; tests stub it. */
-    requestInstanceShutdown?: (origin: string) => Promise<boolean>;
+    requestInstanceShutdown?: (origin: string, expected?: { instanceId: string; pid: number; ownerPid?: number }) => Promise<boolean>;
+    isRecoveryPidAlive?: (pid: number) => boolean;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -3520,7 +3523,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n# Native compaction remains host-owned.\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
@@ -3927,6 +3930,8 @@ async function defaultFetchDetail(url: string): Promise<ProbeOutcome> {
 
 interface HealthInfo {
     ok: boolean;
+    storage?: { effective?: string; degraded: boolean };
+    guardedShutdown?: boolean;
     instanceId?: string;
     /** Responder's bundle version from /__bili/health (#3544): the rotation
      *  gate compares it against OUR version — absent on pre-#3544 builds, in
@@ -3956,8 +3961,9 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown; guardedShutdown?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        info.guardedShutdown = data.guardedShutdown === true;
         if (typeof data.version === "string") info.version = data.version;
         if (typeof data.pid === "number") info.pid = data.pid;
         if (typeof data.auxProxy === "string" && data.auxProxy.length > 0) info.auxProxy = data.auxProxy;
@@ -4656,11 +4662,11 @@ const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
 const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
 
-export async function requestInstanceShutdown(origin: string): Promise<boolean> {
+export async function requestInstanceShutdown(origin: string, expected?: { instanceId: string; pid: number; ownerPid?: number }): Promise<boolean> {
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", ...(expected ? { "x-bili-expected-instance-id": expected.instanceId, "x-bili-expected-pid": String(expected.pid), ...(expected.ownerPid !== undefined ? { "x-bili-expected-owner-pid": String(expected.ownerPid) } : {}) } : {}) },
             body: "{}",
             signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
         });
@@ -4773,7 +4779,182 @@ export function startOwnerHeartbeat(
     return () => { stopped = true; };
 }
 
-export async function ensureProxyRunning(
+interface DshPendingChild { pid: number; launchToken: string }
+
+function dshPendingPath(): string {
+    return path.join(stateDir(), "proxy-dsh-pending");
+}
+
+function readDshPendingChild(): DshPendingChild | undefined {
+    let raw: string;
+    try { raw = fs.readFileSync(dshPendingPath(), "utf8"); }
+    catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+    }
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object" || !("pid" in value) || !("launchToken" in value)
+        || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0
+        || typeof value.launchToken !== "string" || value.launchToken.length === 0) {
+        throw new Error("bili: DSH pending child record is invalid; refusing uncoordinated startup");
+    }
+    return { pid: value.pid, launchToken: value.launchToken };
+}
+
+function clearDshPendingChild(expected: DshPendingChild): void {
+    const current = readDshPendingChild();
+    if (current?.pid !== expected.pid || current.launchToken !== expected.launchToken) {
+        throw new Error("bili: DSH pending child identity changed; refusing to clear it");
+    }
+    fs.unlinkSync(dshPendingPath());
+}
+
+function persistDshPendingChild(child: SpawnChild, launchToken: string): void {
+    if (!Number.isSafeInteger(child.pid) || child.pid <= 0) throw new Error("bili: DSH child has no valid PID; refusing untracked startup");
+    const fd = fs.openSync(dshPendingPath(), "wx");
+    try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: child.pid, launchToken }));
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+const dshRecoveryFlights = new Map<string, Promise<ProxyHandle>>();
+const DSH_RECOVERY_WAIT_MS = 10_000;
+
+async function fetchDshRecoveryHealth(origin: string): Promise<HealthInfo | undefined> {
+    const before = await fetchHealthInfoDefault(origin);
+    if (!before?.ok || !before.instanceId || !before.pid) return undefined;
+    try {
+        const res = await fetch(`${origin}/__bili/status`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+        if (!res.ok) return undefined;
+        const data = await res.json() as { storage?: { effective?: unknown; degraded?: unknown } };
+        const after = await fetchHealthInfoDefault(origin);
+        if (!after?.ok || after.instanceId !== before.instanceId || after.pid !== before.pid) return undefined;
+        if (typeof data.storage?.degraded !== "boolean") return undefined;
+        return { ...after, storage: { effective: typeof data.storage.effective === "string" ? data.storage.effective : undefined, degraded: data.storage.degraded } };
+    } catch {
+        return undefined;
+    }
+}
+
+function dshReady(info: HealthInfo | undefined): boolean {
+    return info?.ok === true && Boolean(info.instanceId) && typeof info.pid === "number" && info.pid > 0 && info.storage?.effective === "full" && info.storage.degraded === false;
+}
+
+export async function ensureProxyRunning(opts: LaunchOptions, deps: LauncherDeps = {}): Promise<ProxyHandle> {
+    if (!opts.recoverDegradedDsh || opts.lane !== "dsh") return ensureProxyRunningCore(opts, deps);
+    const lockPath = path.join(stateDir(), "proxy-dsh-recovery");
+    const active = dshRecoveryFlights.get(lockPath);
+    if (active) return active;
+    const work = recoverDshProxy(opts, deps, lockPath);
+    dshRecoveryFlights.set(lockPath, work);
+    try {
+        return await work;
+    } finally {
+        if (dshRecoveryFlights.get(lockPath) === work) dshRecoveryFlights.delete(lockPath);
+    }
+}
+
+async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath: string): Promise<ProxyHandle> {
+    const now = deps.now ?? Date.now;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const alive = deps.isRecoveryPidAlive ?? isPidAlive;
+    const health = deps.fetchHealthInfo ?? fetchDshRecoveryHealth;
+    const registry = deps.listRegistryInstances ?? discoverLiveInstances;
+    const read = deps.readInstanceFile ?? readProxyInstanceFile;
+    const owner = randomUUID();
+    const deadline = now() + DSH_RECOVERY_WAIT_MS;
+    let fd: number;
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    for (;;) {
+        try {
+            fd = fs.openSync(lockPath, "wx");
+            break;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "EEXIST" || now() >= deadline) throw new Error("bili: DSH recovery lock unavailable; refusing uncoordinated startup", { cause: err });
+            await sleep(HEALTH_POLL_INTERVAL_MS);
+        }
+    }
+    try {
+        fs.writeFileSync(fd, owner);
+        const records = registry();
+        const pending = readDshPendingChild();
+        if (pending) {
+            if (!alive(pending.pid)) {
+                clearDshPendingChild(pending);
+            } else {
+                const registered = records.find((inst) => inst.lane === "dsh" && inst.pid === pending.pid && inst.launchToken === pending.launchToken);
+                const info = registered ? await health(registered.origin) : undefined;
+                if (!registered || !dshReady(info) || info?.pid !== registered.pid || info.instanceId !== registered.instanceId) {
+                    throw new Error("bili: DSH pending child PID is alive without proven full-storage identity; refusing another spawn or kill");
+                }
+                clearDshPendingChild(pending);
+            }
+        }
+        const pointer = read();
+        const candidates = new Map(records.map((inst) => [inst.instanceId, inst]));
+        if (isProxyInstanceFile(pointer)) candidates.set(pointer.instanceId, pointer);
+        const retired = new Set<string>();
+        for (const inst of candidates.values()) {
+            if (!alive(inst.pid) || (inst.lane !== "dsh" && inst.port !== opts.port)) continue;
+            const info = await health(inst.origin);
+            const identity = info?.ok === true && info.instanceId === inst.instanceId && info.pid === inst.pid;
+            if (inst.lane !== "dsh" || !identity) throw new Error("bili: DSH resident identity/readiness unknown; refusing replacement");
+            if (dshReady(info)) {
+                if (info?.watchdog?.armed !== true || instanceCompatible(inst, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), []) !== undefined) throw new Error("bili: DSH resident is ready but incompatible; refusing a second writer");
+                continue;
+            }
+            const registered = records.some((r) => r.instanceId === inst.instanceId && r.pid === inst.pid && r.origin === inst.origin && r.lane === "dsh" && r.launchToken === inst.launchToken);
+            const ownerPid = opts.parentPid ?? process.pid;
+            if (!registered || !inst.launchToken || info?.guardedShutdown !== true || info?.storage?.degraded !== true || info.watchdog?.armed !== true || !info.watchdog.watchers || info.watchdog.watchers.some((pid) => pid !== ownerPid && alive(pid))) {
+                throw new Error("bili: DSH resident is not exclusively managed and known degraded; refusing replacement");
+            }
+            if (!(await (deps.requestInstanceShutdown ?? requestInstanceShutdown)(inst.origin, { instanceId: inst.instanceId, pid: inst.pid, ownerPid }))) throw new Error("bili: DSH resident refused shutdown");
+            const exitDeadline = now() + DSH_RECOVERY_WAIT_MS;
+            while (alive(inst.pid) && now() < exitDeadline) await sleep(HEALTH_POLL_INTERVAL_MS);
+            if (alive(inst.pid)) throw new Error("bili: DSH resident OS process still alive; refusing a second writer");
+            retired.add(inst.instanceId);
+        }
+        const readyHealth = async (origin: string): Promise<HealthInfo> => {
+            const info = await health(origin);
+            if (!dshReady(info)) throw new Error("bili: DSH proxy is not full-storage ready");
+            return info!;
+        };
+        const handle = await ensureProxyRunningCore(opts, {
+            ...deps,
+            readInstanceFile: () => {
+                const inst = read();
+                if (isProxyInstanceFile(inst) && !retired.has(inst.instanceId)) return inst;
+                return registry().find((entry) => entry.lane === "dsh" && !retired.has(entry.instanceId) && alive(entry.pid));
+            },
+            fetchHealthInfo: async (origin) => {
+                if ([...candidates.values()].some((inst) => retired.has(inst.instanceId) && inst.origin === origin) && !registry().some((inst) => !retired.has(inst.instanceId) && inst.origin === origin)) return undefined;
+                const info = await health(origin);
+                if (info === undefined) return undefined;
+                if (!dshReady(info)) throw new Error("bili: DSH proxy is not full-storage ready");
+                return info;
+            },
+        });
+        const finalHealth = await readyHealth(handle.origin);
+        const expectedResident = registry().find((entry) => entry.origin === handle.origin && entry.lane === "dsh");
+        if (handle.child?.pid !== undefined ? finalHealth.pid !== handle.child.pid : expectedResident === undefined || finalHealth.pid !== expectedResident.pid || finalHealth.instanceId !== expectedResident.instanceId) {
+            throw new Error("bili: DSH final responder identity changed before takeover");
+        }
+        const completed = readDshPendingChild();
+        if (completed && expectedResident?.pid === completed.pid && expectedResident.launchToken === completed.launchToken
+            && finalHealth.pid === expectedResident.pid && finalHealth.instanceId === expectedResident.instanceId) {
+            clearDshPendingChild(completed);
+        }
+        return handle;
+    } finally {
+        fs.closeSync(fd);
+        if (fs.readFileSync(lockPath, "utf8") === owner) fs.unlinkSync(lockPath);
+    }
+}
+
+async function ensureProxyRunningCore(
     opts: LaunchOptions,
     deps: LauncherDeps = {},
 ): Promise<ProxyHandle> {
@@ -4810,7 +4991,13 @@ export async function ensureProxyRunning(
     // (#7/#1183). Awaited before returning: a spawner that dies right after a
     // second session attaches must not beat the registration to the grace
     // window.
+    const recoveryReady = async (origin: string, pid: number, instanceId?: string): Promise<boolean> => {
+        if (!opts.recoverDegradedDsh || opts.lane !== "dsh") return true;
+        const info = await fetchHealthInfo(origin);
+        return dshReady(info) && info?.pid === pid && (instanceId === undefined || info.instanceId === instanceId);
+    };
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
+        if (!(await recoveryReady(inst.origin, inst.pid, inst.instanceId))) throw new Error("bili: DSH attach is not full-storage ready");
         // #3404: host-safe channel (#3200) — a raw console.* here lands on the
         // physical screen bypassing an in-host TUI renderer (host-log.ts),
         // e.g. into Pi's input draft after herdr session restore.
@@ -5017,6 +5204,11 @@ export async function ensureProxyRunning(
                     },
                 },
             );
+            // A startup timeout can leave this detached child alive before it
+            // publishes any registry entry. Keep that owned identity beyond the
+            // transient starting marker/lock; the next recovery must not spawn
+            // a second writer merely because the first handshake is ambiguous.
+            if (opts.recoverDegradedDsh && opts.lane === "dsh") persistDshPendingChild(child, launchToken);
         } finally {
             try {
                 fs.closeSync(logFd);
@@ -5162,7 +5354,7 @@ export async function ensureProxyRunning(
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
-                if (await probeHealth(inst.origin, fetchImpl)) {
+                if (await probeHealth(inst.origin, fetchImpl) && await recoveryReady(inst.origin, child.pid, inst.instanceId)) {
                     // #1660: settle the lane's sticky record on the port the
                     // child actually bound (preferred or laddered) so every
                     // later launch of this lane tries it first.
@@ -5182,7 +5374,7 @@ export async function ensureProxyRunning(
             // the preferred-port fallback below, minus the port assumption.
             if (child.pid !== undefined) {
                 const mine = listRegistry().find((e) => e.pid === child.pid);
-                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
+                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl)) && await recoveryReady(mine.origin, child.pid, mine.instanceId)) {
                     settleZonePort(mine.port);
                     startOwnerHeartbeat(mine.origin, watchPid);
                     return { origin: mine.origin, port: mine.port, child, logPath };
@@ -5204,7 +5396,7 @@ export async function ensureProxyRunning(
             if (stale) {
                 const preferredOrigin = proxyOrigin(opts.host, port);
                 const info = await fetchHealthInfo(preferredOrigin);
-                if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
+                if (info?.ok && child.pid !== undefined && info.pid === child.pid && (!(opts.recoverDegradedDsh && opts.lane === "dsh") || dshReady(info))) {
                     settleZonePort(port);
                     startOwnerHeartbeat(preferredOrigin, watchPid);
                     return { origin: preferredOrigin, port, child, logPath };
@@ -5297,6 +5489,7 @@ export async function ensureProxyRunning(
         // after the kill turns "bound but hung" into a misleading
         // ECONNREFUSED.
         const diagnosis = await diagnosePort(true);
+        if (opts.recoverDegradedDsh && opts.lane === "dsh") throw new Error(`bili: DSH child readiness unknown after ${SPAWN_BUDGET_MS}ms; refusing blind force-kill — ${diagnosis}`);
         killAbandonedChild(child);
         console.error(
             `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (log: ${logPath}${logTail()})`,

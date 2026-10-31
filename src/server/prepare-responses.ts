@@ -18,7 +18,7 @@ import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
-import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
+import { carriesDshLocalCompactionSummary } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
@@ -215,38 +215,9 @@ export async function prepareResponses(
         }
         const { msgs } = projection;
         originalMessages = msgs;
-        // #3756 snapshot render: outbound prefix from the unified transcript
-        // (fold-time ids, immune to identity re-mints); live tail keeps the
-        // client's bytes. No-op when the lane is inactive/degraded; the
-        // reconcile call below still observes the CLIENT view.
-        // #4804 WS delta continuation: the session layer short-circuited a
-        // previous_response_id delta onto an augmented body ([...prevOutput,
-        // ...newInput]) and stamped this request with the identitySig of its
-        // last converted message. The prefix renders from the unified
-        // transcript, the whole converted body rides verbatim as tail — no
-        // chain walk. A verification miss throws the typed fallback error;
-        // the session layer turns it into the 400 the client answers with a
-        // full replay (lossless recovery).
-        const wsAnchored = !pluginMode ? wsAnchoredPayload(req) : undefined;
-        let renderMsgs: BiliMessage[];
-        if (wsAnchored) {
-            const anchored = buildAnchoredView(session, msgs, wsAnchored.tailSig);
-            if (!anchored.ok) throw new SnapshotAnchorFallbackError(anchored.reason);
-            delete session.metadata["snapshotRenderDegradeReason"];
-            session.metadata["snapshotRenderTailStart"] = anchored.tailStart;
-            noteAnchoredRender(session, log);
-            renderMsgs = anchored.view;
-        } else {
-            renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
-        }
-        // #4241: the render lane replaced the view (reference-inequality is the
-        // discriminator — maybeSnapshotView returns the SAME array when idle),
-        // so the judged baseline is the rendered transcript, not the inbound.
-        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         if (opts.debug) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin));
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
@@ -287,8 +258,7 @@ export async function prepareResponses(
             const dshAuthored = dshLane && carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact);
             if (localGap && (codexHit || dshHit)) {
                 const missing = localGap.expected - localGap.matched;
-                const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
-                if (missing >= minMissing && missing * 2 >= localGap.expected) {
+                if (dshHit || (missing >= CODEX_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= localGap.expected)) {
                     if (dshHit) {
                         // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
                         if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
@@ -303,6 +273,36 @@ export async function prepareResponses(
                 }
             }
         }
+        // Landed checkpoints retire the old prefix before any snapshot captures it.
+        // #3756 snapshot render: outbound prefix from the unified transcript
+        // (fold-time ids, immune to identity re-mints); live tail keeps the
+        // client's bytes. No-op when the lane is inactive/degraded; the
+        // reconcile call below still observes the CLIENT view.
+        // #4804 WS delta continuation: the session layer short-circuited a
+        // previous_response_id delta onto an augmented body ([...prevOutput,
+        // ...newInput]) and stamped this request with the identitySig of its
+        // last converted message. The prefix renders from the unified
+        // transcript, the whole converted body rides verbatim as tail — no
+        // chain walk. A verification miss throws the typed fallback error;
+        // the session layer turns it into the 400 the client answers with a
+        // full replay (lossless recovery).
+        const wsAnchored = !pluginMode ? wsAnchoredPayload(req) : undefined;
+        let renderMsgs: BiliMessage[];
+        if (wsAnchored) {
+            const anchored = buildAnchoredView(session, msgs, wsAnchored.tailSig);
+            if (!anchored.ok) throw new SnapshotAnchorFallbackError(anchored.reason);
+            delete session.metadata["snapshotRenderDegradeReason"];
+            session.metadata["snapshotRenderTailStart"] = anchored.tailStart;
+            noteAnchoredRender(session, log);
+            renderMsgs = anchored.view;
+        } else {
+            renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        }
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin));
         // #3477: snapshot the active fold blocks BEFORE processTurn's syncBlocks
         // deactivates the ones whose covered ids left the shortened history; the
         // post-turn archive below consumes the announced /__bili/plugin/compact

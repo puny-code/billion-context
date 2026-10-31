@@ -13,7 +13,7 @@ import { envMillis } from "./native-bootstrap.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
-import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
+import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
@@ -160,6 +160,11 @@ export interface NativeInterceptState {
      *  of an upstream 400. The optional body size lets the gate make that
      *  call without re-reading the request. */
     takeoverGate?: (url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>;
+    /** Owner explicitly hands model routing back to the host. Unlike gate=false,
+     * this also bypasses bili's compaction/oversize policy. Other lanes opt out. */
+    nativeBypass?: (force?: boolean, proxyOrigin?: string) => boolean | Promise<boolean>;
+    /** Host owns compaction: matching requests bypass bili even when healthy. */
+    nativeCompactionPassthrough?: boolean;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -452,6 +457,23 @@ function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): R
  *  the backstop. A Request-object input is probed through a CLONE — the
  *  original must stay sendable (#2496). init.body wins over a Request
  *  input's own body (spec: init overrides), mirroring fetchMethodOf. */
+async function dshNativeCompactionCall(input: string | URL | Request, init?: RequestInit): Promise<boolean> {
+    if (fetchMethodOf(input, init) !== "POST") return false;
+    try {
+        const body = init?.body;
+        let text: string;
+        if (typeof body === "string") text = body;
+        else if (body instanceof Blob) text = await body.text();
+        else if (body instanceof Uint8Array) text = new TextDecoder().decode(body);
+        else if (body instanceof ArrayBuffer) text = new TextDecoder().decode(body);
+        else if (body === undefined && input instanceof Request) text = await input.clone().text();
+        else return false;
+        if (!text.includes(DSH_COMPACTION_MARKER_SNIFF)) return false;
+        const parsed: unknown = JSON.parse(text);
+        return ["openai", "anthropic", "responses"].some((protocol) => isDshCompactionCall(protocol, parsed));
+    } catch { return false; }
+}
+
 async function dshCompactionMarkerInBody(input: string | URL | Request, init?: RequestInit): Promise<boolean> {
     const marker = DSH_COMPACTION_MARKER_SNIFF;
     const body: unknown = init?.body;
@@ -1106,6 +1128,36 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // direct rather than hit a disposed context.
         const state = g[ACTIVE_STATE] as NativeInterceptState | undefined;
         if (url === undefined || state === undefined) return send(input, init);
+        // DSH's explicit hand-back precedes ALL bili policy (including signing,
+        // attribution and compaction guards). Restore lane-specific bodies first;
+        // forwarding an incremental delta directly is never a valid fallback.
+        const sendNativeIfNeeded = async (force = false): Promise<Response | undefined> => {
+            const target = routedBiliModelUrl(url) ?? url;
+            const proxyOrigin = routedBiliModelUrl(url) !== undefined ? new URL(url).origin : state.origin;
+            if (!isModelApiUrl(target)) return undefined;
+            const hostCompaction = state.nativeCompactionPassthrough === true && await dshNativeCompactionCall(input, init);
+            if (hostCompaction || (state.nativeBypass !== undefined && await state.nativeBypass(force, proxyOrigin))) {
+                const directInput = target === url ? input : typeof input === "string" || input instanceof URL ? target : new Request(target, input);
+                const prep = await state.prepareDirectSend?.(target, directInput, init) ?? { outcome: "as-is" as const };
+                if (prep.outcome === "unrestorable") throw new TypeError("billion-context: cannot restore lane-specific request for native fallback");
+                // Private routing metadata must never leave for the provider on
+                // hand-back. Preserve provider credentials and content headers.
+                const directHeaders = new Headers(init?.headers ?? (directInput instanceof Request ? directInput.headers : undefined));
+                for (const name of [...directHeaders.keys()]) {
+                    if (name.toLowerCase().startsWith("x-bili-")) directHeaders.delete(name);
+                }
+                const directInit = { ...init, headers: directHeaders };
+                state.onDispatch?.(target, "direct");
+                if (prep.outcome === "restored") {
+                    const restored = withRestoredBody(directInput, directInit, prep.body);
+                    return send(restored.input, restored.init);
+                }
+                return send(directInput, directInit);
+            }
+            return undefined;
+        };
+        const nativeResponse = await sendNativeIfNeeded();
+        if (nativeResponse !== undefined) return nativeResponse;
         // #1268: hold the request until the host's ACP tool registration has
         // finished its first attempt, so headersFor can stamp it into plugin
         // mode. Steady state costs nothing (gate already resolved). A timeout
@@ -1241,6 +1293,8 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // carries unattributed riders along (still passthrough-marked).
             if (state.takeoverGate !== undefined) {
                 const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init), init);
+                const nativeAfterGate = await sendNativeIfNeeded();
+                if (nativeAfterGate !== undefined) return nativeAfterGate;
                 if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     // #2924 direction 1 (routed lane): an already-routed body
                     // the gate could not claim and that provably cannot fit
@@ -1270,6 +1324,8 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     logHostEvent("error", "[native-client]", `bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
                 }
             }
+            const nativeAfterPrepare = await sendNativeIfNeeded();
+            if (nativeAfterPrepare !== undefined) return nativeAfterPrepare;
             const routedExtra = state.headersFor?.(routedTarget);
             let target = url;
             const baked = new URL(url);
@@ -1312,8 +1368,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // instead of retrying or degrading to a direct send (PR #2581
                 // review).
                 if (input instanceof Request && input.bodyUsed) throw err;
+                const nativeOnFailure = await sendNativeIfNeeded(true);
+                if (nativeOnFailure !== undefined) return nativeOnFailure;
                 const deadOrigin = new URL(target).origin;
                 const again = await recover(deadOrigin);
+                const nativeAfterRecovery = await sendNativeIfNeeded(true);
+                if (nativeAfterRecovery !== undefined) return nativeAfterRecovery;
                 if (again !== undefined) {
                     // #2496: a recovery that lands back on the SAME origin is a
                     // transient blip, not a loss — the proxy is alive and the
@@ -1415,6 +1475,8 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // attribution, and may answer `"refuse-oversized"` — both await
             // fine; a plain sync boolean (every other host) is unchanged.
             const verdict = await state.takeoverGate(url, bodyByteSizeOf(init), init);
+            const nativeAfterGate = await sendNativeIfNeeded();
+            if (nativeAfterGate !== undefined) return nativeAfterGate;
             if (verdict !== true) {
                 // #2592/#2709 residual leak: an agentless dsh compaction call on a
                 // RAW provider URL (no settings overlay → nothing routed it) rode
@@ -1506,6 +1568,8 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 logHostEvent("error", "[native-client]", `bili-native: beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — request continues (#2399)`);
             }
         }
+        const nativeAfterPrepare = await sendNativeIfNeeded();
+        if (nativeAfterPrepare !== undefined) return nativeAfterPrepare;
         const first = makeTarget(`${origin}/bili/${url}`);
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {
@@ -1527,7 +1591,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // proxy death — send() already exhausted every live anchor; let
             // it propagate instead of churning a healthy proxy.
             if (err instanceof TypeError && !isDeadClosureError(err)) {
+                if (input instanceof Request && input.bodyUsed) throw err;
+                const nativeOnFailure = await sendNativeIfNeeded(true);
+                if (nativeOnFailure !== undefined) return nativeOnFailure;
                 const again = await recover(origin);
+                const nativeAfterRecovery = await sendNativeIfNeeded(true);
+                if (nativeAfterRecovery !== undefined) return nativeAfterRecovery;
                 if (again !== undefined) {
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");

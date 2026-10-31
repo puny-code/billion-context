@@ -471,6 +471,8 @@ test("C: a one-shot bootstrap failure on a fresh context self-heals through the 
             BILI_DSH_RETRY_INTERVAL_MS: "20",
         }, async () => {
             dsh._resetRegisterForTest(undefined);
+            let now = 0;
+            dsh._setRecoveryNowForTest(() => now);
             let attempts = 0;
             // the field case: the FIRST bring-up loses (EADDRINUSE behind a
             // saturated incumbent), later ones win. Two consecutive one-shot
@@ -484,6 +486,12 @@ test("C: a one-shot bootstrap failure on a fresh context self-heals through the 
             try {
                 const ctx = mockCtx();
                 dsh.apply(ctx);
+                await waitFor(() => attempts === 1, "initial bootstrap failure");
+                await dsh._settleNativeForTest();
+                now += 30_000;
+                await waitFor(() => attempts === 2, "first cooldown-spaced recovery failure");
+                await dsh._settleNativeForTest();
+                now += 30_000;
                 await waitFor(
                     () => dsh._registerStateForTest().base === proxy2.origin && ctx.registeredTools.length === 1,
                     "timer-driven re-base onto the replacement plus tool registration",
@@ -499,6 +507,7 @@ test("C: a one-shot bootstrap failure on a fresh context self-heals through the 
                 assert.equal(proxy2.manifestRequests(), settledManifest, "no background re-registration after the heal (#3380: registrations survive)");
             } finally {
                 dsh._setSpawnForTest(undefined);
+                dsh._setRecoveryNowForTest();
             }
         });
     } finally {
