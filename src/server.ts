@@ -578,6 +578,23 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
         }, gcCfg.intervalMs);
         gcTimer.unref?.();
     }
+    // Orphan content collection on index.db (refcount-0 rows nothing references).
+    // Deferred start so boot is not slowed; bounded batches inside the store;
+    // skipped while another live instance holds index.db (the holder collects).
+    if (getStore().enabled && process.env.BILI_STORAGE_ORPHAN_COLLECT === "1") {
+        const orphanTick = (): void => {
+            try {
+                const freed = getStore().unifiedCollectOrphans();
+                if (freed !== null && freed > 0) log("info", `[storage] orphan content collected: ${freed} row(s) freed`);
+            } catch (err) {
+                log("warn", `[storage] orphan collection failed: ${String(err)}`);
+            }
+        };
+        const orphanBoot = setTimeout(orphanTick, ORPHAN_COLLECT_BOOT_DELAY_MS);
+        orphanBoot.unref?.();
+        const orphanTimer = setInterval(orphanTick, ORPHAN_COLLECT_INTERVAL_MS);
+        orphanTimer.unref?.();
+    }
     // #405 (silent env knobs): the tunnel allowlist is security-relevant —
     // surface it at startup so a remote-client deployment shows WHY private
     // destinations pass or fail.
@@ -1945,6 +1962,11 @@ export function resolveKnownOutputCeiling(
 // died. Long enough for a second session's registration to land when the
 // spawner exits immediately after it starts; short enough that an abandoned
 // proxy still disappears promptly.
+/** Orphan content collection cadence on index.db (see the boot-time timer in
+ *  startServer). Not config surface: fixed, bounded, self-skipping while
+ *  another live instance holds the file. */
+const ORPHAN_COLLECT_BOOT_DELAY_MS = 60_000;
+const ORPHAN_COLLECT_INTERVAL_MS = 6 * 60 * 60_000;
 const WATCHER_IDLE_GRACE_MS = 5_000;
 
 // #3544: how long a heartbeat-opted owner may go silent before the watchdog

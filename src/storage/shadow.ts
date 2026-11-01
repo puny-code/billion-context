@@ -706,6 +706,16 @@ export class UnifiedShadow {
         return this.sync.gc(opts);
     }
 
+    /** Orphan content collection only (no archive sweep, no vacuum). Null on a
+     *  network backend or when this process is not the sole writer of index.db
+     *  (another live instance holds the lock) — collection is then deferred to
+     *  the holder, never raced. */
+    collectOrphans(): number | null {
+        if (this.sync === null) return null;
+        if (this.sync.lockHolder() !== null) return null;
+        return this.sync.collectOrphans();
+    }
+
     restoreArchived(sessionId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
         if (this.sync === null) return { ok: false, reason: 'async backend — use restoreArchivedAsync' };
         return this.sync.restoreArchived(sessionId, opts);
