@@ -45,7 +45,7 @@ function legacyLike(id: string): LegacySessionLike {
     };
 }
 
-test("quick_check: a corrupt db fails open with a typed error, and the wrapper quarantines + reopens fresh", async () => {
+test("quick_check: a corrupt db fails open with an integrity error", async () => {
     const dir = freshDir();
     try {
         // 1. Create a valid db.
@@ -129,7 +129,7 @@ test("lockfile: a live foreign pid is reported, a dead pid is taken over, close 
     }
 });
 
-test("shadow open quarantines a corrupt index.db set and reopens fresh", async () => {
+test("shadow open leaves a corrupt index.db in place and degrades", async () => {
     const { UnifiedShadow } = await import("../src/storage/shadow.ts");
     const { readdirSync } = await import("node:fs");
     const dir = freshDir();
@@ -146,25 +146,12 @@ test("shadow open quarantines a corrupt index.db set and reopens fresh", async (
         }
         writeFileSync(path, raw);
 
-        // The shadow's maybeOpen (full mode) must quarantine + reopen fresh.
+        // Fail closed: an index may hold data absent from legacy files.
         const env = { ...process.env, BILI_STORAGE_UNIFIED: "full" };
         const shadow = UnifiedShadow.maybeOpen(dir, env);
-        assert.ok(shadow, "shadow opens after quarantine");
-
-        const names = readdirSync(dir);
-        const quarantined = names.filter((n) => n.includes(".corrupt-"));
-        assert.ok(quarantined.some((n) => n.startsWith("index.db.corrupt-")), "main db quarantined");
-        // sidecars (-wal/-shm) ride the quarantine when the engine's close
-        // left them behind; the freshly reopened db legitimately creates its
-        // own new -wal, so sidecar presence alone proves nothing here.
-        assert.ok(names.includes("index.db"), "fresh db exists");
-
-        // The fresh db is writable (ingest one session through it).
-        const fresh = UnifiedStore.open(path);
-        fresh.ingestSession(planIngest(legacyLike("post-quarantine")));
-        assert.deepEqual(fresh.listSessionIds(), ["post-quarantine"]);
-        fresh.close();
-        shadow.close();
+        assert.equal(shadow, null);
+        assert.deepEqual(readFileSync(path), raw, "original db is retained byte for byte");
+        assert.ok(!readdirSync(dir).some((n) => n.includes(".corrupt-")), "no file set is moved");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

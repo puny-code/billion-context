@@ -25,9 +25,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
-import { renameSync } from "node:fs";
-import path from "node:path";
+import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
@@ -191,44 +189,9 @@ export class UnifiedShadow {
         }
         let store: UnifiedStore;
         try {
-            try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
-            } catch (err) {
-                // #4175: quick_check failed — the file set is provably corrupt.
-                // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
-                // discipline as the session envelopes) and retry ONCE with a
-                // fresh file: the JSON envelopes remain the recovery source
-                // (full mode re-imports organically on load). No auto-delete —
-                // the corrupt original is kept for forensics.
-                if (!(err instanceof StorageIntegrityError)) throw err;
-                const stamp = Date.now();
-                const quarantined: string[] = [];
-                for (const suffix of ["", "-wal", "-shm"]) {
-                    const from = `${dir}/index.db${suffix}`;
-                    const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
-                    try {
-                        renameSync(from, to);
-                        quarantined.push(path.basename(to));
-                    } catch {
-                        /* absent sidecar files are fine */
-                    }
-                }
-                // #4609: the verdict cache belongs to the quarantined file set —
-                // move it along so the fresh store starts with a clean cache
-                // (its stats differ anyway; this keeps the directory honest).
-                try {
-                    const cacheFrom = `${dir}/index.db.chk`;
-                    renameSync(cacheFrom, `${cacheFrom}.corrupt-${stamp}`);
-                    quarantined.push(path.basename(`${cacheFrom}.corrupt-${stamp}`));
-                } catch {
-                    /* absent cache is fine */
-                }
-                loggerLog(
-                    "error",
-                    `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
-                );
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
-            }
+            // The index may contain data absent from legacy files, and another
+            // process may still hold it open. Never rename or replace it here.
+            store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
             // watermark behind; drop them all so this process's first save
@@ -245,7 +208,7 @@ export class UnifiedShadow {
             // failure; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
-                : `${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`;
+                : `${sqliteOpenFailureHint(errStr)}; preserve index.db and its sidecars for recovery`;
             loggerLog(
                 "warn",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
