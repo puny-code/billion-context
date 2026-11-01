@@ -697,13 +697,11 @@ let activationSpawnFlight: Promise<string | undefined> | undefined;
 let activationInitialSpawnUsed = false;
 let recoveryNow: () => number = Date.now;
 let activationRecoveryBudget = new DshRecoveryBudget(() => recoveryNow());
-let activationRecoveryRemaining = 3;
 
 /** One actual bring-up flight across timer, fetch recovery and storage probes. */
 function startActivationProxy(): Promise<string | undefined> {
     if (activationSpawnFlight !== undefined) return activationSpawnFlight;
     const permit = activationRecoveryBudget.tryAcquire(activationInitialSpawnUsed ? "recovery" : "initial");
-    activationRecoveryRemaining = permit.remaining;
     if (!permit.allowed) return Promise.resolve(undefined);
     activationInitialSpawnUsed = true;
     const gen = originGen;
@@ -1777,7 +1775,6 @@ export function apply(ctx: PluginContext): void {
     activationSpawnFlight = undefined;
     activationInitialSpawnUsed = false;
     activationRecoveryBudget = new DshRecoveryBudget(() => recoveryNow());
-    activationRecoveryRemaining = 3;
 
     // Native compaction stays host-owned; bili never disables preset generations.
     declareDshCompactionInactive();
@@ -1811,11 +1808,11 @@ export function apply(ctx: PluginContext): void {
                 readinessAt = Date.now();
                 // Recovery is background-only: model/compaction calls return to
                 // native immediately rather than waiting on a shutdown/spawn.
-                if (!ready && !readinessDisposed && activationRecoveryRemaining > 0 && storageRecoveryFlight === undefined && process.env.NODE_TEST_CONTEXT === undefined) {
-                    // An explicit attach may belong to somebody else: re-probe it
+                if (!ready && !readinessDisposed && storageRecoveryFlight === undefined && process.env.NODE_TEST_CONTEXT === undefined) {
+                    // An explicit attach or routed model origin is pinned: re-probe it
                     // but never replace it. Discovery-owned DSH instances use the
                     // guarded launcher path, not version-only attach validation.
-                    const pinned = nativeAttachOrigin(process.env);
+                    const pinned = nativeAttachOrigin(process.env) ?? state.routedOrigin ?? proxyEnvOrigin(process.env);
                     const recoverStorage = pinned !== undefined
                         ? async () => { await fetchDshTakeoverReady(pinned); }
                         : startActivationProxy;
@@ -2740,7 +2737,6 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
     activationSpawnFlight = undefined;
     activationInitialSpawnUsed = false;
     activationRecoveryBudget = new DshRecoveryBudget(() => recoveryNow());
-    activationRecoveryRemaining = 3;
     // #3616: invalidate every in-flight recovery chain from earlier scenarios —
     // their late landings must not write this scenario's register/state.
     originGen += 1;

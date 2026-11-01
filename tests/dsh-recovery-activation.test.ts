@@ -149,6 +149,82 @@ test("joining an in-flight activation spawn does not consume a recovery", async 
     });
 });
 
+async function invokeReadiness(): Promise<boolean> {
+    const bypass = dsh._stateNativeBypassForTest();
+    assert.ok(bypass);
+    const testContext = process.env.NODE_TEST_CONTEXT;
+    delete process.env.NODE_TEST_CONTEXT;
+    try {
+        return await bypass(true);
+    } finally {
+        if (testContext !== undefined) process.env.NODE_TEST_CONTEXT = testContext;
+    }
+}
+
+test("readiness alone retries recovery after the exhausted rolling budget expires", async () => {
+    const server = http.createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(req.url === "/__bili/plugin/manifest"
+            ? { version: "0.1.119", tools: { anthropic: [{ name: "compress", input_schema: { type: "object", properties: {} } }] } }
+            : { storage: { effective: "legacy", degraded: true } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const origin = `http://127.0.0.1:${address.port}`;
+    try {
+        await fixture(async (ctx, advance) => {
+            let calls = 0;
+            dsh._setSpawnForTest(async () => { calls += 1; return origin; });
+            dsh.apply(ctx);
+            await waitFor(() => dsh._registerStateForTest().toolsReady, "manifest registration");
+            const respawn = dsh._stateRespawnForTest();
+            assert.ok(respawn);
+            for (let i = 0; i < 3; i += 1) {
+                await respawn();
+                advance(30_000);
+            }
+            assert.equal(calls, 4);
+            assert.equal(await invokeReadiness(), true);
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            assert.equal(calls, 4, "exhausted budget still prevents a spawn");
+            advance(600_000);
+            assert.equal(await invokeReadiness(), true);
+            await waitFor(() => calls === 5, "readiness-driven recovery after refill");
+        });
+    } finally {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+});
+
+test("readiness recovery does not spawn away from a routed pinned origin", async () => {
+    const server = http.createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(req.url === "/__bili/plugin/manifest"
+            ? { version: "0.1.119", tools: { anthropic: [{ name: "compress", input_schema: { type: "object", properties: {} } }] } }
+            : { storage: { effective: "legacy", degraded: true } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const origin = `http://127.0.0.1:${address.port}`;
+    try {
+        await fixture(async (ctx) => {
+            let calls = 0;
+            dsh._setSpawnForTest(async () => { calls += 1; return origin; });
+            dsh.apply(ctx);
+            await waitFor(() => dsh._registerStateForTest().toolsReady, "manifest registration");
+            dsh._noteRoutedForTest(`${origin}/bili/https://api.example.com/v1/messages`);
+            assert.equal(await invokeReadiness(), true);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            assert.equal(calls, 1, "pinned model traffic must not cause a second spawn");
+            assert.equal(dsh._registerStateForTest().base, origin);
+        });
+    } finally {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+});
+
 test("successful spawns and manifest registration do not replenish the activation recovery budget", async () => {
     const server = http.createServer((req, res) => {
         res.writeHead(200, { "content-type": "application/json" });
