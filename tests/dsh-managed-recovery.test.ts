@@ -24,7 +24,7 @@ const script = path.join(root, "entry.js");
 fs.writeFileSync(script, "// fixture\n");
 const origin = "http://127.0.0.1:18919";
 
-function fixture(change: { degraded?: boolean; silent?: boolean; mismatch?: boolean; lane?: string; token?: boolean; watchers?: readonly number[]; neverExit?: boolean; refuse?: boolean; registered?: boolean; missingStorage?: boolean; pidMismatch?: boolean; unarmed?: boolean; effective?: string; successorDegraded?: boolean } = {}) {
+function fixture(change: { degraded?: boolean; silent?: boolean; mismatch?: boolean; lane?: string; token?: boolean; guarded?: boolean; watchers?: readonly number[]; neverExit?: boolean; refuse?: boolean; registered?: boolean; missingStorage?: boolean; pidMismatch?: boolean; unarmed?: boolean; effective?: string; successorDegraded?: boolean } = {}) {
     const inst: ProxyInstanceFile = {
         origin, instanceId: "resident", pid: process.pid, startedAt: 1,
         host: "127.0.0.1", port: 18919, passthrough: false, mitmDomains: [], modelWindows: {},
@@ -41,7 +41,7 @@ function fixture(change: { degraded?: boolean; silent?: boolean; mismatch?: bool
         now: () => ticks, sleep: async (ms) => { ticks += ms; if (shutdowns && !change.neverExit) exited = true; },
         readInstanceFile: () => mine ?? inst,
         listRegistryInstances: () => mine ? [mine] : change.registered === false ? [] : [inst],
-        fetchHealthInfo: async () => mine ? ({ ok: true, instanceId: "successor", pid: 42471, storage: { effective: "full", degraded: change.successorDegraded ?? false }, watchdog: { armed: true, watchers: [999999] } }) : change.silent ? undefined : ({ ok: true, guardedShutdown: true, instanceId: change.mismatch ? "foreign" : "resident", pid: change.pidMismatch ? 123 : inst.pid, ...(change.missingStorage ? {} : { storage: { effective: change.effective ?? "full", degraded: change.degraded ?? true } }), watchdog: { armed: !change.unarmed, watchers: [...(change.watchers ?? [999999])] } }),
+        fetchHealthInfo: async () => mine ? ({ ok: true, instanceId: "successor", pid: 42471, storage: { effective: "full", degraded: change.successorDegraded ?? false }, watchdog: { armed: true, watchers: [999999] } }) : change.silent ? undefined : ({ ok: true, guardedShutdown: change.guarded ?? true, instanceId: change.mismatch ? "foreign" : "resident", pid: change.pidMismatch ? 123 : inst.pid, ...(change.missingStorage ? {} : { storage: { effective: change.effective ?? "full", degraded: change.degraded ?? true } }), watchdog: { armed: !change.unarmed, watchers: [...(change.watchers ?? [999999])] } }),
         fetchImpl: async () => ({ ok: true }),
         isConnectable: async () => true,
         isRecoveryPidAlive: () => !exited,
@@ -61,11 +61,10 @@ function fixture(change: { degraded?: boolean; silent?: boolean; mismatch?: bool
     return { deps, opts, counts: () => ({ shutdowns, spawns }) };
 }
 
-test("managed degraded DSH resident is drained, OS-exit-confirmed and replaced once", async () => {
+test("managed degraded DSH resident is never stopped or replaced even with only the owner PID watching", async () => {
     const f = fixture();
-    const handle = await ensureProxyRunning(f.opts, f.deps);
-    assert.equal(handle.child?.pid, 42471);
-    assert.deepEqual(f.counts(), { shutdowns: 1, spawns: 1 });
+    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /refusing replacement/);
+    assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
 });
 
 test("default probe reads storage from status rather than assuming health implies readiness", async () => {
@@ -112,6 +111,17 @@ test("stale DSH resident discovered after recovery snapshot is not shut down or 
     assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
 });
 
+test("a resident discovered after the recovery snapshot cannot trigger a second writer", async () => {
+    const f = fixture({ degraded: false, unarmed: true });
+    const inst = f.deps.readInstanceFile!();
+    assert.ok(inst && "pid" in inst);
+    let reads = 0;
+    f.deps.readInstanceFile = () => ++reads === 1 ? undefined : inst;
+    f.deps.listRegistryInstances = () => reads === 0 ? [] : [inst];
+    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /refusing a second writer/);
+    assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
+});
+
 test("healthy DSH resident remains attached without restart", async () => {
     const f = fixture({ degraded: false });
     const handle = await ensureProxyRunning(f.opts, f.deps);
@@ -134,6 +144,7 @@ for (const [name, change] of [
     ["foreign lane", { lane: "pi" }],
     ["unmanaged resident", { token: false }],
     ["another owner", { watchers: [999999, 888888] }],
+    ["older resident without guarded shutdown", { guarded: false }],
     ["unregistered resident", { registered: false }],
     ["missing storage status", { missingStorage: true }],
     ["mismatched OS pid", { pidMismatch: true }],
@@ -144,14 +155,6 @@ for (const [name, change] of [
         const f = fixture(change);
         await assert.rejects(ensureProxyRunning(f.opts, f.deps));
         assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
-    });
-}
-
-for (const [name, change] of [["shutdown refused", { refuse: true }], ["health disappears but OS process remains", { neverExit: true }]] as const) {
-    test(`${name} does not allow a second writer`, async () => {
-        const f = fixture(change);
-        await assert.rejects(ensureProxyRunning(f.opts, f.deps));
-        assert.deepEqual(f.counts(), { shutdowns: 1, spawns: 0 });
     });
 }
 
@@ -168,12 +171,6 @@ test("a foreign recovery lock prevents uncoordinated replacement", async () => {
     } finally {
         fs.unlinkSync(lock);
     }
-});
-
-test("degraded successor is not returned even when its health endpoint answers", async () => {
-    const f = fixture({ successorDegraded: true });
-    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /not full-storage ready/);
-    assert.deepEqual(f.counts(), { shutdowns: 1, spawns: 1 });
 });
 
 for (const lane of ["dsh", "pi"]) {
@@ -223,9 +220,9 @@ for (const drift of ["none", "instanceId", "pid"]) {
     });
 }
 
-test("concurrent recovery callers share one replacement", async () => {
+test("concurrent recovery callers both fail closed without stopping the resident", async () => {
     const f = fixture();
-    const [a, b] = await Promise.all([ensureProxyRunning(f.opts, f.deps), ensureProxyRunning(f.opts, f.deps)]);
-    assert.equal(a.origin, b.origin);
-    assert.deepEqual(f.counts(), { shutdowns: 1, spawns: 1 });
+    const results = await Promise.allSettled([ensureProxyRunning(f.opts, f.deps), ensureProxyRunning(f.opts, f.deps)]);
+    assert.deepEqual(results.map((result) => result.status), ["rejected", "rejected"]);
+    assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
 });

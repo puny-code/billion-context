@@ -4899,7 +4899,6 @@ async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath
         const pointer = read();
         const candidates = new Map(records.map((inst) => [inst.instanceId, inst]));
         if (isProxyInstanceFile(pointer)) candidates.set(pointer.instanceId, pointer);
-        const retired = new Set<string>();
         for (const inst of candidates.values()) {
             if (!alive(inst.pid) || (inst.lane !== "dsh" && inst.port !== opts.port)) continue;
             const info = await health(inst.origin);
@@ -4909,16 +4908,7 @@ async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath
                 if (info?.watchdog?.armed !== true || instanceCompatible(inst, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), []) !== undefined) throw new Error("bili: DSH resident is ready but incompatible; refusing a second writer");
                 continue;
             }
-            const registered = records.some((r) => r.instanceId === inst.instanceId && r.pid === inst.pid && r.origin === inst.origin && r.lane === "dsh" && r.launchToken === inst.launchToken);
-            const ownerPid = opts.parentPid ?? process.pid;
-            if (!registered || !inst.launchToken || info?.guardedShutdown !== true || info?.storage?.degraded !== true || info.watchdog?.armed !== true || !info.watchdog.watchers || info.watchdog.watchers.some((pid) => pid !== ownerPid && alive(pid))) {
-                throw new Error("bili: DSH resident is not exclusively managed and known degraded; refusing replacement");
-            }
-            if (!(await (deps.requestInstanceShutdown ?? requestInstanceShutdown)(inst.origin, { instanceId: inst.instanceId, pid: inst.pid, ownerPid }))) throw new Error("bili: DSH resident refused shutdown");
-            const exitDeadline = now() + DSH_RECOVERY_WAIT_MS;
-            while (alive(inst.pid) && now() < exitDeadline) await sleep(HEALTH_POLL_INTERVAL_MS);
-            if (alive(inst.pid)) throw new Error("bili: DSH resident OS process still alive; refusing a second writer");
-            retired.add(inst.instanceId);
+            throw new Error("bili: DSH resident is not full-storage ready; refusing replacement without proven exclusivity");
         }
         const readyHealth = async (origin: string): Promise<HealthInfo> => {
             const info = await health(origin);
@@ -4929,11 +4919,10 @@ async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath
             ...deps,
             readInstanceFile: () => {
                 const inst = read();
-                if (isProxyInstanceFile(inst) && !retired.has(inst.instanceId)) return inst;
-                return registry().find((entry) => entry.lane === "dsh" && !retired.has(entry.instanceId) && alive(entry.pid));
+                if (isProxyInstanceFile(inst)) return inst;
+                return registry().find((entry) => entry.lane === "dsh" && alive(entry.pid));
             },
             fetchHealthInfo: async (origin) => {
-                if ([...candidates.values()].some((inst) => retired.has(inst.instanceId) && inst.origin === origin) && !registry().some((inst) => !retired.has(inst.instanceId) && inst.origin === origin)) return undefined;
                 const info = await health(origin);
                 if (info === undefined) return undefined;
                 if (!dshReady(info)) throw new Error("bili: DSH proxy is not full-storage ready");
@@ -5180,6 +5169,14 @@ async function ensureProxyRunningCore(
         // guess WHICH program was actually spawned.
         const runtime = deps.nodeRuntime ?? resolveNodeRuntime();
         try {
+            if (opts.recoverDegradedDsh && opts.lane === "dsh") {
+                const current = readInstance();
+                const residents = [...(deps.listRegistryInstances ?? discoverLiveInstances)()];
+                if (isProxyInstanceFile(current)) residents.push(current);
+                if (residents.some((inst) => (inst.lane === "dsh" || inst.port === opts.port) && (deps.isRecoveryPidAlive ?? isPidAlive)(inst.pid))) {
+                    throw new Error("bili: DSH resident appeared during recovery; refusing a second writer");
+                }
+            }
             child = spawnImpl(
                 runtime,
                 [script, ...proxyStartArgs({ ...opts, port })],
