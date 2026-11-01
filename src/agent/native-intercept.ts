@@ -1192,7 +1192,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             if (state.respawn === undefined) return undefined;
             state.origin = undefined;
             state.ready = state.respawn();
-            const again = await readyOrigin(state);
+            const again = await withTimeout(state.ready, state.spawnWaitMs ?? state.readyTimeoutMs ?? 15_000);
             if (again !== undefined && again !== deadOrigin) replacedOrigins.add(deadOrigin);
             return again;
         };

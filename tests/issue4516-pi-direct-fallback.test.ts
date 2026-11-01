@@ -246,6 +246,51 @@ test("#4516 slow cold start: an in-flight spawn outliving the readiness cap is w
     assert.deepEqual(sink, [ROUTED], "waited out the spawn — nothing went direct");
 });
 
+for (const lane of ["raw", "routed"] as const) {
+    test(`send-failure recovery waits for configured spawn budget (${lane})`, async () => {
+        const replacement = "http://127.0.0.1:40002";
+        const sends: string[] = [];
+        let giveUps = 0;
+        const { result } = await withFallback(async ({ fetch, rearm, state }) => {
+            rearm((async (input: string | URL | Request) => {
+                const target = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+                sends.push(target);
+                if (target === ROUTED) throw new TypeError("fetch failed");
+                return new Response("{}", { status: 200 });
+            }) as typeof globalThis.fetch);
+            state.onGiveUp = () => { giveUps++; };
+            state.respawn = () => new Promise((resolve) => setTimeout(() => resolve(replacement), 120));
+            return (await fetch()(lane === "raw" ? UPSTREAM : ROUTED, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-bili-plugin-context-window": "500" },
+                body: chatBody(4_200_000),
+            })).status;
+        }, { origin: PROXY, readyTimeoutMs: 30, spawnWaitMs: 500 });
+        assert.equal(result, 200);
+        assert.deepEqual(sends, [ROUTED, `${replacement}/bili/${UPSTREAM}`]);
+        assert.equal(giveUps, 0);
+    });
+}
+
+test("send-failure recovery without spawn budget retains readiness timeout", async () => {
+    const sends: string[] = [];
+    let giveUps = 0;
+    const { result } = await withFallback(async ({ fetch, rearm, state }) => {
+        rearm((async (input: string | URL | Request) => {
+            const target = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+            sends.push(target);
+            if (target === ROUTED) throw new TypeError("fetch failed");
+            return new Response("{}", { status: 200 });
+        }) as typeof globalThis.fetch);
+        state.onGiveUp = () => { giveUps++; };
+        state.respawn = () => new Promise(() => {});
+        return (await fetch()(UPSTREAM, { method: "POST", body: chatBody(100) })).status;
+    }, { origin: PROXY, readyTimeoutMs: 30 });
+    assert.equal(result, 200);
+    assert.deepEqual(sends, [ROUTED, UPSTREAM]);
+    assert.equal(giveUps, 1);
+});
+
 test("#4516 transition logging: repeated degraded sends log ONCE per transition", async () => {
     const { log } = await withFallback(async ({ fetch }) => {
         const mod = await import("../src/agent/native-intercept.js");
