@@ -195,6 +195,28 @@ test("archive log: a crashed append's truncated line cannot block other restores
     }
 });
 
+test("archive after a truncated line preserves bytes and restores the newly swept session", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-tail-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const archiveDir = path.join(dir, "archive");
+        fs.mkdirSync(archiveDir);
+        const logPath = path.join(archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
+        const tail = '{"version":1,"sessionId":"interrupted"';
+        fs.writeFileSync(logPath, tail);
+        store.ingestSession(planIngest(mkSession("new", [mkMsg("m-new", "recover this body")])));
+        assert.ok(store.archiveSession("new", { archiveDir }).ok);
+        assert.equal(store.getMessages("new").length, 0);
+        const bytes = fs.readFileSync(logPath, "utf8");
+        assert.ok(bytes.startsWith(tail + "\n"), "the partial line is preserved and separated");
+        assert.ok(store.restoreArchived("new", { archiveDir }).ok, "the new archive remains restorable");
+        assert.equal(JSON.parse(store.getMessages("new")[0].content).text, "recover this body");
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
 test("gc(): age sweep archives only past-retention sessions; dormant shared rows collected", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-gc-"));
     try {
