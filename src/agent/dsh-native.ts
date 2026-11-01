@@ -794,15 +794,9 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (gen !== originGen) return undefined;
     if (version !== undefined) {
-        // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
-        // replaced by waiting (its fingerprint differs, so no bring-up can
-        // attach or reuse it either, and the detached process outlives every
-        // app restart). Rotate it out, then take the same spawn-fallback
-        // transition as a dead target. Equal or newer versions — and versions
-        // too malformed to compare (isVersionNewer → false) — attach exactly
-        // as before; an unreachable target (no version at all) takes the
-        // dead-target path below.
-        if (!isVersionNewer(VERSION, version)) {
+        // Explicit or routed targets are pinned: replacing them would break
+        // the channel's configured origin. Only unpinned older targets rotate.
+        if (explicitAttachOrigin !== undefined || state.routedOrigin !== undefined || !isVersionNewer(VERSION, version)) {
             if (seqAtEntry !== register.giveUpSeq) return undefined;
             // #1130: restore the interceptor's readyOrigin short-circuit — a
             // runtime recovery clears state.origin before re-probing, and a
