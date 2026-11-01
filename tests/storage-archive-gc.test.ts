@@ -86,6 +86,59 @@ test("archiveSession: tombstone + CAS release; shared rows survive; restore re-i
     }
 });
 
+test("restore counts every restored media mapping without consuming a shared holder's reference", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-media-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const image = "a".repeat(4096);
+        const imageMsg = (id: string) => ({ ...mkMsg(id, id), imageBase64: image, imageMediaType: "image/png" });
+        store.ingestSession(planIngest(mkSession("archived", [imageMsg("a1"), imageMsg("a2")])));
+        store.ingestSession(planIngest(mkSession("holder", [imageMsg("b1")])));
+        assert.equal(store.mediaRefCount(image), 3);
+        const archiveDir = path.join(dir, "archive");
+        assert.ok(store.archiveSession("archived", { archiveDir }).ok);
+        assert.equal(store.mediaRefCount(image), 1);
+        assert.ok(store.restoreArchived("archived", { archiveDir }).ok);
+        assert.equal(store.mediaRefCount(image), 3);
+        store.deleteSession("archived");
+        assert.equal(store.mediaRefCount(image), 1);
+        assert.equal(JSON.parse(store.getMessages("holder")[0].content).imageBase64, image);
+        store.deleteSession("holder");
+        assert.equal(store.mediaRefCount(image), 0);
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("restore ignores duplicate media mappings and preserves pinned checkpoint ownership", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-conflict-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const image = "b".repeat(4096);
+        const msg = { ...mkMsg("m", "image"), imageBase64: image, imageMediaType: "image/png" };
+        store.ingestSession(planIngest(mkSession("session", [msg])));
+        const stateJson = '{"unique":"pinned checkpoint state"}';
+        store.insertCheckpoint({ cpId: "cp", sessionId: "session", seqAt: 0, blockSetHash: "set", kind: "manual", pinned: true, createdAt: 1, stateJson });
+        const archiveDir = path.join(dir, "archive");
+        const archived = store.archiveSession("session", { archiveDir });
+        assert.ok(archived.ok && archived.exportPath);
+        const dump = JSON.parse(fs.readFileSync(archived.exportPath, "utf8")) as { mediaMaps: unknown[] };
+        dump.mediaMaps.push(dump.mediaMaps[0]);
+        fs.writeFileSync(archived.exportPath, JSON.stringify(dump) + "\n");
+        assert.ok(store.restoreArchived("session", { archiveDir }).ok);
+        assert.equal(store.mediaRefCount(image), 1);
+        assert.equal(store.contentRefCountOfBody("pinned checkpoint state"), 1);
+        assert.equal(store.listCheckpoints("session").length, 1);
+        store.deleteSession("session");
+        assert.equal(store.mediaRefCount(image), 0);
+        assert.equal(store.contentRefCountOfBody("pinned checkpoint state"), 1);
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
 test("archive log: one append-only JSONL, one line per session, no per-session files (#3901 review)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-log-"));
     try {

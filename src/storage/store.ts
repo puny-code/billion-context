@@ -1794,24 +1794,54 @@ export class UnifiedStore {
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
         const sess: NonNullable<typeof dump.session> = dump.session;
         this.db.transaction(() => {
-            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            const acquire = (hash: string): boolean => {
+                const body = dump.content[hash];
+                if (body !== undefined) {
+                    this.putContent(Buffer.from(body, "utf8"), hash);
+                    return true;
+                }
+                return this.db.prepare("UPDATE content SET refcount = refcount + 1 WHERE hash = ?").run(hash).changes > 0;
+            };
             const insMsg = this.db.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-            for (const m of dump.messages) insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash);
+            for (const m of dump.messages) {
+                acquire(m.content_hash as string);
+                insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash);
+            }
             const insMedia = this.db.prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
-            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) insMedia.run(sessionId, mm.seq, mm.media_hash);
+            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) {
+                const hash = mm.media_hash as string;
+                const acquired = acquire(hash);
+                if (insMedia.run(sessionId, mm.seq, hash).changes === 0 && acquired) this.releaseContent(hash);
+            }
             const insBlock = this.db.prepare(`INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`);
-            for (const b of dump.blocks) insBlock.run(b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier, b.summary_hash, b.one_hash ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json);
+            for (const b of dump.blocks) {
+                const summary = b.summary_hash as string;
+                const one = b.one_hash as string | null;
+                const summaryAcquired = acquire(summary);
+                const oneAcquired = one != null && acquire(one);
+                if (insBlock.run(b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier, summary, one ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json).changes === 0) {
+                    if (summaryAcquired) this.releaseContent(summary);
+                    if (oneAcquired) this.releaseContent(one);
+                }
+            }
             const insRef = this.db.prepare("INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?)");
             for (const r of dump.refs) insRef.run(sessionId, r.ord, r.raw_id, r.ref, r.ref_num ?? null);
             const insDead = this.db.prepare("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)");
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
-            for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
+            for (const e of dump.ccrEntries) {
+                acquire(e.content_hash as string);
+                insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
+            }
             const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json) VALUES (?, ?, ?)");
             for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json);
             const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
-            for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
+            for (const cp of dump.checkpoints) {
+                const hash = cp.state_hash as string;
+                const acquired = acquire(hash);
+                if (insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, hash).changes === 0 && acquired) this.releaseContent(hash);
+            }
             this.db
                 .prepare(`UPDATE sessions SET parent_session_id = ?, fork_point_seq = ?, protocol = ?, label = ?, title = ?, host_title = ?, namespace = ?, origin = ?,
                     created_at = ?, updated_at = ?, next_block_id = ?, next_run_id = ?, meta_json = ?, stats_json = ?, metadata_json = ?, kstate_json = ?, tail_json = ?, ccr_json = ?, last_ingested_seq = ?, orphans_json = ?, status = 'active' WHERE session_id = ?`)
