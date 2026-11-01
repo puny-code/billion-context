@@ -5006,6 +5006,9 @@ async function ensureProxyRunningCore(
         // e.g. into Pi's input draft after herdr session restore.
         attachDiag(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
         const reg = await registerWatcher(inst.origin, watchPid);
+        if (opts.recoverDegradedDsh && opts.lane === "dsh" && reg !== "ok") {
+            throw new Error(`bili: DSH watcher registration ${reg}; refusing unsafe attach`);
+        }
         // #3544: keep re-asserting our liveness so the proxy's watchdog ages us
         // out by HEARTBEAT expiry, not just kill(pid,0) (identity-blind under
         // Windows pid reuse). No-op unless we own the pid.

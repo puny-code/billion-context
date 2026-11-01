@@ -310,6 +310,52 @@ test("guarded shutdown rejects a successor identity and accepts only matching id
     }
 });
 
+test("guarded shutdown prevents an in-flight watcher body from registering", async () => {
+    const ctx = makeCtx(() => {});
+    ctx.initialWatcherPid = 12345;
+    ctx.proxyWatchers.add(12345);
+    let entered!: () => void;
+    const arrived = new Promise<void>((resolve) => { entered = resolve; });
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/watcher") entered();
+        void handleAdminRoute(req, res, ctx);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    assert.ok(addr && typeof addr !== "string");
+    try {
+        const watcher = http.request({ host: "127.0.0.1", port: addr.port, method: "POST", path: "/__bili/watcher", headers: { "content-type": "application/json", "transfer-encoding": "chunked" } });
+        const watcherStatus = new Promise<number | undefined>((resolve, reject) => { watcher.on("response", (res) => { res.resume(); resolve(res.statusCode); }); watcher.on("error", reject); });
+        watcher.write('{"pid":');
+        await arrived;
+        const shutdown = await fetch(`http://127.0.0.1:${addr.port}/__bili/shutdown`, { method: "POST", headers: { "x-bili-expected-instance-id": "test-instance", "x-bili-expected-pid": String(process.pid), "x-bili-expected-owner-pid": "12345" } });
+        assert.equal(shutdown.status, 202);
+        watcher.end("23456}");
+        assert.equal(await watcherStatus, 409);
+        assert.deepEqual([...ctx.proxyWatchers], [12345]);
+    } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("a completed watcher registration prevents sole-owner shutdown", async () => {
+    const ctx = makeCtx(() => { throw new Error("must not shut down"); });
+    ctx.initialWatcherPid = 12345;
+    ctx.proxyWatchers.add(12345);
+    const watcher = mkReq("127.0.0.1");
+    watcher.url = "/__bili/watcher";
+    const watcherResponse = mkRes();
+    const pending = handleAdminRoute(watcher, watcherResponse.res, ctx);
+    watcher.push('{"pid":23456}');
+    watcher.push(null);
+    await pending;
+    assert.equal(watcherResponse.out.code, 200);
+    const shutdownResponse = mkRes();
+    await handleAdminRoute(mkReq("127.0.0.1", { "x-bili-expected-owner-pid": "12345" }), shutdownResponse.res, ctx);
+    assert.equal(shutdownResponse.out.code, 409);
+});
+
 test("#3544 POST /__bili/shutdown refuses non-loopback peers", async () => {
     const reasons: string[] = [];
     const { res, out } = mkRes();

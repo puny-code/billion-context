@@ -55,6 +55,7 @@ interface AdminCtx {
     /** #3544: last-heartbeat timestamps for hb-opted watchers (optional —
      *  absent on contexts built before #3544). */
     watcherLastSeen?: Map<number, number>;
+    shutdownRequested?: boolean;
     /** #3544: triggers the server's graceful shutdown (stale-proxy rotation);
      *  optional — absent on contexts built before #3544. */
     requestShutdown?: (reason: string) => void;
@@ -516,6 +517,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer>, hb?: true }" }));
+            } else if (ctx.shutdownRequested) {
+                res.writeHead(409, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "shutdown already requested" }));
             } else if (initialWatcherPid === null) {
                 res.writeHead(409, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "watchdog not armed (no parent pid) — this proxy does not take watchers" }));
@@ -551,6 +555,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             res.end(JSON.stringify({ ok: false, error: "instance ownership changed" }));
             return;
         }
+        ctx.shutdownRequested = true;
         ctx.requestShutdown?.("rotation-requested (#3544)");
         log("info", `[admin] POST /__bili/shutdown — graceful shutdown requested`);
         res.writeHead(202, { "content-type": "application/json" });

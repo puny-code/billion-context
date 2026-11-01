@@ -119,6 +119,15 @@ test("healthy DSH resident remains attached without restart", async () => {
     assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
 });
 
+for (const registration of ["refused", "failed"] as const) {
+    test(`DSH recovery attach fails closed on ${registration} watcher registration`, async () => {
+        const f = fixture({ degraded: false });
+        f.deps.registerWatcher = async () => registration;
+        await assert.rejects(ensureProxyRunning(f.opts, f.deps), /watcher registration/);
+        assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
+    });
+}
+
 for (const [name, change] of [
     ["hung health", { silent: true }],
     ["mismatched identity", { mismatch: true }],
