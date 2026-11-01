@@ -1067,7 +1067,6 @@ function recoveryIntervalMs(): number {
 }
 function armRecoveryTimer(): void {
     if (recoveryTimer !== undefined) return;
-    if (register.base === undefined && activationInitialSpawnUsed && activationRecoveryRemaining === 0 && activationSpawnFlight === undefined) return;
     if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.BILI_DSH_RECOVERY_INTERVAL_MS === undefined) return;
     recoveryTimer = setInterval(() => {
         // #4755: a given-up register is base-less while toolsReady stays true
@@ -1075,7 +1074,7 @@ function armRecoveryTimer(): void {
         // toolsReady alone disarmed the driver in exactly that state, leaving
         // a given-up lane with no self-heal until an /acp command or a host
         // restart. Healthy means tools ready AND a live base.
-        if (register.dead || (register.toolsReady && register.base !== undefined) || (register.base === undefined && activationInitialSpawnUsed && activationRecoveryRemaining === 0 && activationSpawnFlight === undefined)) {
+        if (register.dead || (register.toolsReady && register.base !== undefined)) {
             if (recoveryTimer !== undefined) clearInterval(recoveryTimer);
             recoveryTimer = undefined;
             return;

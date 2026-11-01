@@ -33,7 +33,7 @@ test("singleflight joins are free and do not move the next recovery time", () =>
     assert.deepEqual(budget.tryAcquire("recovery"), { allowed: true, remaining: 1 });
 });
 
-test("three successful background recoveries exhaust the activation permanently", async () => {
+test("three background recoveries exhaust the window but not future windows", async () => {
     let now = 0;
     const budget = new DshRecoveryBudget(() => now);
     for (const remaining of [2, 1, 0]) {
@@ -44,8 +44,8 @@ test("three successful background recoveries exhaust the activation permanently"
     assert.deepEqual(budget.tryAcquire("recovery"), { allowed: false, remaining: 0 });
     now += 86_400_000;
     assert.deepEqual(budget.tryAcquire("initial"), { allowed: true, remaining: 0 });
-    assert.deepEqual(budget.tryAcquire("recovery"), { allowed: false, remaining: 0 });
-    assert.deepEqual(budget.tryAcquire("recovery", true), { allowed: true, remaining: 0 });
+    assert.deepEqual(budget.tryAcquire("recovery"), { allowed: true, remaining: 2 });
+    assert.deepEqual(budget.tryAcquire("recovery", true), { allowed: true, remaining: 2 });
 });
 
 test("only a new activation instance gets a fresh budget and cooldown", () => {

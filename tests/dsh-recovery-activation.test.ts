@@ -97,6 +97,28 @@ test("activation entry shares one initial spawn and three 30-second recoveries a
     });
 });
 
+test("background recovery resumes after the rolling budget expires", async () => {
+    await fixture(async (ctx, advance) => {
+        process.env.BILI_DSH_RECOVERY_INTERVAL_MS = "100";
+        let calls = 0;
+        dsh._setSpawnForTest(async () => { calls += 1; return undefined; });
+        dsh.apply(ctx);
+        await waitFor(() => calls === 1, "initial spawn");
+        const respawn = dsh._stateRespawnForTest();
+        assert.ok(respawn);
+        await respawn();
+        advance(30_000);
+        await respawn();
+        advance(30_000);
+        await respawn();
+        assert.equal(calls, 4);
+        // Let at least one exhausted-budget timer tick run before refilling.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        advance(600_000);
+        await waitFor(() => calls > 4, "automatic recovery after budget refill");
+    });
+});
+
 test("joining an in-flight activation spawn does not consume a recovery", async () => {
     await fixture(async (ctx, advance) => {
         let calls = 0;

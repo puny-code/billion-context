@@ -1,8 +1,7 @@
 /** Recovery respawns allowed per rolling window. Once the window slides past
  *  the earlier attempts the budget refills — a proxy that dies a few times
- *  over a long session must keep coming back, not go direct for the rest of
- *  the session (2026-11-01: a permanent 3-strike budget left the proxy dead
- *  with no replacement and oversize turns 422'd). */
+ *  over a long session can retry after the window expires instead of exhausting
+ *  a permanent three-attempt budget. */
 const RECOVERY_WINDOW_MS = 10 * 60_000;
 const RECOVERY_MAX_IN_WINDOW = 3;
 const RECOVERY_MIN_GAP_MS = 30_000;
