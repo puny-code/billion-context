@@ -4715,6 +4715,9 @@ async function rotateStalePredecessor(
     if (targetPort === undefined) return;
     const candidate = stale.find((c) => c.inst.port === targetPort);
     if (!candidate) return;
+    if (opts.recoverDegradedDsh && opts.lane === "dsh") {
+        throw new Error("bili: DSH stale resident discovered during startup; refusing unguarded rotation");
+    }
     const running = candidate.health.version;
     if (running === undefined || !isVersionNewer(VERSION, running)) return;
     console.error(

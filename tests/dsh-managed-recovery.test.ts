@@ -99,6 +99,19 @@ test("default probe reads storage from status rather than assuming health implie
     }
 });
 
+test("stale DSH resident discovered after recovery snapshot is not shut down or replaced", async () => {
+    const f = fixture({ degraded: false });
+    const inst = f.deps.readInstanceFile!();
+    assert.ok(inst && "pid" in inst);
+    const stale = { ...inst, codeFingerprint: "old-build" };
+    let reads = 0;
+    f.deps.readInstanceFile = () => ++reads === 1 ? undefined : stale;
+    f.deps.listRegistryInstances = () => reads === 0 ? [] : [stale];
+    f.deps.fetchHealthInfo = async () => ({ ok: true, instanceId: stale.instanceId, pid: stale.pid, version: "0.0.1", storage: { effective: "full", degraded: false }, watchdog: { armed: true, watchers: [888888] } });
+    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /refusing unguarded rotation/);
+    assert.deepEqual(f.counts(), { shutdowns: 0, spawns: 0 });
+});
+
 test("healthy DSH resident remains attached without restart", async () => {
     const f = fixture({ degraded: false });
     const handle = await ensureProxyRunning(f.opts, f.deps);
