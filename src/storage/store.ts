@@ -36,8 +36,6 @@ import type { MessageContentStore } from "acp-kernel";
  *  PASSIVE never blocks the ingest path; a failed checkpoint is logged and
  *  forgotten — the next tick retries and journal_size_limit does the rest. */
 const WAL_CHECKPOINT_EVERY_INGESTS = 20;
-/** Orphan content rows deleted per transaction (bounded write-lock hold). */
-const ORPHAN_COLLECT_BATCH = 2000;
 
 /** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
  *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
@@ -523,12 +521,6 @@ export class UnifiedStore {
     /** #4175: the live foreign pid seen holding <db>.lock at open, or null. */
     lockHolder(): { pid: number } | null {
         return this.foreignLockHolder;
-    }
-
-    /** Public entry for periodic orphan collection (see collectOrphanContent).
-     *  Callers gate on lockHolder(); this method itself never checks it. */
-    collectOrphans(): number {
-        return this.collectOrphanContent();
     }
 
     /**
@@ -1867,7 +1859,11 @@ export class UnifiedStore {
                 if (r.contentRowsDeleted) contentRowsDeleted += r.contentRowsDeleted;
             }
         }
-        contentRowsDeleted += this.collectOrphanContent();
+        const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
+        if (zero.n > 0) {
+            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            contentRowsDeleted += zero.n;
+        }
         if (opts.vacuum === "full") {
             loggerLog("info", "[#3901] gc: running full VACUUM (this can take a while on large databases)");
             // #4390: delegate to vacuum() — a bare VACUUM leaves the compacted
@@ -1877,47 +1873,6 @@ export class UnifiedStore {
             this.vacuum("incremental");
         }
         return { archived, contentRowsDeleted };
-    }
-
-    /** Orphan collection: content rows whose refcount reached zero AND that no
-     *  table still references (messages, media, blocks, ccr, checkpoints).
-     *  Deleted in bounded batches so one pass never holds the write lock for a
-     *  whole 4 GB store. Archived sessions are untouched: their bodies live in
-     *  archive.jsonl, not in content, so no archived row can match here. */
-    private collectOrphanContent(batchSize = ORPHAN_COLLECT_BATCH): number {
-        // Referenced set via indexed DISTINCT scans, built once. A per-row
-        // correlated NOT EXISTS is O(content x messages): messages has no
-        // content_hash index, so it stalls on a multi-GB store (measured).
-        const referenced = new Set<string>();
-        for (const sql of [
-            "SELECT DISTINCT content_hash AS h FROM messages",
-            "SELECT DISTINCT media_hash AS h FROM message_media",
-            "SELECT DISTINCT summary_hash AS h FROM blocks",
-            "SELECT DISTINCT one_hash AS h FROM blocks WHERE one_hash IS NOT NULL",
-            "SELECT DISTINCT content_hash AS h FROM ccr_entries",
-            "SELECT DISTINCT state_hash AS h FROM checkpoints",
-        ]) {
-            for (const r of this.db.prepare(sql).all() as { h: string }[]) referenced.add(r.h);
-        }
-        // Paged by primary key (content.hash), so each page is an index range scan.
-        // A hash referenced AFTER the set was built is still safe: the DELETE is
-        // guarded by refcount <= 0, and any live reference holds refcount >= 1.
-        const page = this.db.prepare("SELECT hash AS h FROM content WHERE refcount <= 0 AND hash > ? ORDER BY hash LIMIT ?");
-        const del = this.db.prepare("DELETE FROM content WHERE hash = ? AND refcount <= 0");
-        let total = 0;
-        let cursor = "";
-        for (;;) {
-            const rows = page.all(cursor, batchSize) as { h: string }[];
-            if (rows.length === 0) break;
-            cursor = rows[rows.length - 1].h;
-            const orphans = rows.filter((r) => !referenced.has(r.h)).map((r) => r.h);
-            if (orphans.length === 0) continue;
-            this.db.transaction(() => {
-                for (const h of orphans) del.run(h);
-            });
-            total += orphans.length;
-        }
-        return total;
     }
 
     /** Test/ops helper: refcount of the content row whose serialized body

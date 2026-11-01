@@ -1795,19 +1795,6 @@ export class SessionStore {
         }
     }
 
-    /** Periodic orphan-content collection through the live sidecar. Returns the
-     *  number of rows freed, or null when unavailable (legacy-only, network
-     *  backend, or another live instance holds index.db — deferred to it). */
-    unifiedCollectOrphans(): number | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        try {
-            return this.shadow.collectOrphans();
-        } catch (err) {
-            this.log("warn", `[persist] orphan collection failed: ${String(err)}`);
-            return null;
-        }
-    }
-
     /** #4175: online consistent snapshot of the unified store (VACUUM INTO,
      *  sqlite only). Default destination lives beside the archive dir so a
      *  backups/ tree grows in one place: sessionsDir/backups/index-<ts>.db. */
