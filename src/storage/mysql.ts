@@ -64,7 +64,17 @@ import type {
  *  Same discipline as the jimp lazy load (src/image-rescale.ts, #3516). */
 export type Mysql2Module = typeof import("mysql2/promise");
 
-const MYSQL_SCHEMA_VERSION = 8;
+/** v9 (#5539, ported from upstream v11 — this line's head is v8, not v10):
+ *  FK-child indexes on every content(hash)-referencing column
+ *  (messages.content_hash, blocks.one_hash, blocks.summary_hash,
+ *  ccr_entries.content_hash, message_media.media_hash, checkpoints.state_hash)
+ *  — sqlite's foreign_keys=ON full-scan pathology on parent DELETE; MySQL
+ *  declares no FOREIGN KEY constraints yet, so this is parity + future-
+ *  proofing there. Existing stamped-v8 libraries re-enter the probe-first
+ *  DDL block below exactly once on first open (information_schema probe +
+ *  ALTER ADD INDEX); fresh installs pick the keys up from the CREATE TABLE
+ *  DDL. */
+const MYSQL_SCHEMA_VERSION = 9;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
@@ -139,7 +149,8 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE KEY uq_messages_identity (session_id, msg_id, content_hash),
     KEY idx_messages_session (session_id, seq),
     KEY idx_messages_msg_id (session_id, msg_id),
-    KEY idx_messages_identity (session_id, msg_id, identity)
+    KEY idx_messages_identity (session_id, msg_id, identity),
+    KEY idx_messages_content_hash (content_hash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS blocks (
@@ -159,7 +170,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     covered_hash        VARCHAR(64) NOT NULL,
     payload_json        LONGTEXT NOT NULL,
     PRIMARY KEY (session_id, block_id),
-    KEY idx_blocks_session (session_id, ord)
+    KEY idx_blocks_session (session_id, ord),
+    KEY idx_blocks_one_hash (one_hash),
+    KEY idx_blocks_summary_hash (summary_hash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS dead_refs (
@@ -193,7 +206,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     pinned         TINYINT NOT NULL DEFAULT 0,
     label          TEXT NULL,
     state_hash     VARCHAR(64) NOT NULL,
-    KEY idx_checkpoints_session (session_id, created_at)
+    KEY idx_checkpoints_session (session_id, created_at),
+    KEY idx_checkpoints_state_hash (state_hash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS ccr_entries (
@@ -201,7 +215,8 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     ord         BIGINT NOT NULL,
     ccr_key     VARCHAR(255) NOT NULL,
     content_hash VARCHAR(64) NOT NULL,
-    PRIMARY KEY (session_id, ord)
+    PRIMARY KEY (session_id, ord),
+    KEY idx_ccr_entries_content_hash (content_hash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -232,7 +247,8 @@ CREATE TABLE IF NOT EXISTS message_media (
     session_id VARCHAR(255) NOT NULL,
     seq        BIGINT NOT NULL,
     media_hash VARCHAR(64) NOT NULL,
-    PRIMARY KEY (session_id, seq, media_hash)
+    PRIMARY KEY (session_id, seq, media_hash),
+    KEY idx_message_media_media_hash (media_hash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS bili_meta (
@@ -308,6 +324,35 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!have.has("retired_at")) {
                     await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
+                }
+                // #5539 (v9, upstream v11 renumbered): FK-child indexes — see
+                // the MYSQL_SCHEMA_VERSION doc for the mechanism; same
+                // probe-first discipline, one STATISTICS sweep across the six
+                // child tables.
+                const [idxRows] = (await conn.query(
+                    "SELECT TABLE_NAME AS tbl, INDEX_NAME AS idx FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('messages', 'blocks', 'ccr_entries', 'message_media', 'checkpoints')",
+                )) as unknown as Row[][];
+                const haveIdx = new Set(
+                    (idxRows as unknown as { tbl?: unknown; idx?: unknown }[])
+                        .map((r) => `${String(r.tbl ?? "")}.${String(r.idx ?? "")}`),
+                );
+                if (!haveIdx.has("messages.idx_messages_content_hash")) {
+                    await conn.query("ALTER TABLE messages ADD INDEX idx_messages_content_hash (content_hash)");
+                }
+                if (!haveIdx.has("blocks.idx_blocks_one_hash")) {
+                    await conn.query("ALTER TABLE blocks ADD INDEX idx_blocks_one_hash (one_hash)");
+                }
+                if (!haveIdx.has("blocks.idx_blocks_summary_hash")) {
+                    await conn.query("ALTER TABLE blocks ADD INDEX idx_blocks_summary_hash (summary_hash)");
+                }
+                if (!haveIdx.has("ccr_entries.idx_ccr_entries_content_hash")) {
+                    await conn.query("ALTER TABLE ccr_entries ADD INDEX idx_ccr_entries_content_hash (content_hash)");
+                }
+                if (!haveIdx.has("message_media.idx_message_media_media_hash")) {
+                    await conn.query("ALTER TABLE message_media ADD INDEX idx_message_media_media_hash (media_hash)");
+                }
+                if (!haveIdx.has("checkpoints.idx_checkpoints_state_hash")) {
+                    await conn.query("ALTER TABLE checkpoints ADD INDEX idx_checkpoints_state_hash (state_hash)");
                 }
                 // MySQL DDL commits implicitly, so the ALTERs above are
                 // already durable when the data step starts. It streams one
