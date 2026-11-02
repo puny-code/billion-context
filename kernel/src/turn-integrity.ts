@@ -214,14 +214,25 @@ export function buildIntegrityIndex(messages: CoreMessage[]): IntegrityIndex {
  * same array: pass it when screening many ranges against one unchanged array
  * and the fixed point only has to visit the turns/pairs the fold actually
  * touches. Omitting it runs the historical full scan — identical results.
+ *
+ * Coverage is not "kept". An id in `invisibleIds` is already hidden by an
+ * active block: it neither counts as folding nor as kept-visible. A covered
+ * tool-call therefore cannot strand its turn's reasoning — without this, a
+ * #564 reverse split (call+result inside an existing block, reasoning+text
+ * visible) withdraws the stranded pair wholesale FOREVER: they leave no gap a
+ * range can span, so every later fold reclaims only everything else and the
+ * residue grows monotonically until nothing left is big enough to fold
+ * (billion-context#5531). Omit the parameter for the legacy model where
+ * everything not folded reads as visible.
  */
 export function computeIntegrityWithdrawals(
   messages: CoreMessage[],
   foldedIds: ReadonlySet<string>,
   index?: IntegrityIndex,
+  invisibleIds?: ReadonlySet<string>,
 ): IntegrityWithdrawals {
   if (index !== undefined) {
-    return computeWithdrawalsIndexed(index, foldedIds);
+    return computeWithdrawalsIndexed(index, foldedIds, invisibleIds);
   }
   const remaining = new Set(foldedIds);
   const withdrawn = new Set<string>();
@@ -261,7 +272,10 @@ export function computeIntegrityWithdrawals(
       );
       if (!foldHasReasoning) continue;
       const keptHasCall = group.some(
-        (id) => !remaining.has(id) && callIds.has(id),
+        (id) =>
+          !remaining.has(id) &&
+          callIds.has(id) &&
+          !invisibleIds?.has(id),
       );
       if (!keptHasCall) continue;
       handledTurns.add(g);
@@ -308,10 +322,16 @@ export function computeIntegrityWithdrawals(
  * that mutates nothing cannot change the order in which the surviving ones
  * mutate `remaining` — so the visited subset converges to the same fixed
  * point, with the same `splitTurnCount` / `splitPairCount`.
+ *
+ * #5531 keeps that argument: `invisibleIds` only refines the KEPT-side test of
+ * the turn pass, so it can turn a would-be withdrawal into a `continue` but
+ * never introduces a withdrawal outside the candidate set (a turn still needs
+ * a folded member to be visited at all).
  */
 function computeWithdrawalsIndexed(
   index: IntegrityIndex,
   foldedIds: ReadonlySet<string>,
+  invisibleIds?: ReadonlySet<string>,
 ): IntegrityWithdrawals {
   const remaining = new Set(foldedIds);
   const withdrawn = new Set<string>();
@@ -358,7 +378,7 @@ function computeWithdrawalsIndexed(
       );
       if (!foldHasReasoning) continue;
       const keptHasCall = group.some(
-        (id) => !remaining.has(id) && index.callIds.has(id),
+        (id) => !remaining.has(id) && index.callIds.has(id) && !invisibleIds?.has(id),
       );
       if (!keptHasCall) continue;
       handledTurns.add(g);
