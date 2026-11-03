@@ -185,14 +185,12 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
     return summary;
 }
 
-/** #2760: OpenCode Go (`opencode.ai/zen/go`) requires a stable x-opencode-session
- *  header for routing + prompt cache and answers HTTP 400 MissingSessionID without
- *  one. Matched on host + exact `/zen/go` or `/zen/go/...` so adjacent endpoints
- *  (a hypothetical `/zen/golang`) are left untouched too. */
+/** OpenCode endpoints require a stable session header for routing and caching.
+ *  Match the exact official hostname independently of endpoint path. */
 export function isOpenCodeGoTarget(rawUrl: string): boolean {
     try {
         const parsed = new URL(rawUrl);
-        return parsed.hostname.toLowerCase() === "opencode.ai" && (parsed.pathname === "/zen/go" || parsed.pathname.startsWith("/zen/go/"));
+        return parsed.hostname.toLowerCase() === "opencode.ai";
     } catch {
         return false;
     }
@@ -212,8 +210,8 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
     plan.headers.set("content-type", "application/json");
     if (plan.protocol === "anthropic" && !plan.headers.has("anthropic-version")) plan.headers.set("anthropic-version", "2023-06-01");
     // #2760: OpenCode Go rejects requests lacking a stable x-opencode-session
-    // (HTTP 400 MissingSessionID). Stamp it plus bili's own user agent for Go
-    // targets only — never the client's inbound session/auth headers.
+    // (HTTP 400 MissingSessionID). Stamp it plus bili's own user agent for
+    // official OpenCode targets — never the client's inbound session/auth headers.
     if (isOpenCodeGoTarget(plan.url) && typeof plan.sessionId === "string" && plan.sessionId.length > 0) {
         plan.headers.set("x-opencode-session", plan.sessionId);
         plan.headers.set("user-agent", `${PACKAGE_NAME}/${VERSION}`);

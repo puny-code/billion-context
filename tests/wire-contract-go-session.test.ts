@@ -50,13 +50,16 @@ function goFake(capture: Captured[]): (url: string, options: FetchOptions) => Pr
 
 afterEach(() => assert.equal(_liveUpstreamTimersForTest(), 0));
 
-test("WC-016: Go target detection is scoped to opencode.ai/zen/go only", () => {
+test("WC-016: OpenCode target detection uses the exact official hostname", () => {
     assert.equal(isOpenCodeGoTarget(GO_URL), true);
     assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/go/v1/chat/completions?alt=sse"), true);
     assert.equal(isOpenCodeGoTarget("https://OPENCODE.AI/zen/go/v1/chat/completions"), true, "host match is case-insensitive");
-    assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/v1/messages"), false, "the zen Anthropic proxy under /zen/v1 is NOT Go");
-    assert.equal(isOpenCodeGoTarget("https://opencode.ai/v1/chat/completions"), false, "non-/zen/go paths are untouched");
-    assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/golang/v1/chat/completions"), false, "the /zen/go match is segment-bounded: a hypothetical /zen/golang is NOT Go");
+    assert.equal(isOpenCodeGoTarget("https://opencode.ai/inference/go/openai/v1/chat/completions"), true);
+    assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/v1/messages"), true);
+    assert.equal(isOpenCodeGoTarget("https://opencode.ai/v1/chat/completions"), true);
+    assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/golang/v1/chat/completions"), true);
+    assert.equal(isOpenCodeGoTarget("https://opencode.ai.evil.example/inference/go/openai/v1/chat/completions"), false);
+    assert.equal(isOpenCodeGoTarget("https://evil-opencode.ai/inference/go/openai/v1/chat/completions"), false);
     assert.equal(isOpenCodeGoTarget("https://opencode.ai/zen/go"), true, "the bare /zen/go root is Go");
     assert.equal(isOpenCodeGoTarget("https://evil.example.com/zen/go/v1/chat/completions"), false, "other hosts are untouched");
     assert.equal(isOpenCodeGoTarget("not-a-url"), false);
@@ -76,6 +79,15 @@ test("WC-016: a Go summary candidate stamps x-opencode-session and bili's own us
     assert.equal(capture[0].headers["x-opencode-session"], "sess-stable-id", "the stable conversation id rides the outbound Go call");
     assert.equal(capture[0].headers["user-agent"], `${PACKAGE_NAME}/${VERSION}`, "bili's own user agent, not a generic SDK name");
     assert.equal(capture[0].headers["authorization"], "Bearer go-test-key", "its own credential is still present");
+});
+
+test("WC-016: current OpenCode inference endpoint receives the session header", async () => {
+    const capture: Captured[] = [];
+    const target = { ...goTarget("new-endpoint-session"), url: "https://opencode.ai/inference/go/openai/v1/chat/completions" };
+    const result = await withFetchTransport(goFake(capture), () =>
+        new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target, 4096)], budget));
+    assert.equal(result.status, "success");
+    assert.equal(capture[0].headers["x-opencode-session"], "new-endpoint-session");
 });
 
 test("WC-016 negative control: a Go candidate with no session id fails on the upstream MissingSessionID 400", async () => {
