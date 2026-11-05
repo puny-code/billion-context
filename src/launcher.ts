@@ -307,6 +307,12 @@ export interface LauncherDeps {
      *  Default hits the real endpoint; tests stub it. */
     requestInstanceShutdown?: (origin: string, expected?: { instanceId: string; pid: number; ownerPid?: number }) => Promise<boolean>;
     isRecoveryPidAlive?: (pid: number) => boolean;
+    /** Opt-in DSH recovery only: terminate a resident that is provably OUR
+     *  install AND completely unresponsive (health endpoint answers nothing).
+     *  Such a process holds the port and index.db while serving no session, so
+     *  leaving it in place only wedges the lane on DIRECT sends. Never used for
+     *  a resident that still answers health, degraded or not. */
+    terminatePid?: (pid: number) => void;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -4902,6 +4908,31 @@ async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath
         for (const inst of candidates.values()) {
             if (!alive(inst.pid) || (inst.lane !== "dsh" && inst.port !== opts.port)) continue;
             const info = await health(inst.origin);
+            if (info === undefined) {
+                // A resident that holds our port (and index.db) but answers
+                // nothing serves no session at all — leaving it alone does not
+                // protect anyone, it just wedges the lane on DIRECT sends for
+                // minutes (#4516 422s). Reap it, but ONLY when it is provably
+                // the same install; a foreign build is left for the operator to
+                // kill (it is the exact pid we log for them).
+                const foreign = inst.lane !== "dsh" || inst.pid <= 1 || inst.pid === process.pid
+                    || instanceCompatible(inst, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), []) !== undefined;
+                if (foreign) throw new Error("bili: DSH resident identity/readiness unknown; refusing replacement");
+                // Confirm the silence is a state, not one blip.
+                await sleep(HEALTH_POLL_INTERVAL_MS);
+                if (await health(inst.origin) !== undefined) throw new Error("bili: DSH resident identity/readiness unknown; refusing replacement");
+                if (!alive(inst.pid)) continue;
+                deps.attachDiag?.(`bili: reaping unresponsive DSH resident ${inst.origin} (pid ${inst.pid}) — it holds the port and index.db but answers no health probe`);
+                try {
+                    (deps.terminatePid ?? ((pid: number) => { process.kill(pid, "SIGTERM"); }))(inst.pid);
+                } catch {
+                    // Already gone between the probe and the signal.
+                }
+                const reapDeadline = now() + DSH_RECOVERY_WAIT_MS;
+                while (alive(inst.pid) && now() < reapDeadline) await sleep(HEALTH_POLL_INTERVAL_MS);
+                if (alive(inst.pid)) throw new Error("bili: unresponsive DSH resident did not exit; refusing a second writer");
+                continue;
+            }
             const identity = info?.ok === true && info.instanceId === inst.instanceId && info.pid === inst.pid;
             if (inst.lane !== "dsh" || !identity) throw new Error("bili: DSH resident identity/readiness unknown; refusing replacement");
             if (dshReady(info)) {
