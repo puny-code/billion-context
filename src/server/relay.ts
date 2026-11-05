@@ -65,7 +65,7 @@ import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
-import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
+import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, stampOpenCodeSessionHeader, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
@@ -309,6 +309,9 @@ async function forwardCaptured(
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
     const { upstreamUrl, headers, proxyUrl, skippedProxy } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    // OpenCode 400s (MissingSessionID) any model request without a stable
+    // per-conversation session id; hosts drop it on some agentless lanes.
+    stampOpenCodeSessionHeader(headers, prepared?.session.id, upstreamUrl);
     // #3129: v1internal egress re-wrap — every outbound model body (initial send,
     // role-ladder retry, overflow refold, compress-loop round 2+) must go back to
     // Antigravity inside the CloudCode envelope it arrived in. String-level for

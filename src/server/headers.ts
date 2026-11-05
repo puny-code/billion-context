@@ -77,6 +77,25 @@ export function stripRemoteCompactionBetaFeature(headers: Record<string, string>
     else delete headers[betaKey];
 }
 
+/** OpenCode rejects a model request that carries no stable per-conversation
+ *  session id (HTTP 400 MissingSessionID). Host clients stamp it on only SOME
+ *  of their model paths — background/agentless lanes lose it — so bili fills it
+ *  in on egress when the client sent none. A client-supplied value always wins;
+ *  the id must be stable across a conversation (bili's session id is, via
+ *  prefix affinity) because OpenCode uses it for routing and prompt caching. */
+export function stampOpenCodeSessionHeader(headers: Record<string, string>, sessionId: string | undefined, upstreamUrl: string): void {
+    if (sessionId === undefined || sessionId.length === 0) return;
+    let host: string;
+    try {
+        host = new URL(upstreamUrl).hostname.toLowerCase();
+    } catch {
+        return;
+    }
+    if (host !== "opencode.ai") return;
+    for (const key of Object.keys(headers)) if (key.toLowerCase() === "x-opencode-session") return;
+    headers["x-opencode-session"] = sessionId;
+}
+
 export function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {
