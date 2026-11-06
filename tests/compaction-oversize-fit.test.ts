@@ -196,7 +196,11 @@ test("compaction-fit: an oversize host compaction call is fitted before the dire
         assert.equal(messages[0].content, TASK, "the opening instruction is preserved");
         const placeholder = placeholderOf(messages);
         assert.ok(placeholder !== undefined, "a marked placeholder message must explain the dropped history");
-        assert.match(String(placeholder.content), /\[billion-context: \d+ earlier messages omitted to fit the model's context window\]/);
+        assert.match(String(placeholder.content), /\[billion-context: the \d+ earlier messages before this point were NOT included in this request/);
+        // The rationale has to be an instruction, not a note: this body's only
+        // reader is the summarizer, and the count is the one thing that must
+        // survive into the summary (everything downstream sees only that).
+        assert.match(String(placeholder.content), /State that omission explicitly in the summary you write/);
         assert.equal(messages.at(-1)!.content, DIRECTIVE, "the compaction directive is always last");
         assert.ok(messages.some((m) => JSON.stringify(m).includes("toolu_recent")), "the newest tool pair is kept");
         assert.ok(!messages.some((m) => JSON.stringify(m).includes("toolu_early")), "the oldest tool pair is dropped whole");

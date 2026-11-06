@@ -107,9 +107,14 @@ function declaredOutputTokens(parsed: Rec): number | undefined {
 }
 
 /** The marker line. Deliberately explicit: a reader (or the summarizer) must
- *  be able to tell that history was dropped for size, not by the host. */
+ *  be able to tell that history was dropped for size, not by the host — and it
+ *  is phrased as an INSTRUCTION because the summarizer is this body's only
+ *  reader. Everything downstream sees the summary and nothing else: 6,727
+ *  messages replaced here leave no trace in the model's later context unless
+ *  the summary itself says they were never read. */
 export function placeholderTextOf(dropped: number): string {
-    return `[billion-context: ${dropped} earlier message${dropped === 1 ? "" : "s"} omitted to fit the model's context window]`;
+    const many = dropped !== 1;
+    return `[billion-context: the ${dropped} earlier message${many ? "s" : ""} before this point ${many ? "were" : "was"} NOT included in this request — the conversation exceeds the model's context window. Your summary cannot cover ${many ? "them" : "it"}, and later turns will only ever see your summary. State that omission explicitly in the summary you write, including the count (${dropped} message${many ? "s" : ""} not read).]`;
 }
 
 /** Leading system/developer messages — never dropped: they carry the host's
