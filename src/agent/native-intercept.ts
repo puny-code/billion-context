@@ -15,6 +15,7 @@ import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
+import { COMPACTION_FIT_TRIGGER_RATIO, planCompactionFit, type CompactionFitPlan } from "./compaction-fit.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
  *  host's #1117 semantics (raw URL → direct, routed URL → passthrough);
@@ -567,6 +568,44 @@ function bodyByteSizeOf(init: RequestInit | undefined): { bytes: number } | unde
     if (body instanceof Uint8Array) return { bytes: body.byteLength };
     if (body instanceof ArrayBuffer) return { bytes: body.byteLength };
     return undefined;
+}
+
+/** Host-compaction fit (compaction-fit-oversize, compaction-fit.ts): the body text a dispatch
+ *  would put on the wire. Strings are free, byte buffers decode, and a
+ *  Request-object input is probed through a CLONE (the original must stay
+ *  sendable — #2496). Unreadable forms (streams, FormData, consumed requests,
+ *  undecodable buffers) answer undefined: the fit stays disarmed, which is
+ *  never a behavior change from missing data. */
+async function fitBodyTextOf(input: string | URL | Request, init: RequestInit | undefined): Promise<string | undefined> {
+    const body: unknown = init?.body;
+    try {
+        if (typeof body === "string") return body;
+        if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+        if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+        if (body === undefined && input instanceof Request) return await input.clone().text();
+    } catch {
+        return undefined;
+    }
+    return undefined;
+}
+
+/** Host-compaction fit (compaction-fit-oversize): a fitted body is a DIFFERENT size than the one
+ *  the host framed — a stale host-supplied content-length would make the
+ *  provider read a misframed request, so it is dropped when the body is
+ *  replaced (fetch re-derives it from the body). Only called on the fitted
+ *  path; every other dispatch keeps its headers byte-identical. */
+function withoutContentLength(input: string | URL | Request, init: RequestInit | undefined): RequestInit | undefined {
+    const source = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+    if (source === undefined) return init;
+    let headers: Headers;
+    try {
+        headers = new Headers(source as ConstructorParameters<typeof Headers>[0]);
+    } catch {
+        return init;
+    }
+    if (!headers.has("content-length")) return init;
+    headers.delete("content-length");
+    return { ...init, headers };
 }
 
 /** #2924 direction 1: protocol-shaped local refusal — 422 per the #2709
@@ -1178,6 +1217,70 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // DSH's explicit hand-back precedes ALL bili policy (including signing,
         // attribution and compaction guards). Restore lane-specific bodies first;
         // forwarding an incremental delta directly is never a valid fallback.
+        // Host-compaction fit (compaction-fit-oversize). A host-owned compaction call
+        // (`nativeCompactionPassthrough`) replays the WHOLE conversation and
+        // asks the model to summarize it, so it is the one request that can
+        // exceed the window even when every individual turn fits. bili's proxy
+        // deliberately relays such calls VERBATIM instead of folding them
+        // (src/server/handle.ts — "dsh native compaction — relaying verbatim,
+        // kernel bypassed"), so the host's compaction hand-back is the last
+        // place anything can measure the body: without this, an 8,650-message
+        // session (~1,972,454 tok) is mailed to a 1,048,576-tok model and every
+        // auto-compaction trigger dies with
+        //   compaction/end 400 Input too long … turn/end CONTEXT_WINDOW_EXCEEDED.
+        // The fit itself (drop the oldest turns into one marked placeholder,
+        // keep system/first instruction + newest messages, never split a
+        // tool_call/tool_result pair) lives in compaction-fit.ts; this hook
+        // only decides WHEN it applies: a host-compaction POST whose body
+        // provably cannot fit the window. Everything else — small compaction
+        // calls included — keeps its exact bytes.
+        const fitFloorBytes = Math.ceil(MIN_ASSUMED_WINDOW_TOKENS * COMPACTION_FIT_TRIGGER_RATIO) * 4;
+        let compactionFitCache: { source: unknown; plan: CompactionFitPlan | undefined } | undefined;
+        let compactionFitLogged = false;
+        const compactionFitFor = async (
+            source: unknown,
+            bytes: number | undefined,
+            read: () => Promise<string | undefined>,
+        ): Promise<CompactionFitPlan | undefined> => {
+            if (state.nativeCompactionPassthrough !== true) return undefined;
+            if (fetchMethodOf(input, init) !== "POST") return undefined;
+            // No body the guard could ever act on (a sub-fits-any-supported-
+            // window body): skip the window hook — which may refresh model
+            // info — entirely, so ordinary traffic pays a byte count only.
+            if (bytes !== undefined && bytes <= fitFloorBytes) return undefined;
+            const cached = compactionFitCache;
+            if (cached !== undefined && cached.source === source) return cached.plan;
+            let plan: CompactionFitPlan | undefined;
+            const declared = declaredWindowFromHeaders(input, init) ?? state.declaredWindowForDirect?.();
+            // #4079 distrusts windows BELOW MIN_ASSUMED_WINDOW_TOKENS, but a
+            // host-compaction body is the ONE request that replays the whole
+            // history, so "too small to trust" must not mean "send it verbatim
+            // anyway". Live evidence: the dsh lane resolves 1,048,576 and then
+            // subtracts output headroom down to 792,576 — a legitimate number
+            // below the floor — so requiring `declared >= floor` silently
+            // disabled this fit and the 1,972,454-token compaction kept failing
+            // exactly as before. A DECLARED window is therefore lifted to the
+            // floor: we only ever assume MORE room than reported, so the body is
+            // still fitted only when it cannot fit even that assumption. A lane
+            // with no window at all keeps today's verbatim hand-back.
+            const declaredUsable = Number.isFinite(declared) && (declared as number) > 0;
+            const fitWindow = declaredUsable ? Math.max(declared as number, MIN_ASSUMED_WINDOW_TOKENS) : undefined;
+            if (fitWindow !== undefined) {
+                let text: string | undefined;
+                try {
+                    text = await read();
+                } catch {
+                    text = undefined;
+                }
+                plan = text === undefined ? undefined : planCompactionFit(text, fitWindow);
+            }
+            compactionFitCache = { source, plan };
+            if (plan !== undefined && !compactionFitLogged) {
+                compactionFitLogged = true;
+                logHostEvent("warn", "[native-client]", `[compaction-fit] host compaction request ~${plan.originalTokens.toLocaleString("en-US")} tok (${plan.originalBytes.toLocaleString("en-US")} B) provably exceeds the ${plan.window.toLocaleString("en-US")} tok window — replacing ${plan.droppedMessages.toLocaleString("en-US")} earlier message(s) with one marked placeholder before the direct send (~${plan.fittedTokens.toLocaleString("en-US")} tok, compaction-fit-oversize)`);
+            }
+            return plan;
+        };
         const sendNativeIfNeeded = async (force = false): Promise<Response | undefined> => {
             const target = routedBiliModelUrl(url) ?? url;
             const proxyOrigin = routedBiliModelUrl(url) !== undefined ? new URL(url).origin : state.origin;
@@ -1187,6 +1290,15 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 const directInput = target === url ? input : typeof input === "string" || input instanceof URL ? target : new Request(target, input);
                 const prep = await state.prepareDirectSend?.(target, directInput, init) ?? { outcome: "as-is" as const };
                 if (prep.outcome === "unrestorable") throw new TypeError("billion-context: cannot restore lane-specific request for native fallback");
+                const restoredBody = prep.outcome === "restored" ? prep.body : undefined;
+                // compaction-fit-oversize: fit a provably-oversized host-compaction body. The
+                // RESTORED body (a #3248 incremental swap was undone above) is
+                // the one that actually rides the wire, so fit THAT one.
+                const compactionFit = hostCompaction
+                    ? restoredBody !== undefined
+                        ? await compactionFitFor(restoredBody, Buffer.byteLength(restoredBody), async () => restoredBody)
+                        : await compactionFitFor(init?.body ?? input, bodyByteSizeOf(init)?.bytes, () => fitBodyTextOf(input, init))
+                    : undefined;
                 // Private routing metadata must never leave for the provider on
                 // hand-back. Preserve provider credentials and content headers.
                 const directHeaders = new Headers(init?.headers ?? (directInput instanceof Request ? directInput.headers : undefined));
@@ -1198,11 +1310,16 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // dropping this one header is what killed DSH's compaction
                 // channel for days (see stampOpenCodeSessionOnDirect).
                 stampOpenCodeSessionOnDirect(directHeaders, target);
+                if (compactionFit !== undefined) directHeaders.delete("content-length");
                 const directInit = { ...init, headers: directHeaders };
                 state.onDispatch?.(target, "direct");
-                if (prep.outcome === "restored") {
-                    const restored = withRestoredBody(directInput, directInit, prep.body);
+                if (restoredBody !== undefined) {
+                    const restored = withRestoredBody(directInput, directInit, compactionFit !== undefined ? compactionFit.body : restoredBody);
                     return send(restored.input, restored.init);
+                }
+                if (compactionFit !== undefined) {
+                    const fitted = withRestoredBody(directInput, directInit, compactionFit.body);
+                    return send(fitted.input, fitted.init);
                 }
                 return send(directInput, directInit);
             }
@@ -1305,11 +1422,27 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // clone/buffer the body — up to 5 GiB — per degraded direct send
             // for nothing); unreadable body / body that fits once media is
             // excluded → fail open, exactly like the gate arms.
+            //
+            // Host-compaction fit (compaction-fit-oversize): the refusal above is the right
+            // answer for a NORMAL turn (the host can trim its own history, and
+            // retrying the same bytes can never work), but not for the host's
+            // compaction summarize call — there is no other way for the host to
+            // shrink anything, so refusing it leaves the session permanently
+            // oversized. That body is fitted instead (oldest turns → one
+            // marked placeholder; see compaction-fit.ts) and sent. Every other
+            // payload keeps its exact bytes and its existing refusal.
+            const restoredBody = prep.outcome === "restored" ? prep.body : undefined;
+            const compactionFit = await compactionFitFor(
+                restoredBody ?? init?.body ?? defaultInput,
+                restoredBody !== undefined ? Buffer.byteLength(restoredBody) : bodyByteSizeOf(init)?.bytes,
+                () => (restoredBody !== undefined ? Promise.resolve(restoredBody) : fitBodyTextOf(defaultInput, init)),
+            );
+            const sendPrep = compactionFit !== undefined ? { outcome: "restored" as const, body: compactionFit.body } : prep;
             const declaredWindow = declaredWindowFromHeaders(defaultInput, init) ?? state.declaredWindowForDirect?.();
             const measured = declaredWindow === undefined
                 ? undefined
-                : prep.outcome === "restored"
-                  ? { bytes: Buffer.byteLength(prep.body), raw: prep.body }
+                : sendPrep.outcome === "restored"
+                  ? { bytes: Buffer.byteLength(sendPrep.body), raw: sendPrep.body }
                   : await directSendBodyMeasure(defaultInput, init);
             const doom = measured !== undefined ? bodyProvablyOverWindow(measured.bytes, measured.raw, declaredWindow) : undefined;
             if (doom !== undefined) {
@@ -1318,7 +1451,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 logHostEvent("error", "[native-client]", `bili-native: oversized request refused locally instead of direct send — core text ~${doom.floorTokens.toLocaleString("en-US")} tok floor (${doom.coreBytes.toLocaleString("en-US")} B / 4; media ${doom.mediaBytes.toLocaleString("en-US")} B excluded, #4111) exceeds the ${doom.window.toLocaleString("en-US")} tok window: ${dispatchUrl}`);
                 return fallbackOversizeRefusal(dispatchUrl, doom, state.lastUnavailableReason);
             }
-            if (prep.outcome === "as-is") {
+            if (sendPrep.outcome === "as-is") {
                 state.onDispatch?.(dispatchUrl, "direct");
                 // Degraded hand-back (bootstrap failed / proxy died / respawn
                 // failed): the provider still needs its routing header, or the
@@ -1329,7 +1462,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
                 return resp;
             }
-            const restored = withRestoredBody(defaultInput, init, prep.body);
+            const restored = withRestoredBody(defaultInput, compactionFit !== undefined ? withoutContentLength(defaultInput, init) : init, sendPrep.body);
             state.onDispatch?.(dispatchUrl, "direct");
             const handedRestored = withHeaders(restored.input, restored.init, openCodeSessionHandbackHeaders(restored.input, restored.init, dispatchUrl));
             const resp = await send(handedRestored.input, handedRestored.init);
