@@ -77,6 +77,19 @@ export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 // only queue inside the same pass. Ranges past the cap fold through the
 // serial walk in later rounds exactly as before.
 const MAX_PREFLIGHT_SUMMARY_BATCH = 4;
+// #P3-A: minimum candidate count that makes the batched emergency fold worth
+// its extra bookkeeping. Below this the per-range walk is not the bottleneck
+// (at 1000 messages the whole preflight round is ~1.5s), so small sessions keep
+// the byte-identical legacy path. At 8650 messages a round carries 2162 units
+// and the walk spends 3 kernel projections per unit, which is the entire cost.
+const BATCH_FOLD_MIN_RANGES = 32;
+/** #P3-A test hook: force the per-range fold walk (the pre-batching path) so a
+ *  test can compare the batched commit against it block-for-block. Production
+ *  never calls this. */
+let batchFoldDisabled = false;
+export function _setBatchFoldForTest(disabled?: boolean): void {
+    batchFoldDisabled = disabled === true;
+}
 // #2952 Design A: bounded tier-distillation recovery. When raw-range folding
 // alone cannot close the window gap but distilling existing lower-tier BLOCKS
 // (T1->T2, T2->T3) can, preflight performs the distillation ITSELF — the model
@@ -2613,10 +2626,168 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 }
             }
         }
+        // #P3-A: batched emergency fold.
+        //
+        // In the deterministic-digest regime (#2383) every fold is CPU-only, so
+        // a round's whole wall clock is KERNEL PROJECTION work, not summaries.
+        // Measured at 8650 messages / 2162 units: the walk issues 3
+        // applyCompression calls per unit (walk preview -> commit preview ->
+        // apply) = 6486 calls x ~29.6ms = 192s of the 234s round, and the cost
+        // is flat in `state.blocks` (28-30ms at 50 blocks and at 2000), i.e. it
+        // is per-CALL, not per-block. A single multi-range applyCompression
+        // costs ~21ms fixed + ~5.2ms per range, so one call that projects every
+        // unit costs ~13s instead of ~64s, and the same call shape commits them
+        // for the same money: two kernel passes per ROUND instead of 3 per UNIT.
+        //
+        // Fidelity: the folds, their order, their digest inputs and the apply
+        // entry point are exactly the per-range walk's — pass 1 is the same
+        // applyCompression the walk previews with (only N ranges at once), the
+        // digests are built from that projection's own directMessageIds /
+        // directBlockIds, and pass 2 is the same applyRanges call the walk
+        // commits through (only N ranges at once). Nothing about the resulting
+        // state depends on the batching: each fold still lands as its own block,
+        // in the same order, with the same summary. Whenever the projection is
+        // not a clean 1:1 map onto the candidates (any kernel error, a block
+        // count mismatch, or a projected block that is not inside its
+        // candidate's span) the batch is abandoned BEFORE any state change and
+        // the round falls through to the unchanged per-range walk.
+        const foldEmergencyBatch = (candidates: Array<(typeof ranges)[number]>): number => {
+            if (candidates.length === 0) return 0;
+            const stateBefore = deps.session.state;
+            const bail = (why: string): number => {
+                deps.log("info", `[preflight] batched fold skipped (${why}); falling back to the per-range walk`);
+                return 0;
+            };
+            // ---- pass 1: project every candidate in ONE kernel call ----------
+            // Same placeholder convention the walk's preview uses (a summary at
+            // the configured minimum length), so length/shrink gates judge
+            // exactly as they do per range.
+            const placeholder = "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength));
+            const clockProject = Date.now();
+            const plan = deps.core.applyCompression({
+                messages,
+                state: stateBefore,
+                config: activeConfig,
+                ranges: candidates.map((candidate) => ({ startRef: candidate.startRef, endRef: candidate.endRef, summary: placeholder })),
+            });
+            if (plan.result.errors.length > 0) return bail(`projection reported ${plan.result.errors.length} error(s)`);
+            if (plan.result.blocksCreated !== candidates.length) return bail(`projection created ${plan.result.blocksCreated}/${candidates.length} block(s)`);
+            const knownBlocks = new Set(stateBefore.blocks.map((block) => block.blockId));
+            const projected = plan.state.blocks.filter((block) => !knownBlocks.has(block.blockId));
+            if (projected.length !== candidates.length) return bail(`projected ${projected.length}/${candidates.length} block(s)`);
+            const projectMs = Date.now() - clockProject;
+            const clockDigest = Date.now();
+            // ---- digest inputs, identical to the walk's ----------------------
+            const maps = refMaps(messages, stateBefore);
+            const idxById = new Map(messages.map((message, index) => [message.id, index] as const));
+            const charById = new Map<string, number>();
+            for (const message of messages) if (!charById.has(message.id)) charById.set(message.id, (message.text ?? "").length);
+            const byRaw = stateBefore?.messageRefs?.byRaw;
+            const batch: Array<{ startRef: string; endRef: string; summary: string; charMass: number }> = [];
+            for (let i = 0; i < candidates.length; i++) {
+                const range = candidates[i]!;
+                const block = projected[i]!;
+                // A digest is only valid for the span it was projected from: if
+                // the i-th new block is not inside the i-th candidate's span the
+                // 1:1 mapping assumption is broken and the batch must not run.
+                const startIdx = maps.refToIdx.get(range.startRef);
+                const endIdx = maps.refToIdx.get(range.endRef);
+                if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) return bail(`range ${range.startRef}:${range.endRef} does not resolve on the current view`);
+                const span = new Set<string>();
+                for (let k = startIdx; k <= endIdx; k++) span.add(messages[k]!.id);
+                if (block.directMessageIds.some((id) => !span.has(id))) return bail(`projected block ${i} does not belong to range ${range.startRef}:${range.endRef}`);
+                const entries: DigestEntry[] = [];
+                for (const id of block.directMessageIds) {
+                    const index = idxById.get(id);
+                    if (index === undefined) return bail(`message ${id} vanished from the current view`);
+                    const message = messages[index]!;
+                    let text = message.text ?? "";
+                    const notes = imagePlaceholdersForSummary(message, byRaw?.[message.id]);
+                    if (notes.length > 0) {
+                        const note = notes.join(" ");
+                        text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+                    }
+                    if (!text) return bail(`message ${id} rendered no text`);
+                    const label =
+                        message.contentType === "tool-call"
+                            ? `assistant tool-call ${message.toolName ?? "?"}`
+                            : message.contentType === "tool-result"
+                                ? `tool result ${message.toolName ?? "?"}`
+                                : message.contentType === "reasoning"
+                                    ? "assistant reasoning"
+                                    : message.role;
+                    entries.push({ ref: maps.idxToRef.get(index) ?? "?", label, text });
+                }
+                for (const nestedId of block.directBlockIds) {
+                    const nested = stateBefore.blocks.find((candidate) => candidate.blockId === nestedId);
+                    if (!nested) return bail(`child block ${nestedId} missing from the current state`);
+                    const label = nested.topic ? `${nested.blockId}: ${nested.topic}` : nested.blockId;
+                    entries.push({ ref: nested.blockId, label: `summarized ${label}`, text: nested.summary });
+                }
+                if (entries.length === 0) return bail(`range ${range.startRef}:${range.endRef} rendered no digest parts`);
+                let charMass = 0;
+                for (const id of block.effectiveMessageIds) charMass += charById.get(id) ?? 0;
+                const spanUnits = baselineKnown ? block.compressedTokens : charMass;
+                const summary = deterministicDigest(entries, range.startRef, range.endRef, {
+                    maxSummary: activeConfig.compress.maxSummaryLength,
+                    minSummaryLength: activeConfig.compress.minSummaryLength,
+                    shrinkBound: Math.max(activeConfig.compress.minSummaryLength, Math.floor(spanUnits / NET_SHRINK_TOLERANCE)),
+                    countText,
+                });
+                batch.push({ startRef: range.startRef, endRef: range.endRef, summary, charMass });
+            }
+            // ---- pass 2: commit every fold in ONE kernel call ----------------
+            const digestMs = Date.now() - clockDigest;
+            const clockCommit = Date.now();
+            const ctx: RewriteCtx = {
+                core: deps.core,
+                config: activeConfig,
+                messages,
+                session: deps.session,
+                lastNudge: turn.nudge,
+                log: (message) => deps.log("info", message),
+            };
+            const creditBefore = deps.session.stats.compressCreditTokens;
+            const fold = parseCompressInput({
+                content: batch.map((item) => ({
+                    startId: item.startRef,
+                    endId: item.endRef,
+                    summary: item.summary,
+                    topic: deps.compressReason === "growth" ? "preflight auto-fold (growth)" : "preflight overflow compress",
+                })),
+            });
+            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            if (applied.outcome !== "applied" && applied.outcome !== "partial") {
+                deps.log("warn", `[preflight] batched fold ${applied.outcome ?? "failed"} (${safePrefix(applied.text.replace(/^\[Compression (?:FAILED|refused)[:\s]*/, ""), 200)}); state left uncommitted, falling back to the per-range walk`);
+                return 0;
+            }
+            const committed = applied.blocksCreated ?? batch.length;
+            if (committed === 0) return bail("commit created no block");
+            // Same netting the walk does per fold, summed: the kernel's own
+            // credit for the folded mass in the token regime, the folded chars in
+            // the char regime, plus each re-entering summary once.
+            const foldedMass = baselineKnown
+                ? deps.session.stats.compressCreditTokens - creditBefore
+                : batch.reduce((total, item) => total + item.charMass, 0);
+            currentTokens = Math.max(0, currentTokens - foldedMass + batch.reduce((total, item) => total + countText(item.summary), 0));
+            deps.session.stats.lastInputTokens += batch.reduce((total, item) => total + defaultCountTokens(item.summary), 0);
+            appliedThisRound += committed;
+            result.compressedRanges += committed;
+            failure = undefined;
+            deps.log("info", `[preflight] batched fold: ${batch.length} range(s) projected + ${committed} committed in one transaction (#P3-A; 2 kernel passes instead of ${batch.length * 3}); project=${projectMs}ms digest=${digestMs}ms commit=${Date.now() - clockCommit}ms`);
+            return committed;
+        };
         // #4224: emergency digests are CPU-only (zero upstream calls), so the
         // LLM-path "one fold per round" cap wastes hundreds of rounds.
         const maxFoldsPerRound = emergencyFold ? Infinity : 1;
-        for (let oi = 0; oi < ordered.length && appliedThisRound < maxFoldsPerRound && !poolQueueDrop; oi++) {
+        let batchCommitted = false;
+        if (!batchFoldDisabled && emergencyFold && !poolQueueDrop && ordered.length >= BATCH_FOLD_MIN_RANGES) {
+            const batchCandidates = ordered.filter((candidate) => !skipSet.has(`${candidate.startRef}:${candidate.endRef}`));
+            if (batchCandidates.length >= BATCH_FOLD_MIN_RANGES) {
+                batchCommitted = foldEmergencyBatch(batchCandidates) > 0;
+            }
+        }
+        for (let oi = 0; oi < ordered.length && appliedThisRound < maxFoldsPerRound && !poolQueueDrop && !batchCommitted; oi++) {
             const range = ordered[oi];
             if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {

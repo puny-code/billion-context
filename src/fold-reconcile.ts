@@ -489,20 +489,68 @@ export function normalizedIdentityWorkCount(): number {
     return normalizedIdentityWork;
 }
 
-export function normalizedIdentity(message: CoreMessage): string {
+/** #P3-B: per-round text decomposition. `normalizeMessageText` and
+ *  `canonicalTextOf` are pure functions of ONE message's bytes, yet a single
+ *  pass asks for the same multi-KB text up to four times: the identity hash,
+ *  the #2396 no-toolCallId twin, the #2636 turn key (merged-form cores hash
+ *  their own text), and the canonical form that the positional fingerprint,
+ *  simhash and word-bag digest all share. On the measured 8650-message cold
+ *  pass that came out as 23,789 normalizations of 8,650 distinct strings —
+ *  three quarters of the pass's normalization cost was rework.
+ *
+ *  The memo is created once per `reconcileFoldCoverage` call and dropped with
+ *  it. It caches ONLY these content-addressed strings (never anything derived
+ *  from session state, never an anchor), and it is deliberately NOT carried
+ *  across passes: state changes between them, so cross-round reuse would be a
+ *  correctness hazard. */
+interface RoundText {
+    norm?: string;
+    canon?: string;
+}
+type RoundTextMemo = WeakMap<CoreMessage, RoundText>;
+
+function roundTextOf(message: CoreMessage, memo: RoundTextMemo): RoundText {
+    let entry = memo.get(message);
+    if (entry === undefined) {
+        entry = {};
+        memo.set(message, entry);
+    }
+    return entry;
+}
+
+/** normalizeMessageText(message.text), memoized for the round. */
+function normOf(message: CoreMessage, memo: RoundTextMemo | undefined): string {
+    if (memo === undefined) return normalizeMessageText(message.text);
+    const entry = roundTextOf(message, memo);
+    if (entry.norm === undefined) entry.norm = normalizeMessageText(message.text);
+    return entry.norm;
+}
+
+/** canonicalTextOf(message.text ?? ""), memoized for the round. Reuses the
+ *  normalization already computed for the identity hash whenever the text is
+ *  prose (canonicalTextOf's prose branch IS normalizeMessageText), so the
+ *  canonical form costs an O(1) prefix check instead of a second full scan. */
+function canonOf(message: CoreMessage, memo: RoundTextMemo | undefined): string {
+    if (memo === undefined) return canonicalTextOf(message.text ?? "");
+    const entry = roundTextOf(message, memo);
+    if (entry.canon === undefined) entry.canon = canonicalTextOfUsing(message.text ?? "", normOf(message, memo));
+    return entry.canon;
+}
+
+export function normalizedIdentity(message: CoreMessage, memo?: RoundTextMemo): string {
     normalizedIdentityWork++;
     const h = createHash("sha256");
-    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normalizeMessageText(message.text)}`);
+    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normOf(message, memo)}`);
     return h.digest("hex").slice(0, 16);
 }
 
 /** #2396: normalized identity with the toolCallId factor removed — pairs a
  *  message with an inbound twin carrying identical content under a rewritten
  *  tool-call id. Same work-count seam as normalizedIdentity (#2334). */
-export function normalizedIdentityNoToolCallId(message: CoreMessage): string {
+export function normalizedIdentityNoToolCallId(message: CoreMessage, memo?: RoundTextMemo): string {
     normalizedIdentityWork++;
     const h = createHash("sha256");
-    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${normalizeMessageText(message.text)}`);
+    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${normOf(message, memo)}`);
     return h.digest("hex").slice(0, 16);
 }
 
@@ -524,13 +572,17 @@ function identityWithText(message: CoreMessage, text: string): string {
  *  hosts emit a "\n"), so pairs carry a second seam-less key (p2) and the
  *  matcher probes both. Equal only when normalization collapses the
  *  difference. */
- function turnKeyOf(reasoning: string | undefined, text: string | undefined): string {
+ function turnKeyOf(reasoning: string | undefined, text: string | undefined, joinedNorm?: string): string {
     normalizedIdentityWork++;
-    const joined = reasoning !== undefined && reasoning !== "" && text !== undefined && text !== ""
-        ? `${reasoning}\n${text}`
-        : (reasoning ?? "") + (text ?? "");
+    let norm = joinedNorm;
+    if (norm === undefined) {
+        const joined = reasoning !== undefined && reasoning !== "" && text !== undefined && text !== ""
+            ? `${reasoning}\n${text}`
+            : (reasoning ?? "") + (text ?? "");
+        norm = normalizeMessageText(joined);
+    }
     const h = createHash("sha256");
-    h.update(`turn\u0000${normalizeMessageText(joined)}`);
+    h.update(`turn\u0000${norm}`);
     return h.digest("hex").slice(0, 16);
 }
 
@@ -577,7 +629,7 @@ export function extractThinkingMerge(text: string | undefined): { reasoning: str
  *  key(s) and (for split-form turns) the sibling core id. Built lazily — a
  *  steady-state pass reuses stored anchors and never pays this. */
 interface TurnCtx { p?: string; p2?: string; x?: string }
-export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
+export function turnContexts(msgs: CoreMessage[], memo?: RoundTextMemo): Map<string, TurnCtx> {
     const ctx = new Map<string, TurnCtx>();
     for (let i = 0; i < msgs.length; i++) {
         const m = msgs[i];
@@ -591,7 +643,9 @@ export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
                 ctx.set(m.id, seamless !== key ? { p: key, p2: seamless, x: next.id } : { p: key, x: next.id });
                 ctx.set(next.id, seamless !== key ? { p: key, p2: seamless, x: m.id } : { p: key, x: m.id });
             } else {
-                ctx.set(m.id, { p: turnKeyOf(m.text, undefined) });
+                // Standalone reasoning core: the turn IS its own text, so the
+                // round memo already holds its normalization.
+                ctx.set(m.id, { p: turnKeyOf(m.text, undefined, normOf(m, memo)) });
             }
         } else if (m.contentType === "text") {
             const prev = msgs[i - 1];
@@ -607,7 +661,8 @@ export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
                     const seamless = turnKeyOfSeamless(ex.reasoning, ex.text);
                     ctx.set(m.id, seamless !== key ? { p: key, p2: seamless } : { p: key });
                 } else {
-                    ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
+                    // No tag split: the joined turn text IS this core's text.
+                    ctx.set(m.id, { p: turnKeyOf(undefined, m.text, normOf(m, memo)) });
                 }
             }
         }
@@ -651,6 +706,20 @@ export function canonicalTextOf(text: string): string {
     }
 }
 
+/** canonicalTextOf with the caller's already-computed normalization (#P3-B).
+ *  Byte-identical to canonicalTextOf — the prose branch IS
+ *  normalizeMessageText(text) — but a round that hashes the same message
+ *  identity does not pay for the normalization twice. */
+function canonicalTextOfUsing(text: string, norm: string): string {
+    const t = text.trimStart();
+    if (!t.startsWith("{") && !t.startsWith("[")) return norm;
+    try {
+        return canonicalJson(JSON.parse(t));
+    } catch {
+        return norm;
+    }
+}
+
 /** Order-independent word-bag digest of a canonical text (#2915 simhash-tier
  *  edit-honesty gate): sum of per-word hashes over the lowercase alphanumeric
  *  word tokens, seeded at 1. Addition and summation are commutative, so any
@@ -666,9 +735,56 @@ export function canonicalTextOf(text: string): string {
  *  persisted `wh` anchor on first sight (mismatch = refuse, the conservative
  *  edit-honest direction; anchors re-write as sessions re-anchor). */
 export function wordBagDigest(text: string): number {
+    if (!NON_ASCII_TEXT.test(text)) return wordBagDigestAscii(text);
     let acc = 1;
     for (const m of text.toLowerCase().matchAll(/\p{L}+|\p{N}+/gu)) {
         acc = (acc + wordHash(m[0])) % 0x1fffffffffffff;
+    }
+    return acc;
+}
+
+const NON_ASCII_TEXT = /[^\x00-\x7f]/;
+const WORD_BAG_MOD = 0x1fffffffffffff;
+
+/** ASCII fast path for the word bag (#P3-B): same tokens (\p{L}+ and \p{N}+ are
+ *  exactly the ASCII letter/digit runs, kept SEPARATE), same FNV-1a per token,
+ *  same commutative sum — but one scan, no `toLowerCase()` allocation of the
+ *  whole message (ASCII lowering is folded into the hash loop), and the 2^53
+ *  modulus applied as a conditional subtract instead of a floating-point
+ *  modulo per token: `acc < MOD` and `h < 2^32 < MOD`, so `acc + h` is always
+ *  one subtraction away from the same remainder. Non-ASCII text (where
+ *  \p{L}/\p{N} and per-string lowercasing can move token boundaries) falls back
+ *  to the reference path unchanged. */
+function wordBagDigestAscii(text: string): number {
+    let acc = 1;
+    const n = text.length;
+    let i = 0;
+    while (i < n) {
+        let c = text.charCodeAt(i);
+        if (c >= 48 && c <= 57) {
+            let h = 0x811c9dc5;
+            do {
+                h ^= c;
+                h = Math.imul(h, 0x01000193) >>> 0;
+                i++;
+                c = i < n ? text.charCodeAt(i) : 0;
+            } while (c >= 48 && c <= 57);
+            const sum = acc + h;
+            acc = sum >= WORD_BAG_MOD ? sum - WORD_BAG_MOD : sum;
+        } else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+            let h = 0x811c9dc5;
+            do {
+                if (c >= 65 && c <= 90) c += 32;
+                h ^= c;
+                h = Math.imul(h, 0x01000193) >>> 0;
+                i++;
+                c = i < n ? text.charCodeAt(i) : 0;
+            } while ((c >= 65 && c <= 90) || (c >= 97 && c <= 122));
+            const sum = acc + h;
+            acc = sum >= WORD_BAG_MOD ? sum - WORD_BAG_MOD : sum;
+        } else {
+            i++;
+        }
     }
     return acc;
 }
@@ -696,7 +812,7 @@ export function positionalFingerprintWorkCount(): number {
  *  switches (#2454). This is a CONFIDENCE comparator for the positional
  *  identity layer, never an identity itself: positions pair only while their
  *  fingerprints agree, and the pairing lives in position space. */
-export function positionalFingerprint(message: CoreMessage): string {
+export function positionalFingerprint(message: CoreMessage, memo?: RoundTextMemo): string {
     positionalFingerprintWork++;
     const h = createHash("sha256");
     // #2480: reasoning items are id-carrier messages — the responses wire
@@ -715,20 +831,24 @@ export function positionalFingerprint(message: CoreMessage): string {
         h.update(`${message.role}\u0000reasoning-id-carrier\u0000`);
         return h.digest("hex").slice(0, 16);
     }
-    h.update(`${message.role}\u0000${message.toolName ?? ""}\u0000${canonicalTextOf(message.text ?? "")}`);
+    h.update(`${message.role}\u0000${message.toolName ?? ""}\u0000${canonOf(message, memo)}`);
     return h.digest("hex").slice(0, 16);
 }
 
-function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
+function anchorFrom(message: CoreMessage, ctx?: TurnCtx, memo?: RoundTextMemo): FoldAnchor {
     const t = message.toolCallId !== undefined && message.toolCallId !== "" ? message.toolCallId : undefined;
-    const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, c: message.contentType, b: message.text?.length ?? 0 };
+    const anchor: FoldAnchor = { n: normalizedIdentity(message, memo), r: message.role, c: message.contentType, b: message.text?.length ?? 0 };
     if (t !== undefined) {
         anchor.t = t;
-        anchor.m = normalizedIdentityNoToolCallId(message);
+        anchor.m = normalizedIdentityNoToolCallId(message, memo);
     }
     if (message.text !== undefined && message.text !== "" && message.contentType !== "reasoning") {
-        anchor.sh = simhashHex(canonicalTextOf(message.text));
-        anchor.wh = wordBagDigest(canonicalTextOf(message.text));
+        // #P3-B: ONE canonical projection feeds both word-evidence digests (it
+        // used to be computed twice per anchor, plus a third time for the
+        // positional fingerprint one call earlier).
+        const canon = canonOf(message, memo);
+        anchor.sh = simhashHex(canon);
+        anchor.wh = wordBagDigest(canon);
     }
     if (ctx?.p !== undefined) anchor.p = ctx.p;
     if (ctx?.p2 !== undefined) anchor.p2 = ctx.p2;
@@ -815,7 +935,11 @@ export function planReconciliation(
     msgs: CoreMessage[],
     covered: Set<string>,
     positions?: { ids: string[]; canon: string[] },
+    /** #P3-B: round-scoped text memo, shared with the caller's anchor seed so
+     *  the canonical/normalized form of one message is derived once. */
+    memoIn?: RoundTextMemo,
 ): ReconciliationPlan {
+    const memo: RoundTextMemo = memoIn ?? new WeakMap();
     const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0, byShape: 0, absentEverywhere: [], nearDupResidual: [] };
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
@@ -851,7 +975,7 @@ export function planReconciliation(
         newOrder.push(m.id);
         byId.set(m.id, m);
         const priorCanon = canonById.get(m.id);
-        canon.push(priorCanon !== undefined ? priorCanon : positionalFingerprint(m));
+        canon.push(priorCanon !== undefined ? priorCanon : positionalFingerprint(m, memo));
     }
     plan.newOrder = newOrder;
     plan.nextCanon = canon;
@@ -1038,7 +1162,7 @@ export function planReconciliation(
             if (claimedCandidates.has(cand.id)) continue;
             const t = cand.message.toolCallId;
             if (t === undefined || t === "") continue;
-            const nt = normalizedIdentityNoToolCallId(cand.message);
+            const nt = normalizedIdentityNoToolCallId(cand.message, memo);
             const b = twinBuckets.get(nt);
             if (b === undefined) twinBuckets.set(nt, { k: 0, ids: [cand.id], messages: [cand.message] });
             else { b.ids.push(cand.id); b.messages.push(cand.message); }
@@ -1072,7 +1196,7 @@ export function planReconciliation(
     const normGroups = new Map<string, { ids: string[]; anchors: FoldAnchor[] }>();
     for (const cand of candidates) {
         if (claimedCandidates.has(cand.id)) continue;
-        const norm = cand.norm ?? (cand.norm = normalizedIdentity(cand.message));
+        const norm = cand.norm ?? (cand.norm = normalizedIdentity(cand.message, memo));
         const g = normGroups.get(norm);
         if (g === undefined) normGroups.set(norm, { ids: [cand.id], anchors: [] });
         else g.ids.push(cand.id);
@@ -1116,7 +1240,7 @@ export function planReconciliation(
                 // #3301: a merged-form core stands in for the whole turn —
                 // register the raw full-text key AND the extracted pair key(s)
                 // so anchors seeded from either wire form match.
-                const keys = new Set<string>([turnKeyOf(undefined, cand.message.text)]);
+                const keys = new Set<string>([turnKeyOf(undefined, cand.message.text, normOf(cand.message, memo))]);
                 const ex = extractThinkingMerge(cand.message.text);
                 if (ex !== null) {
                     keys.add(turnKeyOf(ex.reasoning, ex.text));
@@ -1139,7 +1263,7 @@ export function planReconciliation(
                 } else {
                     // thinking-only turn kept in same-model shape: the reasoning
                     // core IS the whole turn (mirrors turnContexts' isolated case).
-                    const key = turnKeyOf(cand.message.text, undefined);
+                    const key = turnKeyOf(cand.message.text, undefined, normOf(cand.message, memo));
                     const bucket = singleTurnKeys.get(key);
                     if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
                     else bucket.push(cand.id);
@@ -1318,7 +1442,7 @@ export function planReconciliation(
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
             // (a) simhash corroboration
             if (anchor.sh !== undefined) {
-                const sketch = simhashHex(canonicalTextOf(message.text ?? ""));
+                const sketch = simhashHex(canonOf(message, memo));
                 if (hammingHex(anchor.sh, sketch) >= 0 && hammingHex(anchor.sh, sketch) <= GAP_SIMHASH_MAX_HAMMING) {
                     // Edit-honesty gate (#2480/#1908/#1921): the sketch says
                     // "near-duplicate", but near is not equal — a one-word
@@ -1327,7 +1451,7 @@ export function planReconciliation(
                     // the fold. Only word-preserving churn (reorder, bracket/
                     // whitespace/template punctuation re-stamps) may claim;
                     // any prose change falls through to honest re-entry.
-                    if (anchor.wh === undefined || anchor.wh === wordBagDigest(canonicalTextOf(message.text ?? ""))) {
+                    if (anchor.wh === undefined || anchor.wh === wordBagDigest(canonOf(message, memo))) {
                         plan.claims.set(gap.oldId, [gap.newId]);
                         claimedCandidates.add(gap.newId);
                         plan.bySim++;
@@ -1373,9 +1497,9 @@ export function planReconciliation(
             if (anchor.r !== undefined && anchor.r !== m.role) return false;
             const len = m.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) return false;
-            const wh = wordBagDigest(canonicalTextOf(m.text ?? ""));
+            const wh = wordBagDigest(canonOf(m, memo));
             if (wh !== anchor.wh) return false;
-            const dist = hammingHex(anchor.sh, simhashHex(canonicalTextOf(m.text ?? "")));
+            const dist = hammingHex(anchor.sh, simhashHex(canonOf(m, memo)));
             return dist >= 0 && dist <= GAP_SIMHASH_MAX_HAMMING;
         };
         // prose pairing — order-preserving: walk anchors in conversation
@@ -1489,8 +1613,8 @@ export function planReconciliation(
                 && (anchor.r === undefined || anchor.r === c.message.role)
                 && (
                     (anchor.wh !== undefined && anchor.sh !== undefined
-                        && wordBagDigest(canonicalTextOf(c.message.text ?? "")) === anchor.wh
-                        && (() => { const d = hammingHex(anchor.sh!, simhashHex(canonicalTextOf(c.message.text ?? ""))); return d >= 0 && d <= GAP_SIMHASH_MAX_HAMMING; })())
+                        && wordBagDigest(canonOf(c.message, memo)) === anchor.wh
+                        && (() => { const d = hammingHex(anchor.sh!, simhashHex(canonOf(c.message, memo))); return d >= 0 && d <= GAP_SIMHASH_MAX_HAMMING; })())
                 ));
             // textless anchors (no sh/wh — image cells, #3588) carry NO
             // evidence channel: claimable families were already claimed by
@@ -1516,7 +1640,7 @@ export function planReconciliation(
             if (claimedCandidates.has(cand.id)) continue;
             const t = cand.message.toolCallId;
             if (t === undefined || t === "") continue;
-            const nt = normalizedIdentityNoToolCallId(cand.message);
+            const nt = normalizedIdentityNoToolCallId(cand.message, memo);
             const bucket = noToolWitnesses.get(nt);
             if (bucket === undefined) noToolWitnesses.set(nt, [t]);
             else bucket.push(t);
@@ -1653,6 +1777,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
 
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
+    // #P3-B: round-scoped text memo — created here, dropped on return. The plan
+    // and the anchor seed below read the SAME messages, so the two biggest
+    // per-message scans (normalized identity + canonical projection) are paid
+    // once instead of three times.
+    const memo: RoundTextMemo = new WeakMap();
     // #3301: a wire-shape flip puts legacy (pre-#2644, no p/x) ids off the wire
     // on the FIRST post-flip pass — and this same pass rolls the order backbone
     // forward without them, so any backfill landing later can never claim (the
@@ -1663,14 +1792,14 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     if (opts.storedMessages !== undefined && opts.storedMessages.length > 0) {
         const sById = new Map<string, CoreMessage>();
         for (const m of opts.storedMessages) if (m.id !== undefined) sById.set(m.id, m);
-        const sCtx = turnContexts(opts.storedMessages);
+        const sCtx = turnContexts(opts.storedMessages, memo);
         let changed = false;
         const upgraded: Record<string, FoldAnchor> = {};
         for (const [id, a] of Object.entries(anchors)) {
             if (a.p === undefined && a.r === "assistant" && a.t === undefined && !byId.has(id)) {
                 const sm = sById.get(id);
                 if (sm !== undefined) {
-                    upgraded[id] = anchorFrom(sm, sCtx.get(id));
+                    upgraded[id] = anchorFrom(sm, sCtx.get(id), memo);
                     changed = true;
                     continue;
                 }
@@ -1680,7 +1809,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         if (changed) anchors = upgraded;
     }
 
-    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions, memo);
     if (plan.pass0Desync) {
         loggerLog("warn", `[fold-reconcile] Pass 0 disabled: stored positional copy desynced from order backbone (session=${session.id}, copyIds=${positions?.ids.length ?? -1}, backbone=${oldOrder.length})`);
     }
@@ -1702,7 +1831,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // nothing, every pass.
     let turnCtx: Map<string, TurnCtx> | undefined;
     const ctxOf = (id: string): TurnCtx | undefined => {
-        if (turnCtx === undefined) turnCtx = turnContexts(msgs);
+        if (turnCtx === undefined) turnCtx = turnContexts(msgs, memo);
         return turnCtx.get(id);
     };
     const turnCtxFor = (message: CoreMessage | undefined): TurnCtx | undefined =>
@@ -1736,7 +1865,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 const message = byId.get(nid);
                 if (message === undefined) continue;
                 if (anchorCount < MAX_ANCHORS) {
-                    nextAnchors[nid] = anchorFrom(message, turnCtxFor(message));
+                    nextAnchors[nid] = anchorFrom(message, turnCtxFor(message), memo);
                     anchorCount++;
                 } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
                     nextAnchors[nid] = liteToolAnchorFrom(message);
@@ -1766,7 +1895,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // same identity fields, so recomputing from live bytes is exact).
             if (prior.t !== undefined && prior.m === undefined) {
                 const message = byId.get(id);
-                nextAnchors[id] = message !== undefined ? anchorFrom(message) : prior;
+                nextAnchors[id] = message !== undefined ? anchorFrom(message, undefined, memo) : prior;
             } else if (prior.p === undefined && prior.r === "assistant" && prior.t === undefined) {
                 // #2636: anchor persisted before turn keys existed: backfill
                 // p/x while the bytes are still on the wire (same-id ⇒ same
@@ -1777,7 +1906,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 // steady shape — rebuilding them every pass would break the
                 // #2334 zero-work steady-state contract.
                 const message = byId.get(id);
-                nextAnchors[id] = message !== undefined ? anchorFrom(message, ctxOf(id)) : prior;
+                nextAnchors[id] = message !== undefined ? anchorFrom(message, ctxOf(id), memo) : prior;
             } else if (prior.c === undefined) {
                 // #2732 review supplement: anchors persisted before FoldAnchor.c
                 // existed carry no content-type class and would stay classified
@@ -1787,7 +1916,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 // from live bytes once (same-id ⇒ same identity fields incl.
                 // contentType), then steady-state reuse resumes.
                 const message = byId.get(id);
-                nextAnchors[id] = message !== undefined ? anchorFrom(message, turnCtxFor(message)) : prior;
+                nextAnchors[id] = message !== undefined ? anchorFrom(message, turnCtxFor(message), memo) : prior;
             } else {
                 nextAnchors[id] = prior;
             }
@@ -1797,7 +1926,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         const message = byId.get(id);
         if (message !== undefined) {
             if (anchorCount < MAX_ANCHORS) {
-                nextAnchors[id] = anchorFrom(message, turnCtxFor(message));
+                nextAnchors[id] = anchorFrom(message, turnCtxFor(message), memo);
                 anchorCount++;
             } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
                 nextAnchors[id] = liteToolAnchorFrom(message);
