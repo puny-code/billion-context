@@ -83,6 +83,47 @@ const MAX_PREFLIGHT_SUMMARY_BATCH = 4;
 // the byte-identical legacy path. At 8650 messages a round carries 2162 units
 // and the walk spends 3 kernel projections per unit, which is the entire cost.
 const BATCH_FOLD_MIN_RANGES = 32;
+// #P3-A4: how many ranges one fold CHUNK carries. Chunking exists so the fold
+// pass can hand the poll phase back between chunks instead of holding the single
+// thread for the whole round (health probe / first-byte watchdog / other
+// connections queue behind a non-yielding stretch).
+//
+// Sizing is ADAPTIVE because the per-range cost moves by an order of magnitude
+// between code states and hosts (measured 15ms/range on the pre-P3 kernel and
+// ~1ms/range once applyCompression shares its projection context), while each
+// chunk also pays a fixed per-call overhead. A fixed size is therefore either
+// too coarse on a slow host or needlessly expensive on a fast one. Each chunk
+// re-targets the next one multiplicatively, which converges on the size whose
+// wall time matches the budget (fixed overhead included): K' = K × target/chunk.
+//
+// Knobs (both optional):
+//   BILI_PREFLIGHT_FOLD_CHUNK_RANGES = n   fixed size, adaptation off (tests/debug)
+//   BILI_PREFLIGHT_FOLD_CHUNK_MS     = ms  per-chunk wall budget (default 1200)
+//
+// Measured at 8650 messages / 2162 units (20ms timer running alongside, quiet
+// host): without chunking the fold is ONE uninterrupted stretch — 38s before the
+// batch optimisation, 1.6-2.0s after the kernel/stream projection work landed.
+// With the default budget the same fold commits in ~6 chunks, longest
+// uninterrupted stretch 0.73s, total 2.9s (the ~1s delta is the per-call
+// projection-context rebuild each chunk pays — the price of breathing). On the
+// pre-optimisation kernel the controller simply picks smaller chunks and holds
+// the same ~1s bound.
+const DEFAULT_FOLD_CHUNK_RANGES = 24;
+const FOLD_CHUNK_MIN_RANGES = 16;
+const FOLD_CHUNK_MAX_RANGES = 512;
+const DEFAULT_FOLD_CHUNK_TARGET_MS = 1200;
+/** Fixed chunk size, or undefined for adaptive sizing. */
+function foldChunkFixedLimit(): number | undefined {
+    const raw = Number(process.env.BILI_PREFLIGHT_FOLD_CHUNK_RANGES);
+    if (!Number.isFinite(raw) || raw <= 0) return undefined;
+    return Math.min(100_000, Math.max(1, Math.floor(raw)));
+}
+/** Soft wall-clock budget for one chunk when sizing adaptively. */
+function foldChunkTargetMs(): number {
+    const raw = Number(process.env.BILI_PREFLIGHT_FOLD_CHUNK_MS);
+    if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_FOLD_CHUNK_TARGET_MS;
+    return Math.min(60_000, Math.max(50, Math.floor(raw)));
+}
 /** #P3-A test hook: force the per-range fold walk (the pre-batching path) so a
  *  test can compare the batched commit against it block-for-block. Production
  *  never calls this. */
@@ -2651,13 +2692,41 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // count mismatch, or a projected block that is not inside its
         // candidate's span) the batch is abandoned BEFORE any state change and
         // the round falls through to the unchanged per-range walk.
-        const foldEmergencyBatch = (candidates: Array<(typeof ranges)[number]>): number => {
-            if (candidates.length === 0) return 0;
+        // #P3-A4: the batch is run in CHUNKS with a real event-loop yield between
+        // them. Each (project, commit) pair above is one synchronous stretch that
+        // holds the single JS thread; at 8650 messages the whole candidate set is
+        // ~25-32s of it, and while it runs the health probe, the 30s first-byte
+        // watchdog and every other connection's callbacks queue behind it — the
+        // "resident looks dead" shape of the 2026-11-06 incident. Chunking bounds
+        // that stretch to one chunk and gives the poll phase a turn in between.
+        //
+        // Transaction boundary = ONE CHUNK. A chunk is exactly one multi-range
+        // applyCompression plus one multi-range applyRanges, so it is
+        // all-or-nothing by construction (the kernel clones its state and
+        // applyRanges refuses without committing). Chunks are disjoint and
+        // ordered, so folding them in sequence lands the same blocks, in the same
+        // order, with the same digests as one big batch — asserted byte-for-byte
+        // by the state fingerprint in tests/preflight-chunk-fold.test.ts (K=1,
+        // K=3, a non-dividing count, and chunks-vs-whole-batch).
+        //
+        // Failure policy — PREFIX-PRESERVING, the conservative option: a chunk
+        // that fails leaves the session exactly at the PREVIOUS chunk's boundary
+        // (nothing of the failed chunk lands — no partial chunk is possible), the
+        // already-committed chunks are KEPT, and the round falls through to the
+        // unchanged per-range walk for the remainder. Chunk 0 failing is therefore
+        // precisely the old whole-round fallback: zero state change. Keeping the
+        // prefix is safe because every kept block is a complete, independently
+        // valid fold that the walk itself would have committed at that same
+        // position — the state is never a prefix of a fold, only a prefix of the
+        // FOLD LIST, and each entry in that list is a self-contained transaction.
+        // The alternative (rewinding a failed chunk) would have to un-commit
+        // session.state, gzip-style stats, credit accounting and the folded-original
+        // content cache by hand — more moving parts, more ways to lose data, for no
+        // gain: the walk re-does the remainder either way.
+        const commitEmergencyChunk = (candidates: Array<(typeof ranges)[number]>): { committed: number; projectMs: number; digestMs: number; commitMs: number; bail?: string } => {
             const stateBefore = deps.session.state;
-            const bail = (why: string): number => {
-                deps.log("info", `[preflight] batched fold skipped (${why}); falling back to the per-range walk`);
-                return 0;
-            };
+            // Reason-only: the driver owns the log line so it can name the chunk.
+            const bail = (why: string): { committed: number; projectMs: number; digestMs: number; commitMs: number; bail?: string } => ({ committed: 0, projectMs: 0, digestMs: 0, commitMs: 0, bail: why });
             // ---- pass 1: project every candidate in ONE kernel call ----------
             // Same placeholder convention the walk's preview uses (a summary at
             // the configured minimum length), so length/shrink gates judge
@@ -2757,9 +2826,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 })),
             });
             const applied = applyRanges(fold, ctx, { loopTracking: false });
+            const commitMs = Date.now() - clockCommit;
             if (applied.outcome !== "applied" && applied.outcome !== "partial") {
-                deps.log("warn", `[preflight] batched fold ${applied.outcome ?? "failed"} (${safePrefix(applied.text.replace(/^\[Compression (?:FAILED|refused)[:\s]*/, ""), 200)}); state left uncommitted, falling back to the per-range walk`);
-                return 0;
+                // applyRanges refuses WITHOUT committing (kernel clone + pre-commit
+                // gates), so the session is still exactly at this chunk's boundary.
+                return bail(`commit ${applied.outcome ?? "failed"} (${safePrefix(applied.text.replace(/^\[Compression (?:FAILED|refused)[:\s]*/, ""), 200)})`);
             }
             const committed = applied.blocksCreated ?? batch.length;
             if (committed === 0) return bail("commit created no block");
@@ -2774,8 +2845,62 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             appliedThisRound += committed;
             result.compressedRanges += committed;
             failure = undefined;
-            deps.log("info", `[preflight] batched fold: ${batch.length} range(s) projected + ${committed} committed in one transaction (#P3-A; 2 kernel passes instead of ${batch.length * 3}); project=${projectMs}ms digest=${digestMs}ms commit=${Date.now() - clockCommit}ms`);
-            return committed;
+            return { committed, projectMs, digestMs, commitMs };
+        };
+        // #P3-A4 driver: run the chunks back-to-back, yielding to the poll phase
+        // between them. Returns whether the WHOLE candidate set folded — a partial
+        // run hands the remainder to the per-range walk below (see the failure
+        // policy note above).
+        const foldEmergencyChunks = async (candidates: Array<(typeof ranges)[number]>): Promise<{ committed: number; complete: boolean }> => {
+            const fixedSize = foldChunkFixedLimit();
+            const targetMs = foldChunkTargetMs();
+            let chunkSize = fixedSize ?? Math.min(DEFAULT_FOLD_CHUNK_RANGES, FOLD_CHUNK_MAX_RANGES);
+            const committedKeys: string[] = [];
+            const sizes: number[] = [];
+            let committedTotal = 0;
+            let projectMs = 0;
+            let digestMs = 0;
+            let commitMs = 0;
+            let slowestChunkMs = 0;
+            let chunksRun = 0;
+            const stopEarly = (why: string, nextIndex: number): { committed: number; complete: boolean } => {
+                // Keep the finished chunks out of the walk's way (it would only
+                // re-preview them and note "already compressed"); everything from
+                // nextIndex on is the walk's job, exactly as it was at HEAD.
+                for (const key of committedKeys) skipSet.add(key);
+                deps.log("warn", `[preflight] batched fold stopped at chunk ${chunksRun}/${Math.ceil(candidates.length / chunkSize)} (${why}); ${committedTotal} range(s) from ${chunksRun - 1} completed chunk(s) stay committed, the remaining ${candidates.length - nextIndex} range(s) go through the per-range walk`);
+                return { committed: committedTotal, complete: false };
+            };
+            let start = 0;
+            while (start < candidates.length) {
+                const size = Math.min(chunkSize, candidates.length - start);
+                const chunk = candidates.slice(start, start + size);
+                chunksRun += 1;
+                sizes.push(size);
+                const clockChunk = Date.now();
+                const outcome = commitEmergencyChunk(chunk);
+                const chunkMs = Date.now() - clockChunk;
+                projectMs += outcome.projectMs;
+                digestMs += outcome.digestMs;
+                commitMs += outcome.commitMs;
+                slowestChunkMs = Math.max(slowestChunkMs, chunkMs);
+                if (outcome.bail !== undefined) return stopEarly(outcome.bail, start);
+                committedTotal += outcome.committed;
+                for (const range of chunk) committedKeys.push(`${range.startRef}:${range.endRef}`);
+                start += size;
+                if (start >= candidates.length) break;
+                // Re-target the next chunk (only when the whole intended size was
+                // used — a short tail says nothing about the per-range cost).
+                if (fixedSize === undefined && size === chunkSize) {
+                    const ratio = (targetMs * 0.8) / Math.max(1, chunkMs);
+                    chunkSize = Math.max(FOLD_CHUNK_MIN_RANGES, Math.min(FOLD_CHUNK_MAX_RANGES, Math.round(size * ratio)));
+                }
+                // Hand the poll phase back: this is the whole point of chunking.
+                await yieldToEventLoop();
+                if (deps.signal?.aborted) return stopEarly("client aborted mid-fold", start);
+            }
+            deps.log("info", `[preflight] batched fold: ${committedTotal} range(s) committed in ${chunksRun} chunk(s) (sizes ${sizes.slice(0, 6).join(",")}${sizes.length > 6 ? ",…" : ""}; ${fixedSize === undefined ? `adaptive, target ${targetMs}ms` : "fixed"}, yielding the event loop between chunks; project=${projectMs}ms digest=${digestMs}ms commit=${commitMs}ms slowest-chunk=${slowestChunkMs}ms)`);
+            return { committed: committedTotal, complete: true };
         };
         // #4224: emergency digests are CPU-only (zero upstream calls), so the
         // LLM-path "one fold per round" cap wastes hundreds of rounds.
@@ -2784,7 +2909,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (!batchFoldDisabled && emergencyFold && !poolQueueDrop && ordered.length >= BATCH_FOLD_MIN_RANGES) {
             const batchCandidates = ordered.filter((candidate) => !skipSet.has(`${candidate.startRef}:${candidate.endRef}`));
             if (batchCandidates.length >= BATCH_FOLD_MIN_RANGES) {
-                batchCommitted = foldEmergencyBatch(batchCandidates) > 0;
+                const folded = await foldEmergencyChunks(batchCandidates);
+                // Only a COMPLETE batch suppresses the walk; a partial one leaves
+                // the remainder to it (with the finished chunks pre-skipped).
+                batchCommitted = folded.complete && folded.committed > 0;
             }
         }
         for (let oi = 0; oi < ordered.length && appliedThisRound < maxFoldsPerRound && !poolQueueDrop && !batchCommitted; oi++) {

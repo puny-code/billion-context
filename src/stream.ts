@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
-import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
+import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
@@ -87,6 +87,56 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
  *  order ranges by position when picking the fold point (#189 observability). */
 function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
+}
+
+/** #3307 forensic helper: `prefixTokensBeforeRef` for every ref of a fold batch
+ *  in ONE pass. The imported helper rescans the whole `byRef` map per call
+ *  (`O(|byRef|)`), so the fold-attribution log line paid 2162 × 8650 refNum()
+ *  regex calls — 5.7s measured on the batched preflight fold at the 27.3MiB
+ *  scale. Same two state fields, same arithmetic (token counts are the integer
+ *  numbers renderWithSnapshot records, and an integer sum is order-independent),
+ *  so every returned value is identical; equivalence against the imported
+ *  function is pinned by tests/stream-applyranges-linear.test.ts. */
+function prefixTokenOffsets(session: Session, refs: readonly string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    const byRef = session.state?.messageRefs?.byRef;
+    const snap = session.state?.tokenSnapshot;
+    if (!byRef || !snap) {
+        for (const r of refs) out.set(r, 0);
+        return out;
+    }
+    const entries: Array<[number, number]> = [];
+    for (const key of Object.keys(byRef)) entries.push([refNum(key), snap[key] ?? 0]);
+    entries.sort((a, b) => a[0] - b[0]);
+    const cum: number[] = new Array(entries.length);
+    let acc = 0;
+    for (let i = 0; i < entries.length; i++) {
+        acc += entries[i]![1];
+        cum[i] = acc;
+    }
+    for (const ref of refs) {
+        const q = refNum(ref);
+        if (q === 0) {
+            out.set(ref, 0);
+            continue;
+        }
+        // count of refs strictly before q (spansOverlap has no ties problem here:
+        // the original test is refNum(key) < refNum(ref))
+        let a = 0;
+        let b = entries.length - 1;
+        let idx = 0;
+        while (a <= b) {
+            const mid = (a + b) >> 1;
+            if (entries[mid]![0] < q) {
+                idx = mid + 1;
+                a = mid + 1;
+            } else {
+                b = mid - 1;
+            }
+        }
+        out.set(ref, idx === 0 ? 0 : cum[idx - 1]!);
+    }
+    return out;
 }
 
 /** #1026: recovery hint appended to failed-compress receipts — the raw-ref
@@ -560,12 +610,53 @@ function spanNum(ref: string): number {
     const n = Number(ref.replace(/\D/g, ""));
     return Number.isFinite(n) ? n : 0;
 }
-function spansOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
-    const aLo = Math.min(spanNum(aStart), spanNum(aEnd));
-    const aHi = Math.max(spanNum(aStart), spanNum(aEnd));
-    const bLo = Math.min(spanNum(bStart), spanNum(bEnd));
-    const bHi = Math.max(spanNum(bStart), spanNum(bEnd));
-    return aLo <= bHi && bLo <= aHi;
+/** Numeric [lo, hi] bounds of one range — the exact operands spansOverlap
+ *  derives from its refs (min/max of spanNum over the two endpoints). */
+function spanBounds(startRef: string, endRef: string): { lo: number; hi: number } {
+    const a = spanNum(startRef);
+    const b = spanNum(endRef);
+    return a <= b ? { lo: a, hi: b } : { lo: b, hi: a };
+}
+
+/** Exact O((|base| + |submitted|) log |submitted|) restatement of
+ *  `base.filter((r) => !submitted.some((s) => spansOverlap(r…, s…)))`.
+ *  [aLo,aHi] overlaps some [bLo,bHi] iff a submitted span has bLo <= aHi AND
+ *  bHi >= aLo, so sorting the submitted spans by bLo and prefix-maxing bHi
+ *  answers each query with one binary search instead of a linear `.some` walk.
+ *  The nested form was |base| × |submitted| spanNum() calls (each a regex
+ *  `replace`) — 2162 × 2162 = 4.7M pairs on the batched preflight fold, where
+ *  it measured 3.2s; this form is order-identical and returns the same array. */
+function subtractSubmittedSpans<T extends { startRef: string; endRef: string }, S extends { startRef: string; endRef: string }>(base: T[], submitted: S[]): T[] {
+    if (submitted.length === 0) return base.filter(() => true);
+    const subs = submitted.map((s) => spanBounds(s.startRef, s.endRef));
+    subs.sort((a, b) => (a.lo - b.lo) || (a.hi - b.hi));
+    const maxHi: number[] = new Array(subs.length);
+    let running = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < subs.length; i++) {
+        const hi = subs[i]!.hi;
+        if (hi > running) running = hi;
+        maxHi[i] = running;
+    }
+    const overlapsSome = (lo: number, hi: number): boolean => {
+        // last index whose submitted lo <= this range's hi
+        let a = 0;
+        let b = subs.length - 1;
+        let idx = -1;
+        while (a <= b) {
+            const mid = (a + b) >> 1;
+            if (subs[mid]!.lo <= hi) {
+                idx = mid;
+                a = mid + 1;
+            } else {
+                b = mid - 1;
+            }
+        }
+        return idx >= 0 && maxHi[idx]! >= lo;
+    };
+    return base.filter((r) => {
+        const { lo, hi } = spanBounds(r.startRef, r.endRef);
+        return !overlapsSome(lo, hi);
+    });
 }
 
 function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Array<{ startRef: string; endRef: string }>): string {
@@ -620,7 +711,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // ("compressed 2 of 3 -> show the 1"). Only when ALL offered folded does the
     // stop signal fire below. Ranges not in the pre-fold offer never appear here.
     const remaining = ctx.lastNudge
-        ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
+        ? subtractSubmittedSpans(base, submitted)
         : base;
     if (remaining.length > 0) {
         return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
@@ -1066,6 +1157,47 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 return compressResult(receipt, "refused", 0, "gate:coverage-regression");
             }
         }
+        // P3-A3: message-id index for THIS applyRanges call only. Both the
+        // image-note lookup below and the block-content cache use
+        // id → message lookups that were written as whole-array scans
+        // (`view.find`, and collectBlockContent's internal `messages.filter`)
+        // — O(blocks × |messages|) = 2162 × 8650 on the batched 27.3MiB fold.
+        // The index is rebuilt from the live array on every call and is never
+        // stored on the session/ctx, so per-round state mutation can't stale it.
+        const messageIndexCache = new Map<CoreMessage[], { byId: Map<string, CoreMessage[]>; pos: Map<CoreMessage, number> }>();
+        const messageIndex = (arr: CoreMessage[]): { byId: Map<string, CoreMessage[]>; pos: Map<CoreMessage, number> } => {
+            const hit = messageIndexCache.get(arr);
+            if (hit !== undefined) return hit;
+            const byId = new Map<string, CoreMessage[]>();
+            const pos = new Map<CoreMessage, number>();
+            for (let i = 0; i < arr.length; i++) {
+                const m = arr[i]!;
+                pos.set(m, i);
+                const bucket = byId.get(m.id);
+                if (bucket === undefined) byId.set(m.id, [m]);
+                else bucket.push(m);
+            }
+            const idx = { byId, pos };
+            messageIndexCache.set(arr, idx);
+            return idx;
+        };
+        // The exact subsequence `messages.filter((m) => targetIds.has(m.id))`
+        // would yield: every entry whose id the block covers, in source order
+        // (duplicate ids keep every occurrence, like the filter does).
+        const narrowToBlockIds = (ids: readonly string[], arr: CoreMessage[]): CoreMessage[] => {
+            const idx = messageIndex(arr);
+            const seen = new Set<string>();
+            const picked: CoreMessage[] = [];
+            for (const id of ids) {
+                if (seen.has(id)) continue;
+                seen.add(id);
+                const bucket = idx.byId.get(id);
+                if (bucket === undefined) continue;
+                for (const m of bucket) picked.push(m);
+            }
+            if (picked.length > 1) picked.sort((a, b) => (idx.pos.get(a) ?? 0) - (idx.pos.get(b) ?? 0));
+            return picked;
+        };
         // #2748: host-side image notes append a ref-carrying footer to a new
         // block's summary AFTER the kernel's length validation — count that
         // wrapped mass in the net-benefit decision too. Moved above the commit
@@ -1073,12 +1205,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // old post-commit honesty note, just evaluated before the state lands).
         {
             const view = ctx.compressMessages ?? ctx.messages;
+            const viewIndex = messageIndex(view);
             const byRaw = res.state.messageRefs?.byRaw;
             for (const b of res.state.blocks) {
                 if (beforeIds.has(b.blockId)) continue;
                 const notes: string[] = [];
                 for (const id of b.directMessageIds) {
-                    const m = view.find((msg) => msg.id === id);
+                    // find() semantics: the FIRST occurrence in source order.
+                    const m = viewIndex.byId.get(id)?.[0];
                     if (!m) continue;
                     notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
                 }
@@ -1151,8 +1285,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const contentSource = ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages);
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
-            const full = collectBlockContent(res.state, b, contentSource, { full: true });
-            const one = collectBlockContent(res.state, b, contentSource, { full: false });
+            // Hand the collector only the messages this block can match: its
+            // return value depends on nothing else in the array (see
+            // narrowToBlockIds), and the full-array scan was O(blocks × n).
+            const blockMessages = narrowToBlockIds(b.effectiveMessageIds, contentSource);
+            const full = collectBlockContent(res.state, b, blockMessages, { full: true });
+            const one = collectBlockContent(res.state, b, blockMessages, { full: false });
             if (full.count > 0 || one.count > 0) {
                 const sameView = one.text === full.text && one.count === full.count;
                 cacheBlockContent(ctx.session, b.blockId, {
@@ -1344,7 +1482,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // same-space view tokens (V/Vp) so one capture separates unit-scale from view
         // identity as the inflation source.
         if (newFoldBlocks.length > 0) {
-            const xs = newFoldBlocks.map((b) => (b.startRef ? `${b.startRef}=${prefixTokensBeforeRef(ctx.session, b.startRef)}` : `${b.blockId}=none`)).join(" ");
+            // P3-A3: one prefix-summed pass for every block's startRef instead
+            // of one whole-map rescan per block (see prefixTokenOffsets).
+            const xByRef = prefixTokenOffsets(ctx.session, newFoldBlocks.flatMap((b) => (b.startRef ? [b.startRef] : [])));
+            const xs = newFoldBlocks.map((b) => (b.startRef ? `${b.startRef}=${xByRef.get(b.startRef) ?? 0}` : `${b.blockId}=none`)).join(" ");
             ctx.log(`[acp-compress-obs] fold-attribution X(firstFoldStartTokens)=${xs} · V=${viewTokens} Vraw=${rawViewTokens} Vp=${postCtx} (#3307)`);
         }
         recordCacheFoldsFromBlocks(ctx.session, newFoldBlocks, { V: viewTokens, Vp: postCtx });

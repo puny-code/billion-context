@@ -131,12 +131,12 @@ async function runPreflight(n: number, opts: RunOptions, onSession?: (session: S
  *   - block.createdAt / durationMs are wall-clock,
  *   - nextRunId and block.runId identify the compress TRANSACTIONS a state went
  *     through. The per-range walk commits N one-range transactions (run ids
- *     r1…rN, nextRunId = N+1); the batch commits ONE N-range transaction, exactly
- *     like a model submitting a single multi-range compress call — which is the
- *     shape the kernel's run id is defined for. Nothing reads a run id for a
- *     decision (kernel/src/compress.ts only assigns it; src/ only persists it
- *     through), so this is provenance, not state. The test asserts the exact
- *     relationship for both paths below instead of hiding it.
+ *     r1…rN, nextRunId = N+1); the batched path commits one transaction per
+ *     CHUNK (#P3-A4), like a model submitting one multi-range compress call per
+ *     batch — which is the shape the kernel's run id is defined for. Nothing
+ *     reads a run id for a decision (kernel/src/compress.ts only assigns it; src/
+ *     only persists it through), so this is provenance, not state. The test
+ *     asserts the exact relationship for both paths below instead of hiding it.
  *  Every other field — block ids, nextBlockId, coverage, summaries, tiers, token
  *  counts, ref maps — must match byte for byte, and that is what this checks. */
 function stateFingerprint(session: Session): string {
@@ -198,11 +198,19 @@ test("#P3-A: batched emergency fold commits the SAME state as the per-range walk
         assert.equal(batchedBlocks[i]!.topic, serialBlocks[i]!.topic, `block ${i}: same topic`);
         assert.equal(batchedBlocks[i]!.active, serialBlocks[i]!.active, `block ${i}: same active flag`);
     }
-    // Transaction shape: the walk commits one run per fold, the batch one run for
-    // the whole pass (the documented meaning of runId — see stateFingerprint).
-    assert.equal(new Set(batchedBlocks.map((block) => block.runId)).size, 1, "the batch is ONE compress transaction");
+    // Transaction shape: the walk commits one transaction per fold; the batched
+    // path commits one per CHUNK (#P3-A4 chunked the batch and yields between
+    // chunks), so it uses FEWER transactions than the walk but more than the
+    // single one it used before chunking. Run ids are therefore scheduling, not
+    // semantics — the state fingerprint above normalises them (see
+    // stateFingerprint) and every block-level field still has to match.
+    const batchedTransactions = new Set(batchedBlocks.map((block) => block.runId)).size;
+    assert.ok(
+        batchedTransactions >= 1 && batchedTransactions < serialBlocks.length,
+        `the batch commits per chunk, not per fold (got ${batchedTransactions} transactions for ${batchedBlocks.length} folds)`,
+    );
     assert.equal(new Set(serialBlocks.map((block) => block.runId)).size, serialBlocks.length, "the walk commits one transaction per fold");
-    assert.equal(batched.session.state.nextRunId, 2, "the batch consumed exactly one run id");
+    assert.equal(batched.session.state.nextRunId, batchedTransactions + 1, "the batch consumed one run id per chunk");
     assert.equal(serial.session.state.nextRunId, serialBlocks.length + 1, "the walk consumed one run id per fold");
     assert.equal(batched.session.state.nextBlockId, serial.session.state.nextBlockId, "same block-id high-water mark");
 

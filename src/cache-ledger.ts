@@ -356,19 +356,56 @@ function round1(n: number): number {
     return Math.round(n * 10) / 10;
 }
 
+/** One-pass prefix-token index over the live ref map. Refs are assigned in
+ *  message order and never reused (kernel contract), so numeric order IS view
+ *  order: X(ref) = the sum of first-render token counts of every ref
+ *  chronologically before `ref`. Build cost is one O(n log n) pass; each query
+ *  is then a binary search instead of a full map rescan.
+ *
+ *  Batch callers (recordCacheFoldsFromBlocks) build ONE index per call — the
+ *  per-ref `prefixTokensBeforeRef` rescan made a 2162-block fold pay
+ *  2162 × |byRef| (≈4.8s measured on the 27.3MiB preflight fold). The index is
+ *  only ever a local of the calling batch: nothing is cached across calls or
+ *  rounds, so a state mutation between calls can never serve a stale offset. */
+function prefixTokenIndex(session: Session): (ref: string) => number {
+    const byRef = session.state?.messageRefs?.byRef;
+    const snap = session.state?.tokenSnapshot;
+    if (!byRef || !snap) return () => 0;
+    const entries: Array<[number, number]> = [];
+    for (const key of Object.keys(byRef)) entries.push([refNum(key), snap[key] ?? 0]);
+    entries.sort((a, b) => a[0] - b[0]);
+    const cum: number[] = new Array(entries.length);
+    let acc = 0;
+    for (let i = 0; i < entries.length; i++) {
+        acc += entries[i]![1];
+        cum[i] = acc;
+    }
+    return (ref: string): number => {
+        const q = refNum(ref);
+        if (q === 0) return 0;
+        // number of refs strictly before q (the original test is refNum(key) < refNum(ref))
+        let lo = 0;
+        let hi = entries.length - 1;
+        let idx = 0;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (entries[mid]![0] < q) {
+                idx = mid + 1;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return idx === 0 ? 0 : cum[idx - 1]!;
+    };
+}
+
 /** Token offset of the view prefix that survives a fold starting at `ref`:
  *  sum of first-render token counts of all refs chronologically before it.
  *  Refs are assigned in message order and never reused (kernel contract),
  *  so numeric order IS view order. */
 export function prefixTokensBeforeRef(session: Session, ref: string): number {
-    const byRef = session.state?.messageRefs?.byRef;
-    const snap = session.state?.tokenSnapshot;
-    if (!byRef || !snap || refNum(ref) === 0) return 0;
-    let n = 0;
-    for (const key of Object.keys(byRef)) {
-        if (refNum(key) < refNum(ref)) n += snap[key] ?? 0;
-    }
-    return n;
+    return prefixTokenIndex(session)(ref);
 }
 
 /** #1592-family seam forensics: where two consecutive outbound bodies first
@@ -1220,14 +1257,21 @@ function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "
 export function recordCacheFoldsFromBlocks(session: Session, blocks: CompressionBlock[], geo?: { V?: number; Vp?: number }): void {
     if (blocks.length === 0) return;
     const led = getCacheLedger(session);
+    // P3-A5: the prefix index is built ONCE for this batch (first block that
+    // actually needs an X) instead of rescanning the whole ref map per block.
+    // Lazy so a batch whose blocks are all below the high-water mark pays
+    // nothing, exactly like before. Local to this call — never memoized on the
+    // session, so a later state mutation cannot serve a stale offset.
+    let prefixOf: ((ref: string) => number) | null = null;
     for (const b of blocks) {
         const id = refNum(b.blockId);
         if (id <= led.lastBlockId) continue;
+        if (b.startRef && prefixOf === null) prefixOf = prefixTokenIndex(session);
         pushFold(led, {
             at: b.createdAt || Date.now(),
             S: b.compressedTokens,
             sigma: Math.ceil(b.summary.length / 4),
-            X: b.startRef ? prefixTokensBeforeRef(session, b.startRef) : undefined,
+            X: b.startRef ? prefixOf!(b.startRef) : undefined,
             V: geo?.V,
             Vp: geo?.Vp,
             bid: b.blockId,

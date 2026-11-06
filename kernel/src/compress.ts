@@ -37,7 +37,12 @@ import {
   isMessageProtectedWithPairing,
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  projectUnit,
+  collectCoverage,
+  createProjectionContext,
+} from "./unit-projection.js";
+import type { UnitProjectionContext } from "./unit-projection.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -328,6 +333,23 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
     const preExistingCoverage = collectCoverage(state);
 
+    // ONE projection context for the whole batch. Its expensive layer (id
+    // index, id→message map, protected-tool facts, turn groups, media verdicts)
+    // is a pure function of (input.messages, config) and `input.messages` is
+    // never mutated by this function — so rebuilding it per range was pure
+    // waste, and it dominates a multi-range apply (measured ~21ms fixed +
+    // ~5.2ms/range at 8650 messages). Its STATE layer (active blocks, block
+    // lookups, live checkpoint carriers) holds NO cache: every access reads the
+    // live block list of `state`, so the ranges below may keep appending,
+    // deactivating and refolding blocks without invalidating this context.
+    // What WOULD invalidate it (and makes projectUnit rebuild instead) is a
+    // different message array, a different state object, or a different config.
+    const projectionContext = createProjectionContext(
+      input.messages,
+      state,
+      input.config,
+    );
+
     // Classify every requested range ONCE. The result feeds overlap
     // skipSpecs, the minCompressRange pre-check, and the per-range loop —
     // previously each re-resolved and silently swallowed failures, so
@@ -345,6 +367,8 @@ export function createCore(ports: Ports = {}): CompressionCore {
           endRef: spec.endRef,
           messages: input.messages,
           state,
+          // Same map resolveBoundaries would build, built once per batch.
+          indexByMessageId: projectionContext.indexByMessageId,
         });
         classifications.set(spec, { status: "ok", resolved });
       } catch (error) {
@@ -491,7 +515,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
         }
         countedRanges++;
         for (const id of resolution.resolved.messageIds) {
-          const msg = input.messages.find((m) => m.id === id);
+          const msg = projectionContext.messageById.get(id);
           totalRangeChars += msg?.text?.length ?? 0;
         }
       }
@@ -730,6 +754,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           protectedMessageIds,
           countTokens,
           preExistingCoverage,
+          context: projectionContext,
         });
         blocksCreated += outcome.refolded ? outcome.refolded.length : 1;
         tokensCompressed += outcome.tokens;
@@ -1477,6 +1502,11 @@ interface SingleRangeInput {
   protectedMessageIds?: Set<string>;
   countTokens: (text: string) => number;
   preExistingCoverage: Set<string>;
+  /** Projection context shared by all ranges of one apply batch; bound to the
+   *  same `messages` and `state` objects. Safe to keep across ranges even
+   *  though they mutate `state.blocks`: the context caches nothing derived
+   *  from state. */
+  context: UnitProjectionContext;
 }
 
 interface SingleRangeOutcome {
@@ -1501,6 +1531,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     preExistingCoverage: input.preExistingCoverage,
     protectedMessageIds: input.protectedMessageIds,
     warnings,
+    context: input.context,
   });
   if (projection.fatal) throw projection.fatal.error;
   const {
@@ -1558,7 +1589,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
 
   let compressedTokens = 0;
   for (const id of filteredIds) {
-    const message = input.messages.find((entry) => entry.id === id);
+    const message = input.context.messageById.get(id);
     compressedTokens += message
       ? countMessageTokens(message, input.countTokens)
       : 0;
@@ -1575,7 +1606,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   // block. The claim is recorded only when it is EXACT — see
   // resolveCoverageInterval.
   const interval = resolveCoverageInterval(
-    filteredIds.map((id) => input.messages.find((entry) => entry.id === id)),
+    filteredIds.map((id) => input.context.messageById.get(id)),
     consumedBlockIds.map((id) => blockById(input.state, id)),
   );
   const block: CompressionBlock = {

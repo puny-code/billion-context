@@ -1,4 +1,4 @@
-import { activeBlocks } from "./state.js";
+import { activeBlocks, blockById } from "./state.js";
 import {
   resolveBoundaries,
   blockVisibleInRange,
@@ -104,11 +104,28 @@ export interface UnitProjection {
   isBlockBoundary: boolean;
 }
 
-/** Per-call (i.e. per TURN) derived facts shared by every candidate range the
- *  screening pass projects. Everything here is a pure function of the
- *  `(messages, state, config)` triple, which does not change while a single
- *  turn is screened — so building it once is behavior-preserving. It is
- *  deliberately NOT cached across turns: messages and state do change there. */
+/** Per-call derived facts shared by every candidate range a caller projects.
+ *
+ *  The context is split in two layers with very different invalidation rules:
+ *
+ *  - the MESSAGES layer (`indexByMessageId`, `messageById`, `carrierCandidates`,
+ *    `protectedFold`, `pairByCallId`, `integrity`, media verdicts) is a pure
+ *    function of the message array + config. Rebuilding it costs O(messages) —
+ *    exactly the fixed per-call cost this context exists to remove — so a
+ *    caller projecting MANY ranges over ONE array builds it once.
+ *  - the STATE layer (`activeBlocks()`, `blockById`, `liveCarrierIds()`) reads
+ *    `state.blocks`. It is deliberately **never cached**: every access reads
+ *    the live block list through the bound `state`, so a caller that mutates
+ *    `state.blocks` between projections (the apply path appends a block,
+ *    deactivates consumed blocks and refolds blocks in place) can keep sharing
+ *    one context — its next projection sees the mutated state by construction.
+ *    Per-call memoization inside a single projection is the caller's job, and
+ *    projectUnit does exactly that for the one array it reuses within a call.
+ *
+ *  Invalidation is therefore narrow and fully checked at projectUnit entry: the
+ *  context is reused only while `messages`, `state` (object identity — content
+ *  mutations are fine, see above) and `config` are the very same objects; any
+ *  other binding is rebuilt. Nothing survives a turn. */
 export interface UnitProjectionContext {
   readonly messages: CoreMessage[];
   readonly state: CompressionState;
@@ -118,12 +135,15 @@ export interface UnitProjectionContext {
   /** id → FIRST message with that id — the `messages.find(m => m.id === id)`
    *  contract this module used everywhere. */
   readonly messageById: Map<string, CoreMessage>;
-  readonly activeBlockList: CompressionBlock[];
-  /** blockId → the FIRST block with that id (blockById's contract). */
+  /** active blocks of the bound state, read LIVE on every call. */
+  activeBlocks(): readonly CompressionBlock[];
+  /** blockId → the FIRST block with that id (blockById's contract), read LIVE
+   *  from the bound state so a state mutation between projections can never go
+   *  stale. */
   blockById(blockId: string): CompressionBlock | undefined;
   /** memoized hasUnrecoverableMediaPayload */
   mediaUnrecoverable(message: CoreMessage): boolean;
-  /** ids of live host checkpoint carriers (#335) — plain-range screen only. */
+  /** ids of live host checkpoint carriers (#335), read live from state. */
   liveCarrierIds(): ReadonlySet<string>;
   /** memoized filterProtectedToolMessages inputs */
   protectedFold(): ProtectedFoldIndex;
@@ -150,40 +170,44 @@ export interface ProtectedFoldIndex {
   isLatestProtected(message: CoreMessage): boolean;
 }
 
-/** Build the per-turn context for `messages` / `state` / `config`. O(messages)
- *  up front, with everything expensive built lazily on first use so callers
- *  that never reach a branch (block-boundary ranges, no protected hits) pay
- *  nothing for it. */
-export function createProjectionContext(
+/** The MESSAGES layer of a projection context: everything that depends only on
+ *  `(messages, config)`. Expensive (O(messages)), immutable for the life of the
+ *  array, and therefore shared by every state binding of one apply batch. */
+interface ProjectionSeed {
+  messages: CoreMessage[];
+  config: Config;
+  indexByMessageId: Map<string, number>;
+  messageById: Map<string, CoreMessage>;
+  /** messages that DECLARE a checkpoint carrier — the only ones that can ever
+   *  be live carriers, so the per-state scan stays proportional to them. */
+  carrierCandidates: CoreMessage[];
+  mediaUnrecoverable(message: CoreMessage): boolean;
+  protectedFold(): ProtectedFoldIndex;
+  pairByCallId(): ReadonlyMap<string, [string, string]>;
+  integrity(): IntegrityIndex;
+}
+
+function buildProjectionSeed(
   messages: CoreMessage[],
-  state: CompressionState,
   config: Config,
-): UnitProjectionContext {
+): ProjectionSeed {
   const indexByMessageId = buildIndexByMessageId(messages);
   const messageById = new Map<string, CoreMessage>();
+  const carrierCandidates: CoreMessage[] = [];
   for (const message of messages) {
     if (!messageById.has(message.id)) messageById.set(message.id, message);
-  }
-  const activeBlockList = activeBlocks(state);
-  const blockByIdInContext = new Map<string, CompressionBlock>();
-  for (const block of state.blocks) {
-    if (!blockByIdInContext.has(block.blockId)) {
-      blockByIdInContext.set(block.blockId, block);
-    }
+    if (message.summaryOfBlockId !== undefined) carrierCandidates.push(message);
   }
   const mediaByMessage = new Map<CoreMessage, boolean>();
-  let liveCarriers: Set<string> | undefined;
   let protectedFoldIndex: ProtectedFoldIndex | undefined;
   let pairIndex: Map<string, [string, string]> | undefined;
   let integrityIndex: IntegrityIndex | undefined;
   return {
     messages,
-    state,
     config,
     indexByMessageId,
     messageById,
-    activeBlockList,
-    blockById: (blockId) => blockByIdInContext.get(blockId),
+    carrierCandidates,
     mediaUnrecoverable(message) {
       let verdict = mediaByMessage.get(message);
       if (verdict === undefined) {
@@ -191,24 +215,6 @@ export function createProjectionContext(
         mediaByMessage.set(message, verdict);
       }
       return verdict;
-    },
-    liveCarrierIds() {
-      if (liveCarriers === undefined) {
-        liveCarriers = new Set<string>();
-        for (const message of messages) {
-          // Exact same predicate the selector/apply pair must share (#2663);
-          // resolved through the cached block table because blockById is a
-          // linear scan of every block.
-          const carrierOf = message.summaryOfBlockId;
-          if (
-            carrierOf !== undefined &&
-            blockByIdInContext.get(carrierOf)?.active === true
-          ) {
-            liveCarriers.add(message.id);
-          }
-        }
-      }
-      return liveCarriers;
     },
     protectedFold() {
       if (protectedFoldIndex === undefined) {
@@ -242,6 +248,72 @@ export function createProjectionContext(
       return integrityIndex;
     },
   };
+}
+
+/** Bind the (cheap, potentially per-range) STATE layer of a context. Nothing is
+ *  computed eagerly: block-derived data is read from `state` when projectUnit
+ *  actually needs it, which is what makes rebinding after a state mutation free
+ *  and impossible to leave stale. */
+function bindProjectionState(
+  seed: ProjectionSeed,
+  state: CompressionState,
+): UnitProjectionContext {
+  return {
+    messages: seed.messages,
+    state,
+    config: seed.config,
+    indexByMessageId: seed.indexByMessageId,
+    messageById: seed.messageById,
+    // No caching: the apply path mutates state.blocks in place between
+    // projections, and an unbounded cache keyed by nothing is exactly the
+    // staleness bug this design avoids. projectUnit memoizes per INVOCATION
+    // when it needs the same block list twice.
+    activeBlocks: () => activeBlocks(state),
+    // Linear scan, exactly like the state module's own blockById: projectUnit
+    // looks up only a handful of block ids per range, while an eager block
+    // table would cost O(blocks) on every projection.
+    blockById: (blockId) => blockById(state, blockId),
+    mediaUnrecoverable: (message) => seed.mediaUnrecoverable(message),
+    liveCarrierIds() {
+      if (seed.carrierCandidates.length === 0) {
+        // No message declares a carrier: nothing can be one. This is the
+        // common case and keeps the cost at zero.
+        return EMPTY_ID_SET;
+      }
+      const liveCarriers = new Set<string>();
+      for (const message of seed.carrierCandidates) {
+        // Exact same predicate the selector/apply pair must share (#2663).
+        const carrierOf = message.summaryOfBlockId;
+        if (
+          carrierOf !== undefined &&
+          blockById(state, carrierOf)?.active === true
+        ) {
+          liveCarriers.add(message.id);
+        }
+      }
+      return liveCarriers;
+    },
+    protectedFold: () => seed.protectedFold(),
+    pairByCallId: () => seed.pairByCallId(),
+    integrity: () => seed.integrity(),
+  };
+}
+
+/** Build the projection context for `messages` / `state` / `config`.
+ *
+ *  The O(messages) layer is built here (lazily for the expensive parts, so a
+ *  caller that never reaches them pays nothing); the state layer is a set of
+ *  live reads and costs nothing up front. Two callers exist:
+ *   - `screenRecommendedUnits` (recommend.ts) builds ONE per screening pass.
+ *   - `applyCompression` (compress.ts) builds ONE per batch and shares it with
+ *     every range — safe even though apply mutates `state.blocks`, because the
+ *     state layer is never cached (see the interface docs). */
+export function createProjectionContext(
+  messages: CoreMessage[],
+  state: CompressionState,
+  config: Config,
+): UnitProjectionContext {
+  return bindProjectionState(buildProjectionSeed(messages, config), state);
 }
 
 function buildProtectedFoldIndex(
@@ -303,16 +375,33 @@ function buildProtectedFoldIndex(
 export function projectUnit(input: UnitProjectionInput): UnitProjection {
   const warnings = input.warnings ?? [];
   // Every per-turn derived structure read below (id index, protected-tool
-  // facts, turn groups, pair maps) is a pure function of (messages, state,
-  // config) — all FIXED across the candidate ranges of one screening pass.
-  // projectUnit therefore accepts an optional caller-owned context so the
-  // per-range work stays proportional to the range instead of to the log.
-  // The identity check keeps the parameter safe: a context built for a
-  // different array class is ignored and rebuilt, never silently mis-indexed.
+  // facts, turn groups, pair maps) is a pure function of (messages, config) —
+  // FIXED across the candidate ranges of one screening pass or one apply
+  // batch. projectUnit therefore accepts an optional caller-owned context so
+  // the per-range work stays proportional to the range instead of to the log.
+  // The identity checks keep the parameter safe: a context built for a
+  // different message array, bound to a different state OBJECT, or built for a
+  // different config is ignored and rebuilt, never silently mis-used. In-place
+  // mutations of `state` (blocks appended / deactivated / refolded) need no
+  // check at all: the context caches nothing derived from state. The one thing
+  // identity alone would miss is an in-place edit of the MESSAGE array, so its
+  // length is compared too (O(1); catches push/splice/pop). No kernel path
+  // mutates message contents between projections — a caller that ever does must
+  // discard the context instead of reusing it.
   const ctx =
-    input.context !== undefined && input.context.messages === input.messages
+    input.context !== undefined &&
+    input.context.messages === input.messages &&
+    input.context.messages.length === input.messages.length &&
+    input.context.state === input.state &&
+    input.context.config === input.config
       ? input.context
       : createProjectionContext(input.messages, input.state, input.config);
+  // One projection never mutates state, so the live block list is safe to
+  // memoize for the duration of THIS call (it is read at most twice: the
+  // nested-block rescan and the merge path).
+  let activeBlocksInCall: readonly CompressionBlock[] | undefined;
+  const activeBlocksNow = (): readonly CompressionBlock[] =>
+    (activeBlocksInCall ??= ctx.activeBlocks());
   // Declared up front: every exit path (including the zone fatal below)
   // assembles the result through finish(), which reads these bindings.
   let withdrawnIds = new Set<string>();
@@ -369,7 +458,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           resolved.endIndex)
         : resolved.endIndex;
     const nestedSeen = new Set(resolved.nestedBlockIds);
-    for (const block of ctx.activeBlockList) {
+    for (const block of activeBlocksNow()) {
       if (nestedSeen.has(block.blockId)) continue;
       if (
         blockVisibleInRange(block, indexByMessageId, adjustedStart, adjustedEnd)
@@ -556,7 +645,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     let survivingCoverage = new Set<string>();
     if (isMerge) {
       const consumedSet = new Set(consumedBlockIds);
-      for (const block of ctx.activeBlockList) {
+      for (const block of activeBlocksNow()) {
         const target = consumedSet.has(block.blockId)
           ? consumedCoverage
           : survivingCoverage;
