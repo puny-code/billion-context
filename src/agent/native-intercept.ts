@@ -15,7 +15,8 @@ import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
-import { COMPACTION_FIT_TRIGGER_RATIO, planCompactionFit, type CompactionFitPlan } from "./compaction-fit.js";
+import { COMPACTION_FIT_RETRY_LIMIT, COMPACTION_FIT_TRIGGER_RATIO, planCompactionFit, type CompactionFitPlan } from "./compaction-fit.js";
+import { maskUrlForLog } from "../log-mask.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
  *  host's #1117 semantics (raw URL → direct, routed URL → passthrough);
@@ -1141,6 +1142,123 @@ export function withRestoredBody(input: string | URL | Request, init: RequestIni
     return { input, init: { ...(init ?? {}), body } };
 }
 
+/** Host-compaction fit (compaction-fit-retry): does this provider answer say
+ *  the body was too large? Providers disagree on wording, so the check is the
+ *  4xx status plus the vocabulary every observed relay used — "Input too
+ *  long", "context limit", "maximum context length", "too many tokens",
+ *  "request_too_large". A 4xx we cannot read (opaque stream, empty body) is
+ *  also treated as size-unknown, never as success — the caller keeps the
+ *  response it already received. */
+function looksLikeOversizeRejection(status: number, text: string): boolean {
+    if (status !== 400 && status !== 413 && status !== 422) return false;
+    if (text.length === 0) return true;
+    return /input too long|context limit|context length|context window|too many tokens|request_too_large|prompt is too long|maximum context|exceeds the maximum|too large/i.test(text);
+}
+
+/** Pull the provider's own token count out of a rejection, when it states one.
+ *  DSH's local adapter reports `model limit 1048576 tokens, requested
+ *  1972866 tokens`; other relays phrase it as `prompt is too long: 213462
+ *  tokens > 200000 maximum`. A stated number is the ground truth for the next
+ *  attempt (scaled down a little for the tokenizer gap). */
+function statedTokenCount(text: string): number | undefined {
+    const matches = [...text.matchAll(/(\d{4,})\s*tokens?/gi)].map((m) => Number(m[1])).filter((n) => Number.isFinite(n) && n > 0);
+    if (matches.length === 0) return undefined;
+    // The largest number in the message is the request size in every phrasing
+    // observed; the smaller one is the limit.
+    return Math.max(...matches);
+}
+
+/** Re-cut an already-fitted compaction body so the estimate lands under
+ *  `targetTokens`. Fail-open: undefined means "keep what you have". */
+function refitCompactionBody(original: string, plan: CompactionFitPlan, targetTokens: number): CompactionFitPlan | undefined {
+    try {
+        return planCompactionFit(original, plan.window, targetTokens);
+    } catch {
+        return undefined;
+    }
+}
+
+/** Host-compaction fit (compaction-fit-retry): send a fitted compaction body,
+ *  observe what came back, and re-cut when the provider still calls it too
+ *  large.
+ *
+ *  Why a retry at all: the fit can only measure BYTES. A real tokenizer costs
+ *  3-4× more per byte on CJK prose and base64 media than `bytes / 4` assumes,
+ *  so a body the estimate calls "in budget" can still be rejected — exactly
+ *  what happened live on 2026-11-06 (27.4 MB replayed, fitted to an estimated
+ *  830,806 tok, provider answered `Input too long`, trace 883bb424…). Rather
+ *  than pinning a per-model tokenizer table (which is what the previous two
+ *  attempts got wrong), this halves the target per rejection: two retries
+ *  reach a quarter of the first attempt, enough for the observed 3.48× gap.
+ *
+ *  Every attempt is logged with the bytes actually put on the wire and the
+ *  masked host, so the next failure is readable from bili.log alone instead of
+ *  reconstructed from the host's transcripts. */
+async function sendFittedCompaction(
+    send: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+    target: string,
+    build: (body: string) => { input: string | URL | Request; init: RequestInit | undefined },
+    /** The body BEFORE fitting — the thing a re-cut has to start from. Absent
+     *  (the caller could not keep it) means no retry is possible: a fit of a
+     *  fit would stack placeholders instead of re-cutting the original. */
+    original: string | undefined,
+    plan: CompactionFitPlan,
+): Promise<Response> {
+    const dispatch = async (body: string): Promise<Response> => {
+        const next = build(body);
+        return await send(next.input, next.init);
+    };
+    const describe = (level: "info" | "warn" | "error", status: number | string, extra: string): void => {
+        logHostEvent(level, "[native-client]", `[compaction-fit] hand-back → ${maskUrlForLog(target)}, ${Buffer.byteLength(current.body).toLocaleString("en-US")} B, dropped ${current.droppedMessages.toLocaleString("en-US")}/${(current.droppedMessages + current.keptMessages).toLocaleString("en-US")} msg, est ~${current.fittedTokens.toLocaleString("en-US")} tok against a ${current.budget.toLocaleString("en-US")} tok ceiling — ${extra}: ${status}`);
+    };
+    let current = plan;
+    let response = await dispatch(current.body);
+    for (let attempt = 0; ; attempt += 1) {
+        const status = response.status;
+        const retriesLeft = original !== undefined && attempt < COMPACTION_FIT_RETRY_LIMIT;
+        if (status < 400) {
+            describe("info", String(status), attempt === 0 ? "accepted" : `accepted after ${attempt} re-cut(s)`);
+            return response;
+        }
+        let text = "";
+        try {
+            text = (await response.clone().text()).slice(0, 4096);
+        } catch {
+            text = "";
+        }
+        if (!looksLikeOversizeRejection(status, text)) {
+            describe("warn", String(status), "not a size rejection, this fit cannot fix it — keeping the response as-is");
+            return response;
+        }
+        if (!retriesLeft) {
+            describe("error", String(status), original === undefined
+                ? "still too large and the pre-fit body is gone, so no re-cut is possible"
+                : `still too large after ${attempt} re-cut(s) — giving up rather than looping`);
+            return response;
+        }
+        // A stated request size beats a blind halving: the provider is telling
+        // us exactly how much IT counted.
+        const stated = statedTokenCount(text);
+        const half = Math.max(1, Math.floor(current.budget / 2));
+        const nextTarget = stated === undefined ? half : Math.max(1, Math.min(half, Math.floor(stated * 0.75)));
+        const next = refitCompactionBody(original, current, nextTarget);
+        if (next === undefined) {
+            describe("error", `${status}${stated === undefined ? "" : ` (provider counted ${stated.toLocaleString("en-US")} tok)`}`, "still too large but no narrower cut fits");
+            return response;
+        }
+        // A re-cut that removes nothing is not a retry: the body is already down
+        // to the kept tail (one huge early message can be the WHOLE excess), so
+        // re-sending the same bytes would only burn a round trip.
+        if (next.fittedBytes >= current.fittedBytes) {
+            describe("error", `${status}${stated === undefined ? "" : ` (provider counted ${stated.toLocaleString("en-US")} tok)`}`, "still too large but nothing cuttable is left — the kept tail alone is over the limit");
+            return response;
+        }
+        logHostEvent("warn", "[native-client]", `[compaction-fit] upstream answered ${status}${stated === undefined ? "" : ` (provider counted ${stated.toLocaleString("en-US")} tok)`} — re-cutting attempt ${attempt + 1}/${COMPACTION_FIT_RETRY_LIMIT}: ceiling ${current.budget.toLocaleString("en-US")} → ${next.budget.toLocaleString("en-US")} tok, dropping ${next.droppedMessages.toLocaleString("en-US")} earlier message(s)`);
+        current = next;
+        response = await dispatch(current.body);
+    }
+}
+
 /** Re-point the process-level live-state slot at the activating instance and
  *  advance its generation, so every transport (fetch + Codex Responses WS)
  *  follows the newest applied module instance (#3394/#3558). Called at the TOP
@@ -1235,7 +1353,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // provably cannot fit the window. Everything else — small compaction
         // calls included — keeps its exact bytes.
         const fitFloorBytes = Math.ceil(MIN_ASSUMED_WINDOW_TOKENS * COMPACTION_FIT_TRIGGER_RATIO) * 4;
-        let compactionFitCache: { source: unknown; plan: CompactionFitPlan | undefined } | undefined;
+        let compactionFitCache: { source: unknown; plan: CompactionFitPlan | undefined; text: string | undefined } | undefined;
         let compactionFitLogged = false;
         const compactionFitFor = async (
             source: unknown,
@@ -1251,6 +1369,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             const cached = compactionFitCache;
             if (cached !== undefined && cached.source === source) return cached.plan;
             let plan: CompactionFitPlan | undefined;
+            let body: string | undefined;
             const declared = declaredWindowFromHeaders(input, init) ?? state.declaredWindowForDirect?.();
             // #4079 distrusts windows BELOW MIN_ASSUMED_WINDOW_TOKENS, but a
             // host-compaction body is the ONE request that replays the whole
@@ -1266,15 +1385,14 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             const declaredUsable = Number.isFinite(declared) && (declared as number) > 0;
             const fitWindow = declaredUsable ? Math.max(declared as number, MIN_ASSUMED_WINDOW_TOKENS) : undefined;
             if (fitWindow !== undefined) {
-                let text: string | undefined;
                 try {
-                    text = await read();
+                    body = await read();
                 } catch {
-                    text = undefined;
+                    body = undefined;
                 }
-                plan = text === undefined ? undefined : planCompactionFit(text, fitWindow);
+                plan = body === undefined ? undefined : planCompactionFit(body, fitWindow);
             }
-            compactionFitCache = { source, plan };
+            compactionFitCache = { source, plan, text: body };
             if (plan !== undefined && !compactionFitLogged) {
                 compactionFitLogged = true;
                 logHostEvent("warn", "[native-client]", `[compaction-fit] host compaction request ~${plan.originalTokens.toLocaleString("en-US")} tok (${plan.originalBytes.toLocaleString("en-US")} B) provably exceeds the ${plan.budget.toLocaleString("en-US")} tok input budget (${plan.window.toLocaleString("en-US")} window − ${(plan.window - plan.budget).toLocaleString("en-US")} reply reserve) — replacing ${plan.droppedMessages.toLocaleString("en-US")} earlier message(s) with one marked placeholder before the direct send (~${plan.fittedTokens.toLocaleString("en-US")} tok, compaction-fit-oversize)`);
@@ -1318,8 +1436,13 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     return send(restored.input, restored.init);
                 }
                 if (compactionFit !== undefined) {
-                    const fitted = withRestoredBody(directInput, directInit, compactionFit.body);
-                    return send(fitted.input, fitted.init);
+                    return await sendFittedCompaction(
+                        send,
+                        target,
+                        (body) => withRestoredBody(directInput, directInit, body),
+                        compactionFitCache?.text,
+                        compactionFit,
+                    );
                 }
                 return send(directInput, directInit);
             }
@@ -1464,12 +1587,27 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             }
             const restored = withRestoredBody(defaultInput, compactionFit !== undefined ? withoutContentLength(defaultInput, init) : init, sendPrep.body);
             state.onDispatch?.(dispatchUrl, "direct");
+            if (compactionFit !== undefined) {
+                // compaction-fit-retry: bytes are not tokens, so the first fit
+                // can still be rejected as too large. Re-cut on that answer.
+                const resp = await sendFittedCompaction(
+                    send,
+                    dispatchUrl,
+                    (body) => {
+                        const restoredForBody = withRestoredBody(defaultInput, withoutContentLength(defaultInput, init), body);
+                        return withHeaders(restoredForBody.input, restoredForBody.init, openCodeSessionHandbackHeaders(restoredForBody.input, restoredForBody.init, dispatchUrl));
+                    },
+                    compactionFitCache?.text,
+                    compactionFit,
+                );
+                if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
+                return resp;
+            }
             const handedRestored = withHeaders(restored.input, restored.init, openCodeSessionHandbackHeaders(restored.input, restored.init, dispatchUrl));
             const resp = await send(handedRestored.input, handedRestored.init);
             if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
             return resp;
         };
-
         // Already-routed `/bili/` model requests (launcher settings overlay):
         // routing is done, but plugin headers still decide wire vs plugin
         // mode — stamp and pass through untouched otherwise.

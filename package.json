@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "A context-compression plugin — small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality — for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "icon": "./assets/icon.svg",

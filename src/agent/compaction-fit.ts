@@ -60,6 +60,13 @@ export const COMPACTION_FIT_TARGET_RATIO = 0.8;
  *  on every other lane (reserve `min(max output, 25% of window)`). */
 export const COMPACTION_FIT_OUTPUT_RESERVE_PCT = 0.25;
 
+/** How many times a hand-back may re-cut an already-fitted compaction body
+ *  after the provider rejected it for size. Each retry halves the target, so
+ *  two attempts reach a quarter of the first one — enough to absorb the 3-4×
+ *  gap between `bytes / 4` and a real tokenizer on CJK/base64-heavy replays
+ *  without a retry storm. */
+export const COMPACTION_FIT_RETRY_LIMIT = 2;
+
 export type CompactionWireProtocol = "anthropic" | "openai" | "responses";
 
 /** The replacement body plus the numbers the caller logs (and tests pin). */
@@ -79,7 +86,8 @@ export interface CompactionFitPlan {
     originalTokens: number;
     fittedTokens: number;
     window: number;
-    /** Input ceiling actually used: `window` minus the reply allowance. */
+    /** Input ceiling actually used: `window` minus the reply allowance, or the
+     *  narrower retry target when the caller re-cut after a rejection. */
     budget: number;
     /** The marker text (also the placeholder message's content). */
     placeholder: string;
@@ -293,7 +301,17 @@ function protocolOf(parsed: unknown): { protocol: CompactionWireProtocol; field:
  * Returns undefined when no fit is needed or none can be built safely — the
  * caller then leaves the request exactly as the host sent it.
  */
-export function planCompactionFit(raw: string, declaredWindow: number | undefined): CompactionFitPlan | undefined {
+export function planCompactionFit(
+    raw: string,
+    declaredWindow: number | undefined,
+    /** compaction-fit-retry: an ABSOLUTE input ceiling for this attempt, in the
+     *  same `bytes / 4` unit the fit itself works in. The provider still
+     *  rejected a body the estimate called in-budget (the wire's tokenizer is
+     *  not ours: CJK and base64 cost 3-4× what `bytes / 4` assumes), so the
+     *  caller narrows the target and re-cuts rather than guessing a tokenizer.
+     *  Absent = the ordinary window-minus-reply target. */
+    targetTokens?: number,
+): CompactionFitPlan | undefined {
     if (declaredWindow === undefined || !Number.isFinite(declaredWindow) || declaredWindow <= 0) return undefined;
     const window = Math.floor(declaredWindow);
     const originalBytes = Buffer.byteLength(raw);
@@ -326,7 +344,13 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
     const reserveCeiling = Math.floor(window * COMPACTION_FIT_OUTPUT_RESERVE_PCT);
     const reserved = Math.min(declaredOutputTokens(parsed) ?? reserveCeiling, reserveCeiling);
     const budget = Math.max(1, window - reserved);
-    if (originalTokens <= budget * COMPACTION_FIT_TRIGGER_RATIO) return undefined;
+    // Retry narrowing: never wider than the ordinary budget, and never so small
+    // that the kept tail cannot hold the directive (a fit that drops the whole
+    // conversation is not a summary request any more).
+    const ceiling = targetTokens === undefined
+        ? budget
+        : Math.max(Math.min(budget, Math.floor(targetTokens)), 1);
+    if (originalTokens <= ceiling * COMPACTION_FIT_TRIGGER_RATIO) return undefined;
     const wire = protocolOf(parsed);
     if (wire === undefined) return undefined;
     const { protocol, field } = wire;
@@ -338,7 +362,7 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
     const headEnd = leadingSystemCount(items);
     if (total - headEnd < 2) return undefined;
 
-    const targetBytes = Math.floor(budget * COMPACTION_FIT_TARGET_RATIO) * 4;
+    const targetBytes = Math.floor(ceiling * COMPACTION_FIT_TARGET_RATIO) * 4;
     const itemBytes: number[] = new Array(total).fill(0);
     for (let i = headEnd; i < total; i += 1) {
         const json = JSON.stringify(items[i]);
@@ -374,7 +398,7 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
         // mailing something neither side can reason about.
         if (fittedBytes >= originalBytes) continue;
         const fittedTokens = Math.ceil(fittedBytes / 4);
-        if (fittedTokens > budget * COMPACTION_FIT_TARGET_RATIO) continue;
+        if (fittedTokens > ceiling * COMPACTION_FIT_TARGET_RATIO) continue;
         return {
             body,
             protocol,
@@ -387,7 +411,7 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
             originalTokens,
             fittedTokens,
             window,
-            budget,
+            budget: ceiling,
             placeholder: text,
         };
     }

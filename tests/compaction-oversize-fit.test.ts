@@ -36,7 +36,7 @@ after(() => {
 });
 
 import { installNativeFetchIntercept, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
-import { planCompactionFit, topLevelArraySpanOf } from "../src/agent/compaction-fit.ts";
+import { COMPACTION_FIT_RETRY_LIMIT, planCompactionFit, topLevelArraySpanOf } from "../src/agent/compaction-fit.ts";
 
 const DIRECTIVE = "You are now acting as a compaction engine for this AI coding assistant. Summarize the conversation above.";
 const TASK = "TASK: ship the API change without breaking callers.";
@@ -84,7 +84,14 @@ interface Harness {
 }
 
 async function withIntercept(
-    opts: { window?: number | undefined; gate?: boolean; origin?: string | undefined },
+    opts: {
+        window?: number | undefined;
+        gate?: boolean;
+        origin?: string | undefined;
+        /** compaction-fit-retry: let a case make the fake provider reject a
+         *  send so the re-cut loop is observable. `call` is 1-based. */
+        respond?: (call: number, body: string | undefined) => Response;
+    },
     run: (h: Harness) => Promise<void>,
 ): Promise<void> {
     const saved = globalThis.fetch;
@@ -102,7 +109,7 @@ async function withIntercept(
             body,
             headers: new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)),
         });
-        return new Response("{}", { status: 200 });
+        return opts.respond === undefined ? new Response("{}", { status: 200 }) : opts.respond(sent.length, body);
     }) as typeof fetch;
     const origin = opts.origin === undefined ? "http://127.0.0.1:9999" : opts.origin;
     const state: NativeInterceptState = {
@@ -376,4 +383,173 @@ test("planCompactionFit: declines every shape it cannot reason about", () => {
     const notCompaction = JSON.stringify({ model: "m", messages: [{ role: "user", content: "x".repeat(4_100_000) }] });
     assert.equal(planCompactionFit(notCompaction, WINDOW), undefined, "not a compaction call");
     assert.equal(planCompactionFit("{not json", WINDOW), undefined, "undecodable body");
+});
+
+// compaction-fit-retry: the fit measures BYTES, the provider counts TOKENS, and
+// a CJK/base64-heavy replay costs 3-4x more per byte than `bytes / 4` assumes.
+// Live proof (2026-11-06, trace 883bb424…): a 27.4 MB body was fitted to an
+// estimated 830,806 tok against a 1,048,576 window and the provider still
+// answered "Input too long". The answer is to re-cut on the rejection instead of
+// pinning a tokenizer table.
+
+test("planCompactionFit: a narrower retry target cuts deeper and reports it", () => {
+    const body = mixedHistoryBody(400_000, 50_000, 8_192);
+    const first = planCompactionFit(body, 100_000);
+    assert.ok(first !== undefined);
+    const narrow = planCompactionFit(body, 100_000, Math.floor(first.budget / 4));
+    assert.ok(narrow !== undefined, "a narrower ceiling still produces a legal fit");
+    assert.equal(narrow.budget, Math.floor(first.budget / 4), "the plan reports the ceiling it actually used");
+    assert.ok(narrow.fittedTokens < first.fittedTokens, "a narrower ceiling keeps less");
+    assert.ok(narrow.droppedMessages > first.droppedMessages, "and drops more of the replay");
+    assertNoOrphanToolResults(messagesOf(narrow.body));
+    assert.equal(messagesOf(narrow.body).at(-1)?.content, DIRECTIVE);
+});
+
+test("planCompactionFit: a retry target wider than the window is clamped to it", () => {
+    const body = mixedHistoryBody(400_000, 50_000, 8_192);
+    const wider = planCompactionFit(body, 100_000, 10_000_000);
+    const ordinary = planCompactionFit(body, 100_000);
+    assert.ok(wider !== undefined && ordinary !== undefined);
+    assert.equal(wider.budget, ordinary.budget);
+    assert.equal(wider.fittedTokens, ordinary.fittedTokens);
+});
+
+test("compaction-fit: a rejected fitted body is re-cut, and the retry is what ships", async () => {
+    // Graduated fixture: one huge early tool result (dropped whole by the first
+    // cut) plus a tail of equally-sized turns, so each narrower target really
+    // does cut one turn deeper — the single-pad fixture collapses to its kept
+    // tail in one step and is covered by the does-nothing-to-cut case below.
+    const body = mixedHistoryBody(1_000_000, 400_000, 8_192);
+    const seen: number[] = [];
+    await withIntercept(
+        {
+            window: WINDOW,
+            gate: false,
+            respond: (call, sentBody) => {
+                seen.push(Buffer.byteLength(sentBody ?? ""));
+                if (call === 1) {
+                    return new Response(
+                        JSON.stringify({ type: "server_error", message: "Upstream request failed: [InvalidParameter] Input too long: input exceeds the context limit trace_id: deadbeef" }),
+                        { status: 400, headers: { "content-type": "application/json" } },
+                    );
+                }
+                return new Response("{}", { status: 200 });
+            },
+        },
+        async ({ sent }) => {
+            const res = await fetch("https://provider.test/v1/messages", { method: "POST", body });
+            assert.equal(res.status, 200, "the re-cut attempt's response is what the caller sees");
+            assert.equal(sent.length, 2, "one rejected fit, then one narrower one");
+            const firstBytes = Buffer.byteLength(sent[0].body ?? "");
+            const secondBytes = Buffer.byteLength(sent[1].body ?? "");
+            assert.ok(secondBytes < firstBytes, `the retry must be smaller (${secondBytes} !< ${firstBytes})`);
+            assert.ok(placeholderOf(messagesOf(sent[1].body ?? "")) !== undefined, "the retry is still a marked fit, not a raw replay");
+            assertNoOrphanToolResults(messagesOf(sent[1].body ?? ""));
+            assert.deepEqual(seen, [firstBytes, secondBytes]);
+            // The re-cut is a fit of the ORIGINAL body, not of the first fit:
+            // exactly one placeholder means no stacked markers.
+            const placeholders = messagesOf(sent[1].body ?? "").filter((m) => typeof m.content === "string" && (m.content as string).startsWith("[billion-context:"));
+            assert.equal(placeholders.length, 1, "re-cutting must not stack placeholders");
+        },
+    );
+});
+
+test("compaction-fit: a rejection that is NOT about size is returned untouched", async () => {
+    const body = anthropicCompactionBody(4_100_000);
+    await withIntercept(
+        {
+            window: WINDOW,
+            gate: false,
+            respond: () => new Response(JSON.stringify({ type: "authentication_error", message: "invalid api key" }), { status: 401 }),
+        },
+        async ({ sent }) => {
+            const res = await fetch("https://provider.test/v1/messages", { method: "POST", body });
+            assert.equal(res.status, 401, "a non-size failure must not be retried");
+            assert.equal(sent.length, 1, "exactly one dispatch — retrying a 401 would just burn quota");
+        },
+    );
+});
+
+test("compaction-fit: the retry loop stops after its limit instead of resending forever", async () => {
+    // This replay has exactly two deeper cuts available (1.0 MB pad + four
+    // 400 KB turns), so the loop must use them and then stop.
+    const body = mixedHistoryBody(1_000_000, 400_000, 8_192);
+    await withIntercept(
+        {
+            window: WINDOW,
+            gate: false,
+            respond: () => new Response(JSON.stringify({ type: "server_error", message: "Input too long: input exceeds the context limit" }), { status: 400 }),
+        },
+        async ({ sent }) => {
+            const res = await fetch("https://provider.test/v1/messages", { method: "POST", body });
+            assert.equal(res.status, 400, "the last rejection is what the caller sees");
+            // First fit + COMPACTION_FIT_RETRY_LIMIT re-cuts.
+            assert.equal(sent.length, 1 + COMPACTION_FIT_RETRY_LIMIT, `expected ${1 + COMPACTION_FIT_RETRY_LIMIT} dispatches, saw ${sent.length}`);
+            const sizes = sent.map((s) => Buffer.byteLength(s.body ?? ""));
+            for (let i = 1; i < sizes.length; i += 1) {
+                assert.ok(sizes[i] < sizes[i - 1], `dispatch ${i} (${sizes[i]} B) must be smaller than ${sizes[i - 1]} B`);
+            }
+        },
+    );
+});
+
+test("compaction-fit: a re-cut that removes nothing does not re-send", async () => {
+    // The pad IS the whole excess: after the first fit only the kept tail is
+    // left, so a second dispatch would mail identical bytes and burn a round
+    // trip for a certain rejection.
+    const body = anthropicCompactionBody(4_100_000);
+    await withIntercept(
+        {
+            window: WINDOW,
+            gate: false,
+            respond: () => new Response(JSON.stringify({ type: "server_error", message: "Input too long: input exceeds the context limit" }), { status: 400 }),
+        },
+        async ({ sent }) => {
+            const res = await fetch("https://provider.test/v1/messages", { method: "POST", body });
+            assert.equal(res.status, 400);
+            assert.equal(sent.length, 1, `nothing was left to cut, so exactly one dispatch (saw ${sent.length})`);
+        },
+    );
+});
+
+// The hand-back lane used to write NOTHING about what it dispatched, which is
+// why the 2026-11-06 oversize 400 (trace 883bb424…) had to be reconstructed from
+// the host's transcripts. Every fitted hand-back now leaves one line naming the
+// bytes, the dropped count, the estimate, the ceiling and the status.
+function handBackLogLines(): string[] {
+    const file = path.join(STATE_ROOT, "billion-context", "bili.log");
+    if (!fs.existsSync(file)) return [];
+    return fs.readFileSync(file, "utf8").split("\n").filter((line) => line.includes("[compaction-fit] hand-back"));
+}
+
+test("compaction-fit: the hand-back is observed in bili.log, success and rejection alike", async () => {
+    const body = anthropicCompactionBody(4_100_000);
+    // Earlier cases in this file already wrote hand-back lines, so assert on
+    // this case's own additions.
+    const start = handBackLogLines().length;
+    await withIntercept({ window: WINDOW, gate: false }, async () => {
+        await fetch("https://provider.test/v1/messages", { method: "POST", body });
+    });
+    const accepted = handBackLogLines().slice(start);
+    assert.equal(accepted.length, 1, `expected one accepted hand-back line, saw ${JSON.stringify(accepted)}`);
+    const line = accepted[0];
+    assert.match(line, /hand-back → https:\/\/<private-host>\/v1\/messages, /, "the target is logged through the mask (#3651)");
+    assert.match(line, /\d[\d,]* B, dropped \d[\d,]*\/\d[\d,]* msg, est ~\d[\d,]* tok against a \d[\d,]* tok ceiling/);
+    assert.match(line, /— accepted: 200$/);
+
+    const beforeReject = handBackLogLines().length;
+    await withIntercept(
+        {
+            window: WINDOW,
+            gate: false,
+            respond: () => new Response(JSON.stringify({ type: "server_error", message: "Input too long: input exceeds the context limit" }), { status: 400 }),
+        },
+        async () => {
+            await fetch("https://provider.test/v1/messages", { method: "POST", body });
+        },
+    );
+    const rejected = handBackLogLines().slice(beforeReject);
+    assert.equal(rejected.length, 1, `one line for the give-up, saw ${JSON.stringify(rejected)}`);
+    assert.match(rejected[0], /still too large but nothing cuttable is left/);
+    assert.match(rejected[0], /: 400$/);
 });
