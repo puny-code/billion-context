@@ -127,17 +127,29 @@ test("media CAS: stale-row sweep releases media refs and mappings (full re-inges
         assert.equal(store.mediaRefCount(IMG_B64), 1, "one media reference before re-ingest");
 
         // The session's raw tail no longer contains the image message: the
-        // full path sweeps the stale row — its media mapping and CAS refcount
-        // must go with it, or the bytes leak forever (#3762 review, #3901).
+        // full path sweeps the stale row into a #4390 historian tombstone —
+        // its media mapping and CAS refcount must still go with it, or the
+        // bulky image bytes leak until archive (#3762 review, #3901, #4506).
+        // The TEXT row itself stays retired (retired_at set), never deleted.
         store.ingestSession(planIngest(mkSession("sess-sweep", [mTxt])), undefined, { completeLog: true });
 
         assert.equal(store.mediaRefCount(IMG_B64), 0, "swept message released its media ref");
         const mappings = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number }[] } } })
             .db.prepare("SELECT COUNT(*) AS n FROM message_media WHERE session_id = ?").all("sess-sweep");
         assert.equal(mappings[0].n, 0, "swept media mappings deleted");
-        const rows = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number }[] } } })
-            .db.prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ?").all("sess-sweep");
-        assert.equal(rows[0].n, 1, "only the surviving message row remains");
+        const rows = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number; retired: number }[] } } })
+            .db.prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN retired_at IS NULL THEN 1 ELSE 0 END) AS retired FROM messages WHERE session_id = ?").all("sess-sweep");
+        assert.equal(rows[0].n, 2, "historian keeps both rows (one live, one tombstoned)");
+        assert.equal(rows[0].retired, 1, "only the surviving message is live");
+
+        // #4506 rewind-redo: the SAME image message comes back (undo of the
+        // undo). The tombstone reactivates in place AND its media mapping +
+        // refcount are re-established by the re-ingest — no manual repair.
+        store.ingestSession(planIngest(mkSession("sess-sweep", [mImg, mTxt])), undefined, { completeLog: true });
+        assert.equal(store.mediaRefCount(IMG_B64), 1, "reactivated message re-owns its media ref");
+        const live = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): { n: number }[] } } })
+            .db.prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL").all("sess-sweep");
+        assert.equal(live[0].n, 2, "both rows live again after rewind-redo");
         store.close();
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }

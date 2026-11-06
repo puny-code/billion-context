@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
@@ -9,6 +9,7 @@ import { executeSearchContextTarget, resolveDecompress } from "./decompress-shar
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
+import { peekStoredTailView } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -17,6 +18,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -33,8 +35,9 @@ export type RewriteCtx = {
      *  acted on. postCompressTail bases "remaining ranges" on it (minus the
      *  just-folded spans) instead of a post-fold recompute, which would advance
      *  the protection window and leak newly-de-protected ranges into the receipt
-     *  (zero-growth chained folds + prefix-cache thrash). Absent on internal
-     *  lanes (preflight) → they fall back to the live recompute. */
+     *  (zero-growth chained folds + prefix-cache thrash). Preflight internal
+     *  lanes pin their round's own processTurn offer (#4227); a lane without
+     *  one falls back to the live recompute below. */
     lastNudge?: NudgeDecision;
 };
 
@@ -84,6 +87,56 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
  *  order ranges by position when picking the fold point (#189 observability). */
 function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
+}
+
+/** #3307 forensic helper: `prefixTokensBeforeRef` for every ref of a fold batch
+ *  in ONE pass. The imported helper rescans the whole `byRef` map per call
+ *  (`O(|byRef|)`), so the fold-attribution log line paid 2162 × 8650 refNum()
+ *  regex calls — 5.7s measured on the batched preflight fold at the 27.3MiB
+ *  scale. Same two state fields, same arithmetic (token counts are the integer
+ *  numbers renderWithSnapshot records, and an integer sum is order-independent),
+ *  so every returned value is identical; equivalence against the imported
+ *  function is pinned by tests/stream-applyranges-linear.test.ts. */
+function prefixTokenOffsets(session: Session, refs: readonly string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    const byRef = session.state?.messageRefs?.byRef;
+    const snap = session.state?.tokenSnapshot;
+    if (!byRef || !snap) {
+        for (const r of refs) out.set(r, 0);
+        return out;
+    }
+    const entries: Array<[number, number]> = [];
+    for (const key of Object.keys(byRef)) entries.push([refNum(key), snap[key] ?? 0]);
+    entries.sort((a, b) => a[0] - b[0]);
+    const cum: number[] = new Array(entries.length);
+    let acc = 0;
+    for (let i = 0; i < entries.length; i++) {
+        acc += entries[i]![1];
+        cum[i] = acc;
+    }
+    for (const ref of refs) {
+        const q = refNum(ref);
+        if (q === 0) {
+            out.set(ref, 0);
+            continue;
+        }
+        // count of refs strictly before q (spansOverlap has no ties problem here:
+        // the original test is refNum(key) < refNum(ref))
+        let a = 0;
+        let b = entries.length - 1;
+        let idx = 0;
+        while (a <= b) {
+            const mid = (a + b) >> 1;
+            if (entries[mid]![0] < q) {
+                idx = mid + 1;
+                a = mid + 1;
+            } else {
+                b = mid - 1;
+            }
+        }
+        out.set(ref, idx === 0 ? 0 : cum[idx - 1]!);
+    }
+    return out;
 }
 
 /** #1026: recovery hint appended to failed-compress receipts — the raw-ref
@@ -256,6 +309,25 @@ function substrateDestructionPauseParagraph(n: number): string {
     return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed because the fold substrate was destroyed by an out-of-band history rewrite. STOP calling compress now: do not try other ranges and do not re-issue any previous ones. There is exactly ONE recovery step: run acp_status once, then compress ONLY a range it currently reports as compressible — one success clears this breaker. If acp_status reports no compressible ranges, continue your task without compressing.]`;
 }
 
+// #4812: short refusal for parse-failure receipts once the breaker has climbed
+// PAST its arm moment (n > threshold). The full format lecture is first-sight
+// teaching — failures 1-3 deliver it, and the arm-moment receipt (n ==
+// threshold) keeps its verbatim pause paragraph. Observed in the field: a
+// looping model re-issued the same malformed call six times and bili
+// re-broadcast the same ~2K-token lecture plus guard plus paragraph on every
+// attempt (~12K burned, all ignored) — the breaker escalated wording but never
+// enforced. From n+1 on the receipt collapses to this one-liner instead. It is
+// self-contained (hideConsumedCompressCalls may have folded the earlier
+// lectures away) and deliberately never mentions acp_status: the loop-noise
+// paragraph orders "do not poll acp_status", and #2360 measured that two
+// contradictory orders in one receipt get obeyed as zero. Calls whose args DO
+// parse are never refused here (see applyRanges), so the #2432 substrate
+// recovery step — acp_status once, then ONE live range — still goes through
+// and can clear the breaker.
+function armedRefusalReceipt(n: number, decayMinutes: number): string {
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+}
+
 /** #2146: record one total compress failure (any spec) and return "" while
  *  healthy, or the pause paragraph to embed in the receipt once the
  *  consecutive-failure threshold is reached. Only failed-call receipts carry
@@ -364,6 +436,16 @@ function compressFailureCause(errs: string, session: Session): string {
     return "";
 }
 
+/** Highest allocated mNNNNN number in the session's ref map (0 when empty). */
+function highestMappedRef(state: Pick<CompressionState, "messageRefs">): number {
+    let highest = 0;
+    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
+        const m = M_REF_NUM_RE.exec(ref);
+        if (m) highest = Math.max(highest, Number(m[1]));
+    }
+    return highest;
+}
+
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
  *  pre-allocated); the kernel now classifies that case as above-frontier
@@ -371,11 +453,7 @@ function compressFailureCause(errs: string, session: Session): string {
  *  NO superset of such refs can ever compress — so the model stops re-anchoring
  *  on other stale artifacts instead. */
 export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">, ranges: Array<{ startRef: string; endRef: string }>): string {
-    let highest = 0;
-    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
-        const m = M_REF_NUM_RE.exec(ref);
-        if (m) highest = Math.max(highest, Number(m[1]));
-    }
+    const highest = highestMappedRef(state);
     if (highest <= 0 || ranges.length === 0) return "";
     const allAbove = ranges.every((r) => {
         const s = M_REF_NUM_RE.exec(r.startRef.trim());
@@ -385,6 +463,34 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     if (!allAbove) return "";
     const hi = `m${String(highest).padStart(5, "0")}`;
     return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
+}
+
+/** #4252 follow-up: PARTIALLY past the frontier — some endpoint above the
+ *  highest stored ref while another sits inside it. beyondFrontierNote
+ *  (#2146) only fires when EVERY endpoint is above, so a start-in/end-out
+ *  range fell through to generic guidance while allocation lagged rendering
+ *  (the model sees refs in its transcript that the store has not minted yet)
+ *  and it blind-retried against a moving ceiling (incident session 01a15993:
+ *  5× gate:none-resolved inside 8 minutes, breaker armed). Name the ceiling
+ *  and the clamp explicitly so one retry converges. Fires only when the
+ *  all-above note is absent (the two are mutually exclusive by design). */
+export function frontierClampNote(
+    state: Pick<CompressionState, "messageRefs">,
+    ranges: Array<{ startRef: string; endRef: string }>,
+    beyond: string,
+): string {
+    if (beyond !== "" || ranges.length === 0) return "";
+    const highest = highestMappedRef(state);
+    if (highest <= 0) return "";
+    const over = ranges.filter((rg) => {
+        const s = M_REF_NUM_RE.exec(rg.startRef.trim());
+        const e = M_REF_NUM_RE.exec(rg.endRef.trim());
+        return !!s && !!e && (Number(s[1]) > highest || Number(e[1]) > highest);
+    });
+    if (over.length === 0) return "";
+    const hi = `m${String(highest).padStart(5, "0")}`;
+    const list = over.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+    return ` Range(s) ${list} extend past this session's highest stored ref (${hi}) — refs are minted as messages are stored, so numbers you can already see rendered may not be ingestible yet. Retry with endId ≤ ${hi}, or call acp_status for the live compressible span.`;
 }
 
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
@@ -480,6 +586,10 @@ function droppedEntriesNote(diagnostics: CompressParseDiagnostics): string {
 // past the session tail and burn a round on kernel rejection. Wording is
 // verbatim pi-side so both hosts speak the same contract.
 const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
+// #4331 / pi #521 anti-nag rule: below this TOTAL uncovered mass the receipt
+// keeps the legacy wording — small leftovers outside the offer must not re-nag
+// on every fold. Material leaks (the #4331 class: tens of K tokens raw) override it.
+const UNCOVERED_RECEIPT_FLOOR_TOKENS = 10_000;
 
 // #2404: the tail's "remaining ranges" is the LAST NUDGE's offer (the pre-fold
 // set the model acted on) minus the just-folded spans — NOT a fresh post-fold
@@ -500,12 +610,53 @@ function spanNum(ref: string): number {
     const n = Number(ref.replace(/\D/g, ""));
     return Number.isFinite(n) ? n : 0;
 }
-function spansOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
-    const aLo = Math.min(spanNum(aStart), spanNum(aEnd));
-    const aHi = Math.max(spanNum(aStart), spanNum(aEnd));
-    const bLo = Math.min(spanNum(bStart), spanNum(bEnd));
-    const bHi = Math.max(spanNum(bStart), spanNum(bEnd));
-    return aLo <= bHi && bLo <= aHi;
+/** Numeric [lo, hi] bounds of one range — the exact operands spansOverlap
+ *  derives from its refs (min/max of spanNum over the two endpoints). */
+function spanBounds(startRef: string, endRef: string): { lo: number; hi: number } {
+    const a = spanNum(startRef);
+    const b = spanNum(endRef);
+    return a <= b ? { lo: a, hi: b } : { lo: b, hi: a };
+}
+
+/** Exact O((|base| + |submitted|) log |submitted|) restatement of
+ *  `base.filter((r) => !submitted.some((s) => spansOverlap(r…, s…)))`.
+ *  [aLo,aHi] overlaps some [bLo,bHi] iff a submitted span has bLo <= aHi AND
+ *  bHi >= aLo, so sorting the submitted spans by bLo and prefix-maxing bHi
+ *  answers each query with one binary search instead of a linear `.some` walk.
+ *  The nested form was |base| × |submitted| spanNum() calls (each a regex
+ *  `replace`) — 2162 × 2162 = 4.7M pairs on the batched preflight fold, where
+ *  it measured 3.2s; this form is order-identical and returns the same array. */
+function subtractSubmittedSpans<T extends { startRef: string; endRef: string }, S extends { startRef: string; endRef: string }>(base: T[], submitted: S[]): T[] {
+    if (submitted.length === 0) return base.filter(() => true);
+    const subs = submitted.map((s) => spanBounds(s.startRef, s.endRef));
+    subs.sort((a, b) => (a.lo - b.lo) || (a.hi - b.hi));
+    const maxHi: number[] = new Array(subs.length);
+    let running = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < subs.length; i++) {
+        const hi = subs[i]!.hi;
+        if (hi > running) running = hi;
+        maxHi[i] = running;
+    }
+    const overlapsSome = (lo: number, hi: number): boolean => {
+        // last index whose submitted lo <= this range's hi
+        let a = 0;
+        let b = subs.length - 1;
+        let idx = -1;
+        while (a <= b) {
+            const mid = (a + b) >> 1;
+            if (subs[mid]!.lo <= hi) {
+                idx = mid;
+                a = mid + 1;
+            } else {
+                b = mid - 1;
+            }
+        }
+        return idx >= 0 && maxHi[idx]! >= lo;
+    };
+    return base.filter((r) => {
+        const { lo, hi } = spanBounds(r.startRef, r.endRef);
+        return !overlapsSome(lo, hi);
+    });
 }
 
 function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Array<{ startRef: string; endRef: string }>): string {
@@ -522,8 +673,8 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         base = excludeDeadRefRanges(viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
         tier = ctx.lastNudge.tier ?? null;
     } else {
-        // Internal lanes (preflight overflow-compress) capture no prepare-time
-        // nudge → fall back to the live recompute (same source as #389).
+        // Lane without a pinned offer → fall back to the live recompute (same
+        // source as #389); preflight now pins its round's own nudge (#4227).
         // processTurn is pure; the returned state is deliberately NOT adopted.
         let nudge: NudgeDecision | undefined;
         try {
@@ -560,7 +711,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // ("compressed 2 of 3 -> show the 1"). Only when ALL offered folded does the
     // stop signal fire below. Ranges not in the pre-fold offer never appear here.
     const remaining = ctx.lastNudge
-        ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
+        ? subtractSubmittedSpans(base, submitted)
         : base;
     if (remaining.length > 0) {
         return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
@@ -570,6 +721,33 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // Partial failures stay silent too: the model still owes the errors an answer
     // before any "you are done" verdict (pi #521 gate).
     if (!cleanSuccess || tier !== null) return "";
+    // #4331: offer exhaustion is NOT proof the context is at its minimum — the
+    // verdict only sees this call's pre-fold offer, and mid-history runs can sit
+    // outside every active block AND outside the offer (disjoint folds, dead-ref
+    // holes, integrity withdrawals). Audit before making the global claim; the
+    // verbatim contract string (#1387) stays intact for genuinely-drained
+    // sessions. Advisory only: audit failure degrades to the old wording path.
+    try {
+        const runs = uncoveredHistoryRuns({
+            core: ctx.core,
+            messages: ctx.messages,
+            state: ctx.session.state,
+            config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
+            tokenCount: statusInputBaseline(ctx.session),
+            contentStore: contentStoreOf(ctx.session),
+            applyView: ctx.compressMessages,
+            actionableSpans: remaining,
+        });
+        if (runs.length > 0) {
+            const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
+            const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
+            if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
+                return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+            }
+        }
+    } catch {
+        // Fall through to the contract wording below.
+    }
     return `\n\n${NO_RANGES_REMAIN_TEXT}`;
 }
 
@@ -606,7 +784,21 @@ const DEGENERATE_FOLD_COVERAGE = 0.8;
  *  DEAD (the host commits applyCompression's cloned state even when zero blocks
  *  were created), and the receipt blames "content-changed" — none of which is
  *  true: the refs are intact and the view self-heals on the next model request
- *  (rememberPluginMessages after forward). Null = no refusal, proceed. */
+ *  (rememberPluginMessages after forward).
+ *
+ *  #3859: WHICH empty-view calls may still be handed to the kernel is decided
+ *  by the kernel's own dead-ref test, not by span overlap. danglingMessageRefs
+ *  records a requested ref dead exactly when that BOUNDARY ref is known to this
+ *  session but not visible and not inside any active block's effectiveMessageIds
+ *  — so a range that overlaps one block while its boundary refs sit in gaps
+ *  between blocks passed the old overlap gate and got its live refs tombstoned.
+ *  The gate now yields only when every requested range's message-ref boundaries
+ *  are point-covered by some active block (block-ref boundaries carry no raw id
+ *  and can never be tombstoned). That is also exactly the set of shapes the
+ *  kernel could ever serve from state alone (#403/#2748 restoredInline refold,
+ *  already-compressed warnings): with a truly empty view nothing else anchors,
+ *  so every uncovered-boundary shape can only fail or corrupt.
+ *  Null = no refusal, proceed. */
 export function noVisibleContextRefusal(
     ctx: RewriteCtx,
     ranges: ParsedRange[],
@@ -615,23 +807,25 @@ export function noVisibleContextRefusal(
     const view = ctx.compressMessages ?? ctx.messages;
     const mappedRefs = Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length;
     if (view.length > 0 || mappedRefs === 0) return null;
-    // #398/#403 in-place refold works FROM state alone: after an inline
-    // decompress the originals leave the wire view (proxy mode) yet a
-    // re-compress of the restored span must still land on its block. The
-    // refusal therefore applies only when NO active block touches ANY
-    // requested ref — then nothing in the call can be served without live
-    // messages and every retry fails identically. Any overlap hands the
-    // decision back to the kernel, which keeps its own honest diagnostics
-    // for those shapes (refold / already-compressed / no-net-shrink).
-    const spans = activeBlockSpans(ctx.session.state);
-    const touchable = ranges.some((r) => {
-        const lo = refNum(r.startRef);
-        const hi = refNum(r.endRef);
-        if (lo === 0 || hi === 0) return true;
-        const a = Math.min(lo, hi), b = Math.max(lo, hi);
-        return spans.some((s) => refNum(s.startRef) <= b && refNum(s.endRef) >= a);
-    });
-    if (touchable) return null;
+    // #3859: yield to the kernel only when its own dead-ref test cannot fire on
+    // anything here — i.e. every requested message-ref boundary is point-covered
+    // by an active block (mirrors danglingMessageRefs: same byRef lookup, same
+    // effectiveMessageIds coverage; block-ref boundaries carry no raw id and are
+    // skipped there too). Any uncovered boundary would be recorded DEAD on this
+    // empty view while still live on disk. A boundary with no known rawId is
+    // yielded deliberately: the kernel then only re-records ids already dead
+    // (#3302, idempotent) or skips unknown ones — it can never corrupt a live ref.
+    const byRef = ctx.session.state.messageRefs?.byRef ?? {};
+    const coveredRawIds = new Set(
+        ctx.session.state.blocks.filter((b) => b.active).flatMap((b) => b.effectiveMessageIds),
+    );
+    const unvouchable = ranges.some((r) => [r.startRef, r.endRef].some((ref) => {
+        const parsed = parseBoundary(ref);
+        if (!parsed || parsed.kind !== "message") return false;
+        const rawId = byRef[parsed.raw] ?? byRef[indexToRef(parsed.numericId)];
+        return Boolean(rawId) && !coveredRawIds.has(rawId);
+    }));
+    if (!unvouchable) return null;
     const detail = ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ");
     // #3918: the "self-heals on the next model request" promise holds ONLY when
     // the reloaded session survives between requests. When this session's
@@ -654,6 +848,22 @@ export function noVisibleContextRefusal(
         : "Do NOT retry now — every retry fails identically until the next model request re-sends the conversation and restores the view. Continue your task; after the next turn you can compress the same ranges again.";
     const receipt = `[Compression FAILED: no visible context — the proxy holds no live message view of this conversation right now (its in-memory copy was dropped between model requests, e.g. by memory eviction or a restart). Your refs are intact and NOTHING was marked dead: ${mappedRefs} ref(s) remain mapped, and this is NOT a ref problem.${healClause} [cause: no-visible-context]${repeatGuard}${loopGuard}]`;
     return compressResult(receipt, "refused", 0, "gate:no-visible-context");
+}
+
+/** #3982: evicted-session view recovery — when the effective live view is
+ *  empty, restore the raw client view from the unified transcript (persisted
+ *  on every save, #3911) BEFORE the no-visible-context gate above. Peek-only
+ *  (a store must already exist); any unparsable row keeps the honest refusal.
+ *  A non-empty live view stays authoritative — the store is never consulted
+ *  for it. Shared by the plain-compress lane (applyRanges) and the external-
+ *  summary lane (applyConfiguredCompression). */
+export function recoverEvictedView(ctx: RewriteCtx): void {
+    if ((ctx.compressMessages ?? ctx.messages).length > 0) return;
+    const recovered = peekStoredTailView(ctx.session.id);
+    if (recovered && recovered.length > 0) {
+        ctx.compressMessages = recovered;
+        ctx.log(`[acp-proxy: view recovered from the unified store — ${recovered.length} message(s); folding against the persisted raw view (#3982)]`);
+    }
 }
 
 function formatMiB(bytes: number | undefined): string {
@@ -714,12 +924,86 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
     return hits;
 }
 
+/** #4316 layer 3 PR3/3, #4797 rework: resolve a compress call's refs
+ *  against the CURRENT live map first, the superseded map second, and refuse
+ *  only genuinely-dead cites.
+ *
+ *  The original span-scan refused any range with a superseded KEY anywhere
+ *  between its endpoints — but the restamp's vacated numbers can be handed to
+ *  other messages as seq+1 targets in the same sweep, so in a dense space a
+ *  superseded key is routinely ALSO the live ref of a different message
+ *  (exactly the numbers acp_status advertises). That made the guard reject
+ *  every advertised range and dead-loop the session: "call acp_status" →
+ *  status lists the same live numbers → refused again — the proxy's own
+ *  preflight rescue included (#4797).
+ *
+ *  Resolution ladder, per ENDPOINT (span folding is endpoint-defined; the
+ *  interior number scan only manufactured false hits):
+ *  1. live in the current map → keep as-is (collision-band artifact, the
+ *     common case for numbers straight out of acp_status / the nudge);
+ *  2. superseded key (genuinely vacated) → identity-preserving translation
+ *     oldRef → rawId → the same message's current ref — a model citing a
+ *     number it saw BEFORE the restamp folds the SAME messages, never the
+ *     new owner of that number;
+ *  3. neither → leave to the kernel's boundary-not-found handling.
+ *  Refusal only when an endpoint is a superseded key whose translation
+ *  dead-ends (the message lost its mapping entirely — an honest stale cite).
+ *
+ *  Transitional honesty: for sessions restamped by kernels WITHOUT the
+ *  superseded-liveness prune, case 1 can in principle swallow a resent
+ *  pre-restart call's intent (number now owned by someone else). The replay
+ *  window is seconds; the deadlock it replaces is permanent — live-first is
+ *  the right trade, and the kernel prune removes the ambiguity entirely for
+ *  fresh restamps. */
+interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
+    rejection: string | null;
+    translatedRanges: T[];
+    translated: number;
+}
+
+export function supersededRefRejection<T extends { startRef: string; endRef: string }>(
+    ranges: T[],
+    session: Session,
+): SupersededResolution<T> {
+    const superseded = session.restampSuperseded;
+    const out: SupersededResolution<T> = { rejection: null, translatedRanges: [], translated: 0 };
+    if (!superseded || superseded.size === 0) {
+        out.translatedRanges = ranges.map((r) => ({ ...r }));
+        return out;
+    }
+    const byRef = session.state.messageRefs?.byRef ?? {};
+    const byRaw = session.state.messageRefs?.byRaw ?? {};
+    const dead: string[] = [];
+    const resolveEndpoint = (ref: string): string => {
+        if (byRef[ref] !== undefined) return ref;
+        const rawId = superseded.get(ref);
+        if (rawId === undefined) return ref;
+        const next = byRaw[rawId];
+        if (typeof next === "string" && next !== ref && byRef[next] === rawId) {
+            out.translated++;
+            return next;
+        }
+        dead.push(ref);
+        return ref;
+    };
+    out.translatedRanges = ranges.map((range) => ({
+        ...range,
+        startRef: resolveEndpoint(range.startRef),
+        endRef: resolveEndpoint(range.endRef),
+    }));
+    if (dead.length === 0) return out;
+    const listed = dead.slice(0, 5).join(", ");
+    const more = dead.length > 5 ? ` (+${dead.length - 5} more)` : "";
+    out.rejection = `ref(s) ${listed}${more} were re-numbered by the ledger alignment and no longer resolve to a live message. Re-read the current labels with acp_status and re-issue.`;
+    return out;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
     const trackLoop = opts?.loopTracking !== false;
-    const { ranges, diagnostics } = parsed;
+    let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
@@ -763,6 +1047,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     : "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
         );
         const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, parseKey) : "";
+        // #4812: enforce the armed breaker on parse-failure receipts — see
+        // armedRefusalReceipt for the invariants (arm-moment receipt unchanged;
+        // parsing-valid calls never blocked; preflight lane untouched via
+        // trackLoop).
+        const armedDetail = trackLoop ? compressBreakerDetail(ctx.session) : undefined;
+        if (armedDetail !== undefined && armedDetail.n > COMPRESS_LOOP_THRESHOLD) {
+            ctx.log(`[acp-proxy: parse-failure receipt collapsed to short refusal (breaker armed, n=${armedDetail.n}, kind=${diagnostics.kind})`);
+            return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
+        }
         if (isEmptyCall) {
             return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
@@ -783,10 +1076,27 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length} ref(s) mapped]`);
+    // #4316 PR3/3 (#4797 rework): resolve the cited refs against the live map
+    // first, the superseded map second — see supersededRefRejection. Live
+    // endpoints pass untouched; genuinely-vacated ones are translated onto
+    // the SAME message's current ref (identity-preserving); only
+    // dead-end translations refuse.
+    const supersededRes = supersededRefRejection(ranges, ctx.session);
+    if (supersededRes.rejection !== null) {
+        ctx.log(`[acp-proxy: refused compress citing superseded ref(s): ${supersededRes.rejection} (#4316 PR3/3)]`);
+        return compressResult(`[Compression REFUSED: ${supersededRes.rejection} The refs in this call no longer identify the same messages and folding them would compress the wrong span. Re-issue the compress call with the updated labels.]`, "refused", 0, "superseded-ref");
+    }
+    if (supersededRes.translated > 0) {
+        ranges = supersededRes.translatedRanges;
+        ctx.log(`[acp-proxy: translated ${supersededRes.translated} superseded ref(s) onto current labels (identity-preserving, #4797): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
+    } else {
+        ranges = supersededRes.translatedRanges;
+    }
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
         ctx.log(`[acp-proxy: first msg ids: ${ids}]`);
     }
+    recoverEvictedView(ctx);
     const noView = noVisibleContextRefusal(ctx, ranges, { loopTracking: trackLoop });
     if (noView) return noView;
     // #2749: reject summaries that are byte-identical to a display stub the
@@ -847,6 +1157,47 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 return compressResult(receipt, "refused", 0, "gate:coverage-regression");
             }
         }
+        // P3-A3: message-id index for THIS applyRanges call only. Both the
+        // image-note lookup below and the block-content cache use
+        // id → message lookups that were written as whole-array scans
+        // (`view.find`, and collectBlockContent's internal `messages.filter`)
+        // — O(blocks × |messages|) = 2162 × 8650 on the batched 27.3MiB fold.
+        // The index is rebuilt from the live array on every call and is never
+        // stored on the session/ctx, so per-round state mutation can't stale it.
+        const messageIndexCache = new Map<CoreMessage[], { byId: Map<string, CoreMessage[]>; pos: Map<CoreMessage, number> }>();
+        const messageIndex = (arr: CoreMessage[]): { byId: Map<string, CoreMessage[]>; pos: Map<CoreMessage, number> } => {
+            const hit = messageIndexCache.get(arr);
+            if (hit !== undefined) return hit;
+            const byId = new Map<string, CoreMessage[]>();
+            const pos = new Map<CoreMessage, number>();
+            for (let i = 0; i < arr.length; i++) {
+                const m = arr[i]!;
+                pos.set(m, i);
+                const bucket = byId.get(m.id);
+                if (bucket === undefined) byId.set(m.id, [m]);
+                else bucket.push(m);
+            }
+            const idx = { byId, pos };
+            messageIndexCache.set(arr, idx);
+            return idx;
+        };
+        // The exact subsequence `messages.filter((m) => targetIds.has(m.id))`
+        // would yield: every entry whose id the block covers, in source order
+        // (duplicate ids keep every occurrence, like the filter does).
+        const narrowToBlockIds = (ids: readonly string[], arr: CoreMessage[]): CoreMessage[] => {
+            const idx = messageIndex(arr);
+            const seen = new Set<string>();
+            const picked: CoreMessage[] = [];
+            for (const id of ids) {
+                if (seen.has(id)) continue;
+                seen.add(id);
+                const bucket = idx.byId.get(id);
+                if (bucket === undefined) continue;
+                for (const m of bucket) picked.push(m);
+            }
+            if (picked.length > 1) picked.sort((a, b) => (idx.pos.get(a) ?? 0) - (idx.pos.get(b) ?? 0));
+            return picked;
+        };
         // #2748: host-side image notes append a ref-carrying footer to a new
         // block's summary AFTER the kernel's length validation — count that
         // wrapped mass in the net-benefit decision too. Moved above the commit
@@ -854,12 +1205,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // old post-commit honesty note, just evaluated before the state lands).
         {
             const view = ctx.compressMessages ?? ctx.messages;
+            const viewIndex = messageIndex(view);
             const byRaw = res.state.messageRefs?.byRaw;
             for (const b of res.state.blocks) {
                 if (beforeIds.has(b.blockId)) continue;
                 const notes: string[] = [];
                 for (const id of b.directMessageIds) {
-                    const m = view.find((msg) => msg.id === id);
+                    // find() semantics: the FIRST occurrence in source order.
+                    const m = viewIndex.byId.get(id)?.[0];
                     if (!m) continue;
                     notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
                 }
@@ -919,17 +1272,25 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // Cache original content for newly-created blocks. At compress time the
         // source messages are still in ctx.messages (this round's view, before
-        // the next processTurn folds them). Storing the text here lets decompress
-        // work in later rounds where ctx.messages no longer carries the originals.
+        // the next processTurn folds them) — or in ctx.compressMessages when an
+        // EMPTY-view fold recovered its source from the unified store (#3982);
+        // collecting against [] would leave those blocks uncached for later
+        // decompress/range-restore. Storing the text here lets decompress work
+        // in later rounds where neither carries the originals.
         // Two views are cached so decompress can honor the `full` flag: `one`
         // (direct messages + nested child summaries) and `full` (all originals).
         // Leaf blocks have no active nested children, so both kernel paths
         // emit byte-identical text — persist a single copy in that case
         // (#401: the duplicate was 50% of blockContents bytes on disk).
+        const contentSource = ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages);
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
-            const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
-            const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
+            // Hand the collector only the messages this block can match: its
+            // return value depends on nothing else in the array (see
+            // narrowToBlockIds), and the full-array scan was O(blocks × n).
+            const blockMessages = narrowToBlockIds(b.effectiveMessageIds, contentSource);
+            const full = collectBlockContent(res.state, b, blockMessages, { full: true });
+            const one = collectBlockContent(res.state, b, blockMessages, { full: false });
             if (full.count > 0 || one.count > 0) {
                 const sameView = one.text === full.text && one.count === full.count;
                 cacheBlockContent(ctx.session, b.blockId, {
@@ -987,7 +1348,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // intact, all on one line for the client marker) so the model stops
             // inspecting state and lets the original turn continue.
             const minChars = ctx.config.compress.minCompressRange;
-            const totalChars = ctx.messages.reduce((n, m) => n + (m.text ?? "").length, 0);
+            const totalChars = (ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages))
+                .reduce((n, m) => n + (m.text ?? "").length, 0);
             const noViableAnywhere = minChars > 0 && totalChars < minChars
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";
@@ -996,11 +1358,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
             const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
             const beyond = beyondFrontierNote(ctx.session.state, ranges);
+            const clamp = frontierClampNote(ctx.session.state, ranges, beyond);
             // #2146: once the breaker arms, the diagnostic hint cluster it used
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-
@@ -1045,9 +1408,31 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // with the kernel's own per-message counter instead — a same-space
         // denominator makes the ratio structurally ≤1, so #1839's
         // "trustworthy baseline" gate is subsumed and no longer needed.
-        const viewMessages = ctx.compressMessages ?? ctx.messages;
+        // #3307: "the current view" is the LIVE context being managed — the
+        // compressed outbound (ctx.messages / processedMessages), i.e. what gets
+        // billed next — NOT the client's un-shrunken resend. applyCompression
+        // still runs on ctx.compressMessages (raw message boundaries, #2627) so
+        // the fold geometry maps correctly; only the OBSERVABILITY denominator
+        // moves. A stateless client (codex_webui) re-sends its FULL history every
+        // turn, so preferring compressMessages made V ~50x the billed input and
+        // read every real fold as a ~1% shrink — postCtx/ceiling and the
+        // degenerate-fold gate below all distorted off the wrong basis.
+        // #4227: id→tokens map over the same live view — one scan serves both meters.
+        const viewMessages = ctx.messages;
+        const viewTokById = new Map<string, number>();
         let viewTokens = 0;
-        for (const m of viewMessages) viewTokens += countMessageTokens(m);
+        for (const m of viewMessages) {
+            const t = countMessageTokens(m);
+            viewTokById.set(m.id, t);
+            viewTokens += t;
+        }
+        // This-fold ratio only: lastCompress, the degenerate-fold gate and the
+        // staged-compress note all judge ONE rewrite, never the session (#4227).
+        // #3307: keep the raw-inbound total alongside (log-only) so one capture
+        // shows the view-factor collapse — V=live vs Vraw=inbound — separating it
+        // from the residual chars/4-vs-BPE estimator factor without a second trip.
+        let rawViewTokens = 0;
+        for (const m of ctx.compressMessages ?? ctx.messages) rawViewTokens += countMessageTokens(m);
         const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
@@ -1059,9 +1444,27 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // upstream eviction.
         const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
         const activeBlockCount = res.state.blocks.filter((b) => b.active).length;
-        const postCtx = Math.max(0, viewTokens - r.tokensCompressed);
+        // #4227: postCtx is the RENDERED post-fold context — raw view minus what
+        // EVERY active block covers (union, so overlapping merged blocks count
+        // once), not "raw view minus this fold". The old value ignored all
+        // earlier blocks' net savings: with 86+ active blocks it read as the
+        // full resend mass (#4224: postCtx≈14.5M while most of it was already
+        // covered) and printed "shrink 0%" + "ceiling ≥0%" for a heavily
+        // compressed session. Single-block sessions are byte-identical to the
+        // old value (union == this fold); re-entering anchors stay reported
+        // separately as anchor≈ below, so nothing double-counts.
+        const coveredIds = new Set<string>();
+        for (const b of res.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) coveredIds.add(id);
+        let coveredTok = 0;
+        for (const id of coveredIds) {
+            const t = viewTokById.get(id);
+            if (t !== undefined) coveredTok += t;
+        }
+        const postCtx = Math.max(0, viewTokens - coveredTok);
+        const cumSaved = Math.max(0, viewTokens - postCtx);
+        const cumShrinkRatio = viewTokens > 0 ? Math.min(1, cumSaved / viewTokens) : 0;
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
-        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% this-fold (~${r.tokensCompressed}/${viewTokens} tok) · cumulative ${Math.round(cumShrinkRatio * 100)}% (~${cumSaved}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
         // #1911: a fold covering most of the live context is a degenerate reset —
         // legitimate as a marathon-session strategy, but it rewrites the whole
         // prefix and leaves only the anchor summaries. Hosts need a
@@ -1072,11 +1475,20 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
-        recordCacheFoldsFromBlocks(
-            ctx.session,
-            res.state.blocks.filter((b) => !beforeIds.has(b.blockId)),
-            { V: viewTokens, Vp: postCtx },
-        );
+        const newFoldBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
+        // #3307: the ledger credits a fold only when firstFoldStartTokens=X < billed
+        // input, but X is a kernel chars/4 estimate vs provider-billed input — in long
+        // sessions X can land >= input and the re-pay drops unattributed. Log X plus the
+        // same-space view tokens (V/Vp) so one capture separates unit-scale from view
+        // identity as the inflation source.
+        if (newFoldBlocks.length > 0) {
+            // P3-A3: one prefix-summed pass for every block's startRef instead
+            // of one whole-map rescan per block (see prefixTokenOffsets).
+            const xByRef = prefixTokenOffsets(ctx.session, newFoldBlocks.flatMap((b) => (b.startRef ? [b.startRef] : [])));
+            const xs = newFoldBlocks.map((b) => (b.startRef ? `${b.startRef}=${xByRef.get(b.startRef) ?? 0}` : `${b.blockId}=none`)).join(" ");
+            ctx.log(`[acp-compress-obs] fold-attribution X(firstFoldStartTokens)=${xs} · V=${viewTokens} Vraw=${rawViewTokens} Vp=${postCtx} (#3307)`);
+        }
+        recordCacheFoldsFromBlocks(ctx.session, newFoldBlocks, { V: viewTokens, Vp: postCtx });
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         // #1495: apply-layer per-range errors (unknown refs, …) were invisible

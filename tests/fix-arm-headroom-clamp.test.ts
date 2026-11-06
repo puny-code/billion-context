@@ -201,12 +201,13 @@ test("the stated-window arm is clamped to the headroom-reserved judging limit", 
         s.stats.lastInputTokens < WINDOW,
         `arm ${s.stats.lastInputTokens} must sit BELOW the stated window ${WINDOW}`,
     );
-    // The reserved judging limit, read exactly the way relay.ts does (a
-    // `metadata` value is typed loosely, so narrow it before comparing).
+    // The reserved judging limit, read exactly the way relay.ts does (#4205:
+    // per-request twin of the unreserved display window; `metadata` values are
+    // typed loosely, so narrow before comparing).
     const judgingLimit =
-        typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0
-            ? s.metadata.effectiveContextLimit
-            : 0;
+        typeof s.metadata.reservedContextLimit === "number" && s.metadata.reservedContextLimit > 0
+            ? s.metadata.reservedContextLimit
+            : typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
     assert.ok(judgingLimit > 0, "handle must have recorded the reserved judging limit");
     assert.ok(
         s.stats.lastInputTokens <= judgingLimit,

@@ -14,6 +14,7 @@ import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 // #3417 lane-decisions truth table (characterization pass): pin the CURRENT
 // compress-surface behavior (standing prompt + nudge) per lane across all four
@@ -47,7 +48,7 @@ for (const key of ["HOME", "APPHOME", "HERMES_HOME", "XDG_STATE_HOME", "XDG_DATA
 
 type Wire = "anthropic" | "openai" | "responses" | "google";
 // "proxy" = no x-bili-plugin header at all (plain client; bili injects its own tools).
-type Lane = "omp" | "dsh" | "pi" | "opencode" | "proxy";
+type Lane = "omp" | "dsh" | "pi" | "opencode" | "zcode" | "proxy";
 
 interface RowOutcome {
     nudge: boolean;
@@ -81,20 +82,6 @@ function historyTexts(): string[] {
 // teachTokens: what the fake upstream REPORTS as input_tokens on every reply.
 // The loop adopts it as the next turn's tokenCount (usage-grade baseline), so
 // this is how each row dials context usage against the 64k declared window.
-const CLOSE_TIMEOUT_MS = 5_000;
-// #3731: bound the teardown 'close' await. Under Windows runner-pool load a delayed
-// or lost 'close' makes `await once(server,"close")` a handle-less dangling await that
-// drains the event loop, so node --test aborts the WHOLE file and records every sibling
-// subtest as cancelledByParent with ZERO assertion failures. The live timer keeps the
-// loop alive so the promise always settles; per-test/--test-timeout do NOT rescue this
-// (node:test's timer is unref'd). closeAllConnections already freed every socket.
-const settledClose = (srv: http.Server): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined = undefined;
-    const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, CLOSE_TIMEOUT_MS); });
-    return Promise.race([once(srv, "close"), timeout]).then(() => {
-        if (timer !== undefined) clearTimeout(timer);
-    });
-};
 
 async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
     // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
@@ -183,10 +170,10 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
         };
     };
     const endpoint = wire === "anthropic" ? "/v1/messages" : wire === "openai" ? "/v1/chat/completions" : wire === "responses" ? "/v1/responses" : "/v1beta/models/model-test:generateContent";
-    const send = async (texts: string[]) => {
+    const send = async (texts: string[], opts?: { headerless?: boolean }) => {
         const r = await fetch(`${origin}/bili/${upstreamUrl}${endpoint}`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" ? {} : { "x-bili-plugin": lane }) },
+            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" || opts?.headerless ? {} : { "x-bili-plugin": lane }) },
             body: JSON.stringify(buildBody(texts)),
         });
         const bodyText = await r.text();
@@ -194,12 +181,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     };
     const close = async () => {
         store.cancelAll();
-        // closeAllConnections destroys keep-alive sockets that close() alone
-        // would wait on forever (server.close only completes once every
-        // connection ends) — belt-and-suspenders against teardown hangs.
-        proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
-        upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
-        await Promise.all([settledClose(proxy), settledClose(upstream)]);
+        await closeServers([proxy, upstream], "lane-decisions harness");
     };
     return { send, forwarded, close };
 }
@@ -246,7 +228,7 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; headerlessProbe?: boolean; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
@@ -296,6 +278,30 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #4344 FIX ROWS (zcode). zcode reaches the ACP tools ONLY through its MCP
+    // bridge, and bridge delivery is environmental (agent modes gate MCP tools;
+    // the degraded shim serves an EMPTY tool list). The profile now mirrors
+    // that truth: host-scoped, observed per request — a lane whose bridge is
+    // absent goes silent instead of advertising a tool the model cannot call
+    // (the #4344 shape: 5+ T1 nudges at 21-29% usage, 0 compressions in 46
+    // requests). The dialect row is the companion fix: a healthy bridge
+    // declares mcp__bili__compress, which counts as reachable (#4344).
+    { name: "zcode no-tools drops the surface (#4344: bridge absent → do not advertise)", lane: "zcode", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "zcode mcp__bili__compress keeps the surface (#4344 dialect-aware reachability)", lane: "zcode", tools: ["mcp__bili__compress", "mcp__bili__acp_status"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "zcode bare compress keeps the surface (#4344 observed declaration)", lane: "zcode", tools: ["compress", "get_weather"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "zcode single regular tool still drops the surface (precision retained)", lane: "zcode", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #2155 FIX ROW: the sticky zcode session serves a HEADERLESS round (the
+    // zombie shape — plugin gone from the client, session still bound). The
+    // nudge channel doubles as the self-heal probe: #4372's host-scoped zcode
+    // profile read these rounds as unreachable and starved zombieStreak, so
+    // degrade-to-proxy never fired (issue2155-self-heal red on master). A
+    // headerless plugin-bound round keeps the surface ON; the #4344 silent
+    // bridge (header PRESENT, tools empty — row above) keeps going silent.
+    { name: "zcode headerless zombie round keeps the surface (#2155 probe must stay armed)", lane: "zcode", tools: [], headerlessProbe: true, expect: () => ({ nudge: true, standingPrompt: true }) },
+    // Dialect reachability is lane-independent: any host-scoped lane whose
+    // wire carries the MCP-prefixed compress reads reachable, same as #3401's
+    // bare-name observation on dsh.
+    { name: "dsh mcp__bili__compress keeps the surface (#4344 dialect is lane-independent)", lane: "dsh", tools: ["mcp__bili__compress"], expect: () => ({ nudge: true, standingPrompt: true }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
@@ -304,7 +310,7 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
             const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
-                await h.send(historyTexts());            // arm the nudge
+                await h.send(historyTexts(), { headerless: row.headerlessProbe === true });            // arm the nudge
                 assert.equal(h.forwarded.length, 2, "both turns forwarded");
                 const got = outcome(wire, historyTexts().length, h.forwarded[1]!);
                 const want = row.expect(wire);

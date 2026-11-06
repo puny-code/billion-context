@@ -16,118 +16,13 @@
     "anthropic": [
       {
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "input_schema": {
           "type": "object",
           "properties": {
-            "topic": {
-              "type": "string",
-              "description": "Optional short title for the compressed range"
-            },
             "content": {
-              "description": "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startId",
-                          "endId",
-                          "summary"
-                        ]
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startRef",
-                          "endRef",
-                          "summary"
-                        ]
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "string"
-                }
-              ]
-            },
-            "startId": {
               "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-            },
-            "endId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-            },
-            "startRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of startId"
-            },
-            "endRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of endId"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -227,118 +122,13 @@
         "type": "function",
         "function": {
           "name": "compress",
-          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
           "parameters": {
             "type": "object",
             "properties": {
-              "topic": {
-                "type": "string",
-                "description": "Optional short title for the compressed range"
-              },
               "content": {
-                "description": "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "anyOf": [
-                        {
-                          "type": "string",
-                          "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                        },
-                        {
-                          "type": "object",
-                          "properties": {
-                            "topic": {
-                              "type": "string"
-                            },
-                            "startId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the start of the range"
-                            },
-                            "endId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the end of the range"
-                            },
-                            "startRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of startId"
-                            },
-                            "endRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of endId"
-                            },
-                            "summary": {
-                              "type": "string",
-                              "description": "Self-contained summary replacing the range"
-                            }
-                          },
-                          "required": [
-                            "startId",
-                            "endId",
-                            "summary"
-                          ]
-                        },
-                        {
-                          "type": "object",
-                          "properties": {
-                            "topic": {
-                              "type": "string"
-                            },
-                            "startId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the start of the range"
-                            },
-                            "endId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the end of the range"
-                            },
-                            "startRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of startId"
-                            },
-                            "endRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of endId"
-                            },
-                            "summary": {
-                              "type": "string",
-                              "description": "Self-contained summary replacing the range"
-                            }
-                          },
-                          "required": [
-                            "startRef",
-                            "endRef",
-                            "summary"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "type": "string"
-                  }
-                ]
-              },
-              "startId": {
                 "type": "string",
-                "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-              },
-              "endId": {
-                "type": "string",
-                "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-              },
-              "startRef": {
-                "type": "string",
-                "description": "Flat single-range form: alternate spelling of startId"
-              },
-              "endRef": {
-                "type": "string",
-                "description": "Flat single-range form: alternate spelling of endId"
-              },
-              "summary": {
-                "type": "string",
-                "description": "Flat single-range form (no content): self-contained summary replacing the range"
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
               }
             }
           }
@@ -453,118 +243,13 @@
       {
         "type": "function",
         "name": "compress",
-        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool. Context management is provided by billion-context — report billion-context problems at github.com/ranxianglei/billion-context/issues.",
         "parameters": {
           "type": "object",
           "properties": {
-            "topic": {
-              "type": "string",
-              "description": "Optional short title for the compressed range"
-            },
             "content": {
-              "description": "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startId",
-                          "endId",
-                          "summary"
-                        ]
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startRef",
-                          "endRef",
-                          "summary"
-                        ]
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "string"
-                }
-              ]
-            },
-            "startId": {
               "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
-            },
-            "endId": {
-              "type": "string",
-              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
-            },
-            "startRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of startId"
-            },
-            "endRef": {
-              "type": "string",
-              "description": "Flat single-range form: alternate spelling of endId"
-            },
-            "summary": {
-              "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -671,7 +356,8 @@
     "contextWindow": "x-bili-plugin-context-window",
     "maxOutput": "x-bili-plugin-max-output",
     "model": "x-bili-plugin-model",
-    "instructionsMutable": "x-bili-plugin-instructions-mutable"
+    "instructionsMutable": "x-bili-plugin-instructions-mutable",
+    "compression": "x-bili-plugin-compression"
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",

@@ -17,13 +17,18 @@
  * `--- recent conflict-related log lines ---` (the exact signatures a
  * maintainer greps to adjudicate a native-compaction episode).
  *
- * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body. Secret
- * values are replaced before serialization and redactSecretsInText is applied
- * as a sink-level net; only profile NAMES are included, never absolute paths
- * (they would leak usernames). #3811: non-public endpoint hosts are masked too —
- * config URLs and conflict-log lines run through maskUrlsForPublish, which masks
- * unconditionally so the blob stays host-safe even when BILI_LOG_MASK_HOSTS=0
- * (the local host-visibility preference must not weaken the publish boundary).
+ * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body (copied
+ * verbatim AND embedded in the prefilled URL). Every byte passes redactForPublish
+ * at the SINK (buildDiagnostics) — unconditional host masking + credential-shape
+ * scrubbing, ignoring BILI_LOG_MASK_HOSTS so the local host-visibility preference
+ * can never weaken the publish boundary (#3811/#4427). Per-section redaction
+ * (config values, log tails, storage reason strings) runs upstream too; the sink
+ * is the guarantee that NO topic — present or future — can leak a private host, a
+ * credential shape, or a user-identifying home path (redactForPublish also rewrites
+ * $HOME→~ across the whole blob) even if its author forgets. Only profile NAMES are
+ * included; the storage force-retry lever keeps its absolute marker path for
+ * actionability, but the sink ~-normalizes any $HOME prefix so no username reaches
+ * the public body (#4427).
  *
  * Contract: NEVER throws — every fs/listSessions access is guarded so a
  * broken log file or an unbuilt store degrades the blob, not the endpoint.
@@ -37,7 +42,7 @@ import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
-import { maskUrlsForPublish, redactSecretsInText } from "../log-mask.js";
+import { redactForPublish } from "../log-mask.js";
 import { getLogPath } from "../logger.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
@@ -103,9 +108,19 @@ function candidateLogLines(): string[] {
 }
 
 /** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
- * match). The caller reads the rotated pair once per report (#3813). */
+ * match). The caller reads the rotated pair once per report (#3813). #4427:
+ * these are VERBATIM on-disk bytes (written under whatever BILI_LOG_MASK_HOSTS
+ * was in effect), so each line gets the same publish-boundary redaction +
+ * length bound as conflictLogTail — a [storage] line can carry a URL with
+ * credentials, a private host, or an absolute path. */
 function storageLogTail(lines: string[]): string[] {
-    return lines.filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES);
+    return lines
+        .filter((l) => l.includes("[storage]"))
+        .slice(-STORAGE_LOG_TAIL_LINES)
+        .map((l) => {
+            const masked = redactForPublish(l);
+            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+        });
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -126,11 +141,10 @@ function conflictLogTail(lines: string[]): string[] {
         .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
         .slice(-CONFLICT_LOG_TAIL_LINES)
         .map((l) => {
-            // #3811: redactSecretsInText scrubs credential shapes only — a URL in a
-            // log line keeps its host. maskUrlsForPublish masks it unconditionally,
-            // so under BILI_LOG_MASK_HOSTS=0 (real hosts in the on-disk log) the
-            // published tail still cannot leak them.
-            const masked = maskUrlsForPublish(redactSecretsInText(l));
+            // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
+            // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
+            // on-disk log) the published tail still cannot leak them.
+            const masked = redactForPublish(l);
             return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
         });
 }
@@ -242,11 +256,12 @@ function configSectionLines(): string[] {
     }
     let text: string;
     try {
-        // #3811: maskUrlsForPublish is the outermost sink net — it masks every
-        // non-public endpoint host whether it appears as a VALUE (upstream/proxy)
-        // or a providers-table KEY, and drops userinfo/query/hash (subsuming the
-        // old userinfo-only strip). Always on: the blob is publish-boundary.
-        text = maskUrlsForPublish(redactSecretsInText(JSON.stringify(maskSecretValues(parsed))));
+        // #3811: redactForPublish is the outermost sink net for this section — it
+        // masks every non-public endpoint host whether it appears as a VALUE
+        // (upstream/proxy) or a providers-table KEY, drops userinfo/query/hash
+        // (subsuming the old userinfo-only strip), AND scrubs credential shapes.
+        // Always on: the blob is publish-boundary.
+        text = redactForPublish(JSON.stringify(maskSecretValues(parsed)));
     } catch {
         lines.push("(config could not be serialized)");
         return lines;
@@ -347,7 +362,16 @@ export function buildDiagnostics(topic?: string): DiagnosticsReport {
     if (def) lines.push(...def.section(ctx));
     lines.push(...hostClientVersionLines());
     lines.push(...configSectionLines());
-    const blob = lines.join("\n");
+    // #4427: sink-level publish net — the blob lands in a PUBLIC GitHub issue
+    // body (copied verbatim AND embedded in the prefilled URL), so EVERY byte of
+    // every topic passes unconditional host masking + credential scrubbing right
+    // before serialization. This is the real choke point the header promises: it
+    // stops relying on each topic author remembering to sanitize its own fields
+    // (the storage section's raw log tail / free-form reason strings are exactly
+    // what slipped through before). Idempotent over the per-section redaction
+    // already applied upstream; both `blob` and the URL body derive from this one
+    // string so they can never diverge.
+    const blob = redactForPublish(lines.join("\n"));
     const title = def
         ? def.title()
         : `bili diagnostics report (v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`;

@@ -137,6 +137,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         const old = oldHistory();
         const pos = storedOf(old);
         const { plan } = planFor(old, codecSwitch(old), pos);
+        assert.equal(plan.pass0Desync, undefined, "aligned copy must not flag a desync");
         assert.equal(plan.byPos, 10, "every covered id claimed at its position");
         assert.equal(plan.byTool, 0, "rewritten toolCallId scheme defeats the tool pass — positional did the work");
         assert.equal(plan.byNorm, 0, "changed contentType literal defeats the norm pass — positional did the work");
@@ -284,6 +285,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         const { plan } = planFor(old, drifted, wrong);
         assert.equal(plan.byPos, 0, "misaligned copy must not claim");
         assert.ok(plan.unmatched.length > 0, "honest fallback to the legacy passes");
+        assert.equal(plan.pass0Desync, true, "#4390 p3: the silent Pass-0 degrade must be flagged for logging");
     });
 
     test("legacy plain-canon[] storage from the #2488 merge window still reconciles", () => {

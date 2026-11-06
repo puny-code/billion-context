@@ -28,6 +28,7 @@ import { activeBlockSpans } from "./block-map.js";
 import { createRenderRefsNode } from "./render-refs.js";
 import type { RenderStrategy } from "./render-refs.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasUnrecoverableMediaPayload,
@@ -36,7 +37,12 @@ import {
   isMessageProtectedWithPairing,
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  projectUnit,
+  collectCoverage,
+  createProjectionContext,
+} from "./unit-projection.js";
+import type { UnitProjectionContext } from "./unit-projection.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -327,6 +333,23 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
     const preExistingCoverage = collectCoverage(state);
 
+    // ONE projection context for the whole batch. Its expensive layer (id
+    // index, id→message map, protected-tool facts, turn groups, media verdicts)
+    // is a pure function of (input.messages, config) and `input.messages` is
+    // never mutated by this function — so rebuilding it per range was pure
+    // waste, and it dominates a multi-range apply (measured ~21ms fixed +
+    // ~5.2ms/range at 8650 messages). Its STATE layer (active blocks, block
+    // lookups, live checkpoint carriers) holds NO cache: every access reads the
+    // live block list of `state`, so the ranges below may keep appending,
+    // deactivating and refolding blocks without invalidating this context.
+    // What WOULD invalidate it (and makes projectUnit rebuild instead) is a
+    // different message array, a different state object, or a different config.
+    const projectionContext = createProjectionContext(
+      input.messages,
+      state,
+      input.config,
+    );
+
     // Classify every requested range ONCE. The result feeds overlap
     // skipSpecs, the minCompressRange pre-check, and the per-range loop —
     // previously each re-resolved and silently swallowed failures, so
@@ -344,6 +367,8 @@ export function createCore(ports: Ports = {}): CompressionCore {
           endRef: spec.endRef,
           messages: input.messages,
           state,
+          // Same map resolveBoundaries would build, built once per batch.
+          indexByMessageId: projectionContext.indexByMessageId,
         });
         classifications.set(spec, { status: "ok", resolved });
       } catch (error) {
@@ -490,7 +515,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
         }
         countedRanges++;
         for (const id of resolution.resolved.messageIds) {
-          const msg = input.messages.find((m) => m.id === id);
+          const msg = projectionContext.messageById.get(id);
           totalRangeChars += msg?.text?.length ?? 0;
         }
       }
@@ -729,6 +754,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           protectedMessageIds,
           countTokens,
           preExistingCoverage,
+          context: projectionContext,
         });
         blocksCreated += outcome.refolded ? outcome.refolded.length : 1;
         tokensCompressed += outcome.tokens;
@@ -1009,6 +1035,16 @@ const assignRefsNode: PipelineNode = {
     const hasPathPatterns = (ctx.config.protectedTools ?? []).some((p) =>
       p.includes("/"),
     );
+    // #4289: compress exchanges whose result applied ZERO ranges (receipt
+    // starts "[Compression FAILED") are refuse, not metadata — they fold like
+    // ordinary messages so a failing compress loop cannot permanently bloat
+    // context. Both halves are recognized here via the failed-call id set in
+    // BOTH ref layouts (direct and path-pattern pairing), dialect-aware
+    // through ctx.config.isCompressTool (MCP-lane forms).
+    const failedCompressCallIds = collectFailedCompressCallIds(
+      io.messages,
+      ctx.config,
+    );
     const pathProtectedCallIds =
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
@@ -1022,8 +1058,13 @@ const assignRefsNode: PipelineNode = {
       hasUnrecoverableMediaPayload(m) ||
       (hasProtection
         ? (pathProtectedCallIds
-            ? isMessageProtectedWithPairing(m, ctx.config, pathProtectedCallIds)
-            : isMessageProtected(m, ctx.config)) ||
+            ? isMessageProtectedWithPairing(
+                m,
+                ctx.config,
+                pathProtectedCallIds,
+                failedCompressCallIds,
+              )
+            : isMessageProtected(m, ctx.config, failedCompressCallIds)) ||
           (latest ? isMessageLatestProtected(m, latest) : false)
         : false);
     const refResult = assignRefs(io.messages, {
@@ -1461,6 +1502,11 @@ interface SingleRangeInput {
   protectedMessageIds?: Set<string>;
   countTokens: (text: string) => number;
   preExistingCoverage: Set<string>;
+  /** Projection context shared by all ranges of one apply batch; bound to the
+   *  same `messages` and `state` objects. Safe to keep across ranges even
+   *  though they mutate `state.blocks`: the context caches nothing derived
+   *  from state. */
+  context: UnitProjectionContext;
 }
 
 interface SingleRangeOutcome {
@@ -1485,6 +1531,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     preExistingCoverage: input.preExistingCoverage,
     protectedMessageIds: input.protectedMessageIds,
     warnings,
+    context: input.context,
   });
   if (projection.fatal) throw projection.fatal.error;
   const {
@@ -1542,7 +1589,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
 
   let compressedTokens = 0;
   for (const id of filteredIds) {
-    const message = input.messages.find((entry) => entry.id === id);
+    const message = input.context.messageById.get(id);
     compressedTokens += message
       ? countMessageTokens(message, input.countTokens)
       : 0;
@@ -1555,6 +1602,13 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   }
 
   const blockId = allocateBlockId(input.state);
+  // #4316 layer 3: resolve the fold's ledger interval before constructing the
+  // block. The claim is recorded only when it is EXACT — see
+  // resolveCoverageInterval.
+  const interval = resolveCoverageInterval(
+    filteredIds.map((id) => input.context.messageById.get(id)),
+    consumedBlockIds.map((id) => blockById(input.state, id)),
+  );
   const block: CompressionBlock = {
     blockId,
     runId: input.runId,
@@ -1572,6 +1626,9 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     compressCallId: input.spec.compressCallId,
     startRef: input.spec.startRef,
     endRef: input.spec.endRef,
+    ...(interval
+      ? { startSeq: interval.start, endSeq: interval.end }
+      : {}),
   };
   input.state.blocks.push(block);
 
@@ -1581,6 +1638,61 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   }
 
   return { tokens: compressedTokens, warnings };
+}
+
+/**
+ * #4316 layer 3: compute a fold's unified-ledger interval claim from its
+ * direct (folded) messages and consumed blocks. Returns [start, end] ONLY
+ * when the claim is exact:
+ *   - every direct message carries an integer ledgerSeq stamp;
+ *   - every consumed block carries its own startSeq/endSeq bounds;
+ *   - merging the resulting segments (direct seq points + consumed
+ *     intervals, overlaps/adjacency merged) yields exactly ONE contiguous
+ *     segment — a hole between them means [min, max] would swallow messages
+ *     the fold does not actually cover, so no bounds are recorded and the
+ *     id path stays authoritative for this block. Never guessed.
+ */
+function resolveCoverageInterval(
+  directMessages: Array<CoreMessage | undefined>,
+  consumedBlocks: Array<CompressionBlock | undefined>,
+): { start: number; end: number } | undefined {
+  const segments: Array<{ start: number; end: number }> = [];
+  for (const message of directMessages) {
+    if (
+      !message ||
+      typeof message.ledgerSeq !== "number" ||
+      !Number.isInteger(message.ledgerSeq)
+    ) {
+      return undefined; // unstamped direct traffic — never guess
+    }
+    segments.push({ start: message.ledgerSeq, end: message.ledgerSeq });
+  }
+  for (const consumed of consumedBlocks) {
+    if (
+      !consumed ||
+      typeof consumed.startSeq !== "number" ||
+      typeof consumed.endSeq !== "number" ||
+      consumed.endSeq < consumed.startSeq ||
+      consumed.startSeq < 0 ||
+      consumed.endSeq < 0
+    ) {
+      return undefined; // unbounded consumed block (or legacy) — never guess
+    }
+    segments.push({ start: consumed.startSeq, end: consumed.endSeq });
+  }
+  if (segments.length === 0) return undefined;
+  segments.sort((a, b) => a.start - b.start || a.end - b.end);
+  let merged = { ...segments[0]! };
+  for (const segment of segments.slice(1)) {
+    if (segment.start <= merged.end + 1) {
+      // Adjacent or overlapping — merge (overlap can only shrink the union,
+      // keeping the [min,max] claim exact).
+      if (segment.end > merged.end) merged.end = segment.end;
+    } else {
+      return undefined; // hole — a [min,max] claim would over-cover
+    }
+  }
+  return merged;
 }
 
 function validateCompressionRange(
@@ -2033,6 +2145,10 @@ function cloneState(state: CompressionState): CompressionState {
     pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
     lastPassIds: state.lastPassIds ? [...state.lastPassIds] : undefined,
+    // #4797: the one-time ledger-alignment gate must survive the fold clone
+    // too — same contract as the sync clone (kernel/src/sync.ts); dropping it
+    // re-arms the restamp on every applyCompression.
+    refLedgerAligned: state.refLedgerAligned,
   };
 }
 

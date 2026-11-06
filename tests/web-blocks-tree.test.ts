@@ -8,9 +8,10 @@ import { createInitialState, defaultCountTokens } from "acp-kernel";
 import type { CompressionBlock } from "acp-kernel";
 import { LazyBlockContents, _resetSessionsForTest, getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail } from "../src/web/sessions-data.ts";
+import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree } from "../src/web/sessions-data.ts";
 import { MESSAGES } from "../src/web/i18n.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { WEB_STYLES } from "../src/web/styles.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -168,7 +169,24 @@ test("#3917: a folded message the host pruned reports a miss instead of a guess"
     assert.deepEqual(await buildMessageContent("tree-pruned", "m00001"), { ok: false, reason: "unknown-message" });
 });
 
-test("#3917: the tree's strings exist in both locales with identical placeholders", () => {
+test("#4173: the live tree endpoint ships ids/tiers/edges/spans — no summaries", async () => {
+    // #4173 review: nodes label their covered message span; non-monotonic
+    // stored spans are canonicalized ascending before leaving the server.
+    const t1 = mkBlock("b1", 1, "## T1 summary\n- point one", ["rm1"], ["rm1"], [], ["m00010", "m00005"]);
+    const t2 = mkBlock("b2", 2, "T2 summary", ["rm3"], ["rm1", "rm3"], ["b1"], ["m00001", "m00030"]);
+    seedSession("tree-live", [t1, t2]);
+    const tree = await buildSessionTree("tree-live");
+    assert.ok(tree);
+    assert.equal(tree.blocks.length, 2);
+    const byId = new Map(tree.blocks.map((b) => [b.blockId, b]));
+    assert.deepEqual(byId.get("b1"), { blockId: "b1", tier: 1, active: true, startRef: "m00005", endRef: "m00010", parentBlockId: "b2", directBlockIds: [] }, "the child names its fold parent AND its message span");
+    assert.deepEqual(byId.get("b2"), { blockId: "b2", tier: 2, active: true, startRef: "m00001", endRef: "m00030", directBlockIds: ["b1"] }, "the root has no parent field at all");
+    // The whole point of the compact feed: no summary bytes on the wire.
+    assert.ok(!JSON.stringify(tree).includes("point one"), "summaries never leave the server");
+    assert.equal(await buildSessionTree("no-such-session"), null, "unknown session resolves to a 404 payload");
+});
+
+test("#4608: the pane's strings exist in both locales with identical placeholders", () => {
     const keys = [
         "det.tab_overview",
         "det.tab_blocks",
@@ -185,11 +203,17 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
         "det.tree_orig_missing",
         "det.tree_msgs_unavailable",
         "det.tree_msg_gone",
-        "det.tree_hint",
-        "det.tree_view_list",
         "det.tree_view_graph",
-        "det.tree_graph_hint",
-        "det.tree_graph_legend",
+        "det.tree_view_list",
+        "det.tree_list_hint",
+        "det.tree_expand_all",
+        "det.tree_collapse_all",
+        "det.tree_interact",
+        "det.block_detail_title",
+        "det.block_side_hint",
+        "det.block_side_live",
+        "det.tree_sum_more",
+        "det.tree_sum_less",
     ];
     const placeholders = (s: string) => (s.match(/\{[a-z]+\}/g) ?? []).sort().join(",");
     for (const key of keys) {
@@ -201,15 +225,126 @@ test("#3917: the tree's strings exist in both locales with identical placeholder
     }
 });
 
-test("#3917: the web client bundle stays parseable JS after the tree additions", () => {
+test("#4608: the web client bundle stays parseable JS with the master-detail pane wired", () => {
     assert.doesNotThrow(() => new vm.Script(WEB_CLIENT), "WEB_CLIENT must compile as a standalone script");
     assert.match(WEB_CLIENT, /function buildTreePane\(blocks\)/);
     assert.match(WEB_CLIENT, /\/block-content\?blockId=/);
-    // the graph reading of the same folds: layered boxes + list⇄graph switch
-    assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks\)/);
-    assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks\)/);
-    assert.match(WEB_CLIENT, /"g-node tier-" \+/);
-    assert.match(WEB_CLIENT, /data-mode="graph"/);
+    // collapsible tree reading (default) + the restored classic list
+    assert.match(WEB_CLIENT, /function collapTreeLayout\(blocks/);
+    assert.match(WEB_CLIENT, /function renderCollapSvg\(blocks/);
+    assert.match(WEB_CLIENT, /function sidePanelHtml\(b, idx\)/);
+    assert.match(WEB_CLIENT, /function blockNodeHtml\(b, shape, idx, depth\)/);
     assert.match(WEB_CLIENT, /id="tree-graph"/);
-    assert.match(WEB_CLIENT, /\.block-node\[data-bid=/);
+    assert.match(WEB_CLIENT, /id="tree-list"/);
+    assert.match(WEB_CLIENT, /id="bd-panels"/);
+    assert.match(WEB_CLIENT, /data-mode="tree"/);
+    assert.match(WEB_CLIENT, /data-mode="list"/);
+    assert.match(WEB_CLIENT, /"g-node tier-" \+/);
+    assert.match(WEB_CLIENT, /tchip/);
+    // point hit-testing survives innerHTML swaps; the mode choice persists
+    assert.match(WEB_CLIENT, /document\.elementFromPoint/);
+    assert.match(WEB_CLIENT, /sessionStorage\.setItem\("bili-tree-mode"/);
+    assert.match(WEB_CLIENT, /let treeViewState = null;/);
+    assert.match(WEB_CLIENT, /window\.__biliDetailBlocks = blocks;/);
+    // live lane repaints only the tree drawing from GET /sessions/<id>/tree
+    assert.match(WEB_CLIENT, /function refreshTreeMap\(\)/);
+    assert.match(WEB_CLIENT, /renderCollapSvg\(r\.blocks/);
+    assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring still present");
+    // raw-view buttons stay reversible; the clamp machinery now measures panels
+    assert.match(WEB_CLIENT, /if \(!box\.hidden && box\.getAttribute\("data-view"\) === view\) \{ box\.hidden = true; return; \}/);
+    assert.match(WEB_CLIENT, /blk-sum clamp/);
+    assert.match(WEB_CLIENT, /body\.__sumChk/);
+});
+
+// Run the actual drawing code out of the bundle against fixtures (#4173
+// precedent): the section is extracted between stable function anchors and
+// executed in a vm with the page helpers stubbed.
+interface PaneBlock {
+    blockId: string;
+    tier?: number;
+    active?: boolean;
+    topic?: string;
+    startRef?: string;
+    endRef?: string;
+    parentBlockId?: string;
+    compressedTokens?: number;
+    summaryTokens?: number;
+}
+interface PaneApi {
+    collapTreeLayout(blocks: PaneBlock[], expanded: Record<string, boolean>): { nodes: { b: PaneBlock; x: number; y: number }[]; links: unknown[]; sizes: Record<string, number> };
+    renderCollapSvg(blocks: PaneBlock[], expanded: Record<string, boolean>, selectedBid?: string): { html: string };
+    buildTreePane(blocks: PaneBlock[]): string;
+}
+function loadPaneApi(): PaneApi {
+    const start = WEB_CLIENT.indexOf("function blockTreeStats(");
+    const end = WEB_CLIENT.indexOf("function buildDetailHtml(d) {");
+    assert.ok(start > 0 && end > start, "pane section anchors present in the bundle");
+    const stubs = [
+        "var escapeHtml=function(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');};",
+        "var fmtW=function(n){return String(n);};",
+        "var fmtB=function(n){return String(n)+'B';};",
+        "var timeAgo=function(){return 'now';};",
+        "var blockTopic=function(b){return b.topic||'';};",
+        "var t=function(k,v){return k;};",
+        "var renderBlockMd=function(s){return '<p>'+escapeHtml(String(s))+'</p>';};",
+        "var window={};",
+    ].join("");
+    const ctx = vm.createContext({});
+    vm.runInContext(stubs + WEB_CLIENT.slice(start, end) + "\nthis.api={collapTreeLayout:collapTreeLayout,renderCollapSvg:renderCollapSvg,buildTreePane:buildTreePane};this.api", ctx, { filename: "web-pane.js" });
+    return (ctx as { api: PaneApi }).api;
+}
+
+// vm-run code returns foreign-realm arrays/objects; JSON round-trip on the
+// host side restores plain prototypes so deepEqual compares structure, not realms.
+const fromVm = (x: unknown) => JSON.parse(JSON.stringify(x)) as never;
+
+test("#4608: the collapsible tree shows roots until a branch is opened; chips count what hides", () => {
+    const api = loadPaneApi();
+    const fam: PaneBlock[] = [
+        { blockId: "r1", tier: 1, active: true, topic: "root topic" },
+        { blockId: "k1", tier: 2, active: true, parentBlockId: "r1" },
+        { blockId: "k2", tier: 2, active: false, parentBlockId: "r1" },
+    ];
+    const folded = api.collapTreeLayout(fam, {});
+    assert.deepEqual(fromVm(folded.nodes.map((n) => n.b.blockId)), ["r1"], "only roots sit on canvas by default");
+    assert.equal(folded.sizes.r1, 3, "subtree size counts the hidden descendants");
+    const open = api.collapTreeLayout(fam, { r1: true });
+    assert.equal(open.nodes.length, 3);
+    assert.equal(open.links.length, 2);
+    assert.equal(open.nodes.find((n) => n.b.blockId === "k1")!.x, 1, "children land one column deeper");
+    const svgF = api.renderCollapSvg(fam, {}, "").html;
+    assert.ok(svgF.includes("+2"), "the closed branch advertises how much hides behind it");
+    assert.ok(svgF.includes('data-toggle="r1"'), "chips toggle their parent");
+    assert.ok(!svgF.includes("k1"), "collapsed children never reach the DOM");
+    const svgO = api.renderCollapSvg(fam, { r1: true }, "k2").html;
+    assert.ok(svgO.includes("\u2212") || svgO.includes("-"), "the open branch offers a collapse mark");
+    assert.ok(svgO.includes("fsel"), "selection rides the node");
+    assert.ok(svgO.includes("tier-2 inactive"), "archived children keep the dashed styling");
+    assert.equal(api.renderCollapSvg([], {}, "").html, "", "an empty forest renders nothing");
+});
+
+test("#4608: buildTreePane wires the two drawings beside the pre-rendered panels", () => {
+    const api = loadPaneApi();
+    const fam: PaneBlock[] = [
+        { blockId: "r1", tier: 1, active: true, topic: "root topic" },
+        { blockId: "k1", tier: 2, active: true, parentBlockId: "r1", compressedTokens: 9, summaryTokens: 1 },
+    ];
+    const pane = api.buildTreePane(fam);
+    assert.ok(pane.includes('id="tree-graph"') && !pane.includes('id="tree-graph" hidden'), "the tree reading shows by default");
+    assert.ok(pane.includes('id="tree-list" hidden'), "the classic list starts under the tree");
+    assert.ok(pane.includes('class="block-item block-node tier-1"'), "the classic list keeps the master-folded rows");
+    assert.equal((pane.match(/class="bd-panel"/g) || []).length, 2, "one pre-rendered panel per block");
+    assert.ok(pane.includes('data-mode="tree"') && pane.includes('data-mode="list"'), "mode switch offers both readings");
+    assert.ok(!pane.includes("flame-stage"), "no flame leftovers in the pane");
+    assert.ok(pane.includes('id="tm-expand-all"'), "expand/collapse controls ship with the tree mode");
+    assert.ok(!api.buildTreePane([]).includes("tree-list"), "no blocks -> the empty card, no frames");
+});
+
+test("#4737 review: pane surfaces follow the theme and list markdown rules keep their element suffixes", () => {
+    assert.ok(!/\.fd-left \{[^}]*#fff/.test(WEB_STYLES), ".fd-left must not hardcode white (dark scheme)");
+    assert.ok(!/\.bd-card \{[^}]*#fff/.test(WEB_STYLES), ".bd-card must not hardcode white (dark scheme)");
+    assert.ok(!/\.block-item \.body\.md,/.test(WEB_STYLES), "no bare '.block-item .body.md,' selector (element suffix dropped)");
+    for (const sel of ["p", "h2", "ul", "li", "pre", "code", "blockquote", "hr", "strong"]) {
+        assert.match(WEB_STYLES, new RegExp(`\\.block-item \\.body\\.md ${sel},`), `list-mode ${sel} rule keeps its element suffix`);
+    }
 });

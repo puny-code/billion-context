@@ -33,6 +33,7 @@
  * lone-duplicate degrade (seam-too-short → legacy fallback, reason recorded),
  * (c) block-unanchored degrade.
  */
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction, type SymVal } from "../verif/symbolic.ts";
@@ -42,7 +43,7 @@ import { maybeSnapshotView } from "../src/server/snapshot-render.ts";
 import { _setStoreForTest, type SessionStore } from "../src/persist.ts";
 import type { BiliMessage } from "acp-kernel/wire";
 
-const SR_FILE = new URL("../src/server/snapshot-render.ts", import.meta.url).pathname;
+const SR_FILE = fileURLToPath(new URL("../src/server/snapshot-render.ts", import.meta.url));
 
 function haveSolver(): boolean {
   try {
@@ -74,6 +75,7 @@ test("bug3756 judge: buildView keeps the client tail and the summary anchor (sym
   const row = (seq: number, id: Term, text: Term): SymVal =>
     objv([
       ["seq", numv(seq)],
+      ["msgId", strv(id)],
       ["content", strv(S0.concat(id).concat(S1).concat(ROLE).concat(S2).concat(CT).concat(S3).concat(text).concat(S4))],
     ]);
   const rows = arrv([row(1, r1, t1), row(2, r2, t2), row(3, r3, t3)]);
@@ -106,6 +108,12 @@ test("bug3756 judge: buildView keeps the client tail and the summary anchor (sym
         getStore: (): SymVal => objv([]),
         __method_unifiedTailViewRows: (): SymVal => rows,
         __method_unifiedTailSeqs: (): SymVal => arrv([numv(1), numv(2), numv(3)]),
+        __method_unifiedMessageIdRows: (): SymVal => arrv([
+          objv([["seq", numv(1)], ["msgId", strv(r1)]]),
+          objv([["seq", numv(2)], ["msgId", strv(r2)]]),
+          objv([["seq", numv(3)], ["msgId", strv(r3)]]),
+        ]),
+        __method_unifiedUncoveredRows: (): SymVal => rows,
       },
     },
   }).exec();
@@ -188,8 +196,16 @@ test("bug3756 replay: maybeSnapshotView end-to-end on real JS (success / #3812 l
       content: JSON.stringify({ id, role: "user", contentType: "text", text: `body-${id}` }),
       contentHash: `h${i}`, tokens: 3,
     }));
-  const fakeStore = (rows: unknown[] | null): SessionStore =>
-    ({ unifiedTailViewRows: () => rows, unifiedTailSeqs: () => (rows ? rows.map((_, i) => i + 1) : null) }) as unknown as SessionStore;
+  const fakeStore = (rows: unknown[] | null): SessionStore => {
+    const list = rows as { seq: number; msgId: string }[] | null;
+    return ({
+      unifiedTailViewRows: () => rows,
+      unifiedTailSeqs: () => (rows ? rows.map((_, i) => i + 1) : null),
+      unifiedMessageIdRows: () => (list ? list.map(({ seq, msgId }) => ({ seq, msgId })) : null),
+      unifiedUncoveredRows: (_id: string, intervals: readonly [number, number][]) =>
+        (list ? list.filter((r) => !intervals.some(([a, b]) => r.seq >= a && r.seq <= b)) : null),
+    }) as unknown as SessionStore;
+  };
   const mkSession = (blockIds: string[]): { session: never; blocks: never } => {
     const session = {
       id: "s1",

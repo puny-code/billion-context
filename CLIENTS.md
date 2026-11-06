@@ -98,14 +98,31 @@ Two lanes, same plugin (#941):
     No patch layer can address that NESTED row by id — dsh's patch engine
     indexes only top-level rows and true group children — so the bundled
     `auto: false` lands on web-app's already-disabled host-plane row and
-    changes nothing. Since #3354 bili closes the gap at LOAD TIME: the
-    `bili-native` bundle entry registers a cordis `internal/config` overlay
-    (vendored from deshark42/dsh-compaction-basic-disable, MIT) that marks
-    the preset's `compaction-basic` and `command-compact` rows
-    `disabled: true`, and the preset gate rows in the bundle patch make each
-    Web preset wait for that overlay before it can register. Native
+     changes nothing. Since #3354 bili closes the gap at LOAD TIME: an
+     always-on bundle entry `bili-compaction-gate` — a separate cordis entry
+     beside `bili-native`, mounted by the same patch layers, so it stays
+     alive when `bili-native` is disabled or kill-switched (#3662) —
+     registers a cordis `internal/config` overlay (vendored from
+     deshark42/dsh-compaction-basic-disable, MIT) that marks the preset's
+     `compaction-basic` and `command-compact` rows `disabled: true` while
+     bili owns the lane, and the preset gate rows in the bundle patch make
+     each Web preset wait for that overlay's service before it can register.
+     Native
     auto-compaction is OFF in these profiles too (and `/compact` is
-    unavailable there); ACP compression is unaffected. The overlay rides an
+    unavailable there — that is EXPECTED, not a bug (#4002): bili owns
+    compression on the lane, so the preset's compact command and its
+    auto-compaction are both stood down deliberately; there is no
+    re-enable switch by design (#3651/#3666), see CONFIGURATION.md);
+    ACP compression is unaffected. Since #4147 the overlay matches
+    STRUCTURALLY — any entry whose resolved `config.plugins` nests
+    `compaction-basic`/`command-compact` rows gets them disabled, custom
+    and profile-local presets exactly like the factory ones (the four
+    gate-row ids in `dsh.bundle.patch.yml` are ordering insurance for the
+    factory roster, not the coverage boundary — a profile shipping other
+    preset ids is covered by the structural walk). The one-time `[dsh-client]`
+    boot note names the actual entries the overlay rewrote (#3962), so a
+    patch-row miss on a renamed roster is visible without reading the host
+    loader log. The overlay rides an
     INTERNAL dsh hook and is version-sensitive — if you still see a dsh
     compaction checkpoint land on a newer/older dsh build, fall back to the
     #2474 recipe: a profile-level patch (your profile's `cordis.patch.yml`,
@@ -118,9 +135,31 @@ Two lanes, same plugin (#941):
     leave the preset unrecognized by the roster — and `- insert:` with the
     same id appends a second dead row instead of merging. The snapshot also
     freezes the roster until re-copied after a dsh preset update. The plugin
-    logs a one-time `[dsh-client]` note naming both paths at boot in such
-    profiles.
-  - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
+     logs a one-time `[dsh-client]` note naming both paths at boot in such
+     profiles.
+   - **Disabling vs removing the plugin (#3662):** pre-#3662, disabling
+     `bili-native` (dsh plugin manager, or `disabled: true` in any patch
+     layer) removed the ONLY provider of the gate service while the preset
+     rows kept waiting on it — all four Web presets stayed pending forever
+     and every new/resumed session failed with
+     `Unknown agent preset: standard`. The service now lives in the
+     separate always-on `bili-compaction-gate` entry: disabling or
+     kill-switching (`BILLION_CONTEXT_PLUGIN=0`) `bili-native` hands the
+     lane back to STOCK dsh behavior — presets boot normally and native
+     auto-compaction returns; compression is simply off. Do NOT disable
+     `bili-compaction-gate` itself — that re-creates the brick. To fully
+     uninstall, remove `billion-context` from the profile's
+     `dsh.profile.bundles` (and its dependency) and restart: the whole
+     patch layer disappears and `compaction-basic` returns to stock
+     `auto: true`. If you are stuck on a pre-#3662 version with the plugin
+     already disabled, upgrading self-heals (the patch layer mounts from
+     whatever package is listed in bundles, regardless of `bili-native`'s
+     state); the manual un-brick is appending four rows to the HOME-layer
+     patch `$DSH_HOME/cordis.patch.yml` (`~/.dsh/cordis.patch.yml` when
+     `DSH_HOME` is unset) — `- id: preset-standard` / `preset-ptc` /
+     `preset-minimal` / `preset-cordis`, each with `inject: null`. Top-level
+     keys are replaced wholesale, clearing the pending latch.
+   - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
     the bare `billion-context` name in `dsh.profile.bundles` installation-
     anchor-first — from its own install tree (the global npm root) before the
     profile's `node_modules`. So if a machine-global `billion-context` exists
@@ -426,6 +465,8 @@ two small node scripts that do the work around the client:
 
 ## Codex (OpenAI Codex CLI)
 
+**Temporary catalog outages (#3993).** For authenticated `GET https://chatgpt.com/backend-api/codex/models` requests routed through Bili, a last-valid complete catalog can cover transport failures and HTTP 500/502/503/504. This prevents transient discovery failure from discarding Codex's known context/tool capabilities. The private cache is under the existing XDG cache directory (`codex-model-catalog-v1`); it is isolated by full URL/client version and credential/account/org/project fingerprints, contains no raw credentials, and is limited to 1 MiB per catalog, 16 entries and six hours. Online discovery always takes precedence; offline hits do not extend age. With a usable cache the network/body deadline is four seconds. Caller cancellation, 401/403, other explicit errors and invalid/empty catalogs do not become cached success. Cold, expired or changed-credential requests still need successful discovery. Offline replay does not clear the upstream circuit or prove inference reachability. No inference payload, compression mode or configured context limit is changed.
+
 **Window alignment.** Client-reported plugin/runtime windows and launcher windows
 take precedence over the bundled Codex model table. Without a report, a local
 proxy reads `models_cache.json` and the base `config.toml` under its `CODEX_HOME`
@@ -453,6 +494,8 @@ so the plugin can never route codex's own traffic. Three postures:
 | `bili codex` (launcher) | Full zero-config: a self-managed lane proxy (#1660 zone, sticky port) + cert-MITM env injected into codex — tools *and* compression |
 | `bili plugin install codex` + a running bili + self-exported `HTTPS_PROXY` | Tools + compression for power users who manage their own env |
 | `bili plugin install codex` alone | The four tools appear in codex but no conversation is proxied, so there is nothing for them to act on; `tools/list` fails with -32003 (`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) when nothing is reachable |
+
+**Concurrent sessions (#3203).** Several `bili codex` launches may run at once in the same project directory with the same `CODEX_HOME`: each launch takes its own per-session overlay slot (`<CODEX_HOME>-bili-s<N>`, pool of 16) and its own lane proxy, so routing, MCP conversation binding, and compression state never cross between sessions. With the shared-state default (codex ≥ 0.147.0) both sessions' history lands in the ONE live state db in the real home and survives any exit order — see `BILI_CODEX_STATE_MODE` in CONFIGURATION.md. Older binaries, or `BILI_CODEX_STATE_MODE=legacy`, keep one exclusive overlay per home: the second concurrent launch is refused with `BILI_OVERLAY_BUSY`.
 
 The install writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml`
 (command = node, args = dist/mcp.js). #1660 removed the install-time origin bake

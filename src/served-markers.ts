@@ -21,6 +21,9 @@ export interface WriterIdentity {
     pid: number;
     origin: string;
     version: string;
+    /** #3923/#3959: this instance's lane (e.g. "pi", "dsh") — additive;
+     *  markers written by older builds carry none and stay valid. */
+    lane?: string;
 }
 
 interface WriterMarkerFile {
@@ -29,8 +32,33 @@ interface WriterMarkerFile {
     pid: number;
     origin: string;
     version: string;
+    lane?: string;
+    /** Set only by a graceful dispose(): this instance recorded its FINAL
+     *  marker and will never commit again. Peers skip such markers outright —
+     *  a positively-known dead predecessor is not a concurrent writer, even
+     *  while its file is fresh (restart flows kill + immediately rebind).
+     *  Markers from older builds carry none and stay valid. */
+    stoppedAt?: number;
     /** sessionId → last commit time (ms epoch). */
     servedAt: Record<string, number>;
+}
+
+/** A surfaced split-brain contest: which session (id + resolved title) and
+ *  who is on each side (#3923/#3959). */
+interface SplitBrainContest {
+    sessionId: string;
+    title?: string;
+    self: WriterIdentity;
+    peer: WriterIdentity & { servedAt: number };
+    at: number;
+}
+
+interface ServedMarkerOptions {
+    /** Cheapest accessor for the session's display title (in-memory peek —
+     *  never a disk read). */
+    resolveTitle?: (sessionId: string) => string | undefined;
+    /** Surfacing seam: called once per contested peer, AFTER the log line. */
+    onContest?: (contest: SplitBrainContest) => void;
 }
 
 /** A peer that committed the same session within this window counts as
@@ -46,7 +74,8 @@ const MAX_TRACKED_SESSIONS = 128;
 const VERDICT_TTL_MS = 60_000;
 /** A peer counts as live when its pid is alive OR its marker was written
  *  within this window (covers platforms where the pid check cannot see the
- *  peer process). */
+ *  peer process). Gracefully-stopped peers are excluded upstream via
+ *  stoppedAt — this fallback only ever rescues CRASHED peers. */
 const PEER_FILE_FRESH_MS = 30_000;
 /** reapStaleWriterMarkers removes files whose pid is dead AND whose mtime is
  *  older than this. */
@@ -85,12 +114,13 @@ export interface ServedMarkerWriter {
     dispose(): void;
 }
 
-export function createServedMarkerWriter(identity: WriterIdentity, dir: string, log: (level: string, msg: string) => void): ServedMarkerWriter & { __flushForTest(): void; __servedForTest(): Record<string, number> } {
+export function createServedMarkerWriter(identity: WriterIdentity, dir: string, log: (level: string, msg: string) => void, opts?: ServedMarkerOptions): ServedMarkerWriter & { __flushForTest(): void; __servedForTest(): Record<string, number> } {
     const servedAt = new Map<string, number>();
     const verdicts = new Map<string, number>();
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
     let lastFlushAt = 0;
     let disposed = false;
+    let stoppedAt: number | undefined;
 
     const prune = (now: number): void => {
         for (const [id, at] of [...servedAt]) {
@@ -114,6 +144,8 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             pid: identity.pid,
             origin: identity.origin,
             version: identity.version,
+            ...(identity.lane === undefined || identity.lane === "" ? {} : { lane: identity.lane }),
+            ...(stoppedAt === undefined ? {} : { stoppedAt }),
             servedAt: Object.fromEntries(servedAt),
         };
         try {
@@ -144,7 +176,13 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
         if (last !== undefined && now - last < VERDICT_TTL_MS) return;
         verdicts.set(sessionId, now);
         for (const peer of findContestedWriters(dir, identity.instanceId, sessionId, now)) {
-            log("error", `[split-brain] session ${sessionId} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}, v${identity.version}) and another live instance (pid ${peer.pid}, ${peer.origin}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
+            // #3923/#3959: name the session (title when resolvable) and each
+            // side's lane — a real conflict must be attributable on its face.
+            const title = opts?.resolveTitle?.(sessionId);
+            const laneOf = (x: WriterIdentity): string => (x.lane === undefined || x.lane === "" ? "" : `, lane ${x.lane}`);
+            const titleOf = title === undefined || title === "" ? "" : ` "${title}"`;
+            log("error", `[split-brain] session ${sessionId}${titleOf} committed by BOTH this instance (pid ${identity.pid}, ${identity.origin}${laneOf(identity)}, v${identity.version}) and another live instance (pid ${peer.pid}, ${peer.origin}${laneOf(peer)}, v${peer.version}) within ${CONTEST_WINDOW_MS / 60000}m — fold decisions are invisible across instances and the last writer wins (#394/#405); stop one of them or align your client config so one conversation rides one proxy (#3923)`);
+            opts?.onContest?.({ sessionId, ...(title === undefined || title === "" ? {} : { title }), self: identity, peer, at: now });
         }
     };
 
@@ -160,7 +198,11 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             disposed = true;
             if (flushTimer !== undefined) clearTimeout(flushTimer);
             // final write (bypasses the disposed guard): peers should still be
-            // able to attribute this instance's last commits after shutdown
+            // able to attribute this instance's last commits after shutdown.
+            // stoppedAt marks the stop as GRACEFUL so peers never flag this
+            // predecessor in a split-brain contest — the freshness fallback
+            // must only rescue crashed peers whose death we cannot prove.
+            stoppedAt = Date.now();
             writeMarker();
         },
         __flushForTest(): void {
@@ -173,8 +215,11 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
 }
 
 /** Peer marker files that record a commit of `sessionId` inside the contest
- *  window by a LIVE foreign instance (pid alive or file fresh). Malformed or
- *  tearing files are skipped silently — a marker is observability, not data. */
+ *  window by a LIVE foreign instance (pid alive or file fresh). Markers
+ *  carrying stoppedAt (graceful shutdown) are skipped unconditionally — a
+ *  restart flow's predecessor died seconds ago and must not raise an alarm.
+ *  Malformed or tearing files are skipped silently — a marker is
+ *  observability, not data. */
 export function findContestedWriters(dir: string, selfInstanceId: string, sessionId: string, now: number): Array<WriterIdentity & { servedAt: number }> {
     let entries: fs.Dirent[];
     try {
@@ -189,6 +234,7 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         try {
             const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<WriterMarkerFile>;
             if (raw.v !== 1 || typeof raw.instanceId !== "string" || raw.instanceId === selfInstanceId) continue;
+            if (typeof raw.stoppedAt === "number") continue;
             const at = raw.servedAt !== null && typeof raw.servedAt === "object" ? (raw.servedAt as Record<string, unknown>)[sessionId] : undefined;
             if (typeof at !== "number" || now - at > CONTEST_WINDOW_MS) continue;
             const mtimeMs = fs.statSync(file).mtimeMs;
@@ -199,6 +245,7 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
                 pid: typeof raw.pid === "number" ? raw.pid : -1,
                 origin: typeof raw.origin === "string" ? raw.origin : "unknown",
                 version: typeof raw.version === "string" ? raw.version : "unknown",
+                lane: typeof raw.lane === "string" && raw.lane !== "" ? raw.lane : undefined,
                 servedAt: at,
             });
         } catch {

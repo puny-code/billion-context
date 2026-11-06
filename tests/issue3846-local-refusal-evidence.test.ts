@@ -318,3 +318,67 @@ test("e2e #3846 d: another ORIGIN is evaluated independently — the probe stays
         await close();
     }
 });
+
+// (#4079/#3974) The refusal evidence now carries a TTL (10 minutes): the
+// #3846 lock was real money protection, but a record that never expires
+// turned one bad hour into a permanent "this model is unusable" for the
+// session — the uninstall-event class from #3974. Both directions pinned:
+//   (e) an expired record no longer covers — the estimate-only probe may
+//       bet once again (that bet is cheap and self-correcting: usage
+//       settles, or a fresh refusal re-records with a fresh timestamp);
+//   (f) a record without a readable `at` (persisted before the TTL existed)
+//       is treated as expired too, so upgraded stuck sessions self-heal.
+test("e2e #4079 e: refusal evidence expires after the TTL — the probe reopens exactly once", async () => {
+    const up = makeUpstream();
+    const port = await listen(up);
+    const { ctx, close } = await setup({ [`http://127.0.0.1:${port}`]: { models: { "gpt-test": { context: WINDOW } } } });
+    try {
+        await seedAndRefuse(ctx, "i3846-e", "gpt-test");
+        demoteToEstimate("i3846-e");
+
+        const s = getSession("i3846-e")!;
+        const refusals = s.metadata.localRefusals as Array<{ at?: number }>;
+        assert.equal(refusals.length, 1, "one refusal record");
+        assert.equal(typeof refusals[0]!.at, "number", "the record carries a readable timestamp");
+
+        // Backdate past the TTL.
+        refusals[0]!.at = Date.now() - 11 * 60_000;
+
+        // The expired record no longer covers: the estimate-only probe may
+        // bet once again (and here the bet lands — usage settles afresh).
+        const r = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
+        assert.equal(r.status, 200, "an expired record lets the probe bet once again");
+        await r.text();
+        assert.equal(streamCalls(up.calls), 2, "seed + exactly one reopened probe forward");
+    } finally {
+        up.server.close();
+        up.server.closeIdleConnections?.();
+        await close();
+    }
+});
+
+test("e2e #4079 f: a record without a timestamp (pre-TTL legacy) is expired — upgraded stuck sessions self-heal", async () => {
+    const up = makeUpstream();
+    const port = await listen(up);
+    const { ctx, close } = await setup({ [`http://127.0.0.1:${port}`]: { models: { "gpt-test": { context: WINDOW } } } });
+    try {
+        await seedAndRefuse(ctx, "i3846-f", "gpt-test");
+        demoteToEstimate("i3846-f");
+
+        const s = getSession("i3846-f")!;
+        const refusals = s.metadata.localRefusals as Array<{ origin: string; model: string; window: number; at?: number }>;
+        assert.equal(refusals.length, 1, "one refusal record");
+        delete refusals[0]!.at;
+
+        // No readable `at` proves nothing — the lane must behave as if no
+        // refusal was recorded (the pre-TTL lock is exactly what #3974 hit).
+        const r = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
+        assert.equal(r.status, 200, "an at-less record does not hold the line");
+        await r.text();
+        assert.equal(streamCalls(up.calls), 2, "seed + exactly one probe forward");
+    } finally {
+        up.server.close();
+        up.server.closeIdleConnections?.();
+        await close();
+    }
+});

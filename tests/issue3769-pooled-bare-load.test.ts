@@ -104,7 +104,10 @@ test("bare-id loadSync hydrates a pooled envelope when the unified index misses 
         assert.equal(pooled.filter((f) => f.endsWith(".json") && !f.endsWith(".content-store.json")).length, 1, "pooled envelope present");
 
         // Simulate the index miss: drop index.db entirely (plus sqlite
-        // sidecars) while the envelope stays on disk.
+        // sidecars) while the envelope stays on disk. Close store1 FIRST:
+        // Windows refuses to unlink a file its sqlite handle still holds
+        // (EBUSY) — same discipline as the plugin-fork cold restores.
+        store1.closeQuietly();
         for (const side of ["index.db", "index.db-wal", "index.db-shm"]) {
             rmSync(path.join(dir, side), { force: true });
         }

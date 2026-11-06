@@ -8,6 +8,7 @@ import {
 } from "./identity.js";
 import { hashId } from "./util.js";
 import { ClusterCounter } from "./message-id.js";
+import { isPlainTextSystemMessage } from "../protected.js";
 
 export type AnthropicTextBlock = {
   type: "text";
@@ -52,11 +53,19 @@ export type AnthropicMessage = {
   content: string | AnthropicBlock[];
 };
 
+export type AnthropicSystemMessage = {
+  role: "system";
+  content: string | AnthropicBlock[];
+  [key: string]: unknown;
+};
+
+export type AnthropicWireMessage = AnthropicMessage | AnthropicSystemMessage;
+
 export type AnthropicRequestBody = {
   model?: string;
   max_tokens?: number;
   system?: string | AnthropicTextBlock[];
-  messages: AnthropicMessage[];
+  messages: AnthropicWireMessage[];
   tools?: unknown[];
   stream?: boolean;
   temperature?: number;
@@ -102,6 +111,17 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
     // map fold coverage (core-message space) back to wire positions without
     // re-deriving the converter's block-split behavior.
     const before = msgs.length;
+    if (m.role === "system") {
+      const core = systemMessageCore(m, clusters);
+      core.wireIndex = wireIndex;
+      msgs.push(core);
+      // Harvest the client's breakpoint like any text block's: the host's
+      // client-managed-caching detection (#1637) and WC-010's 4-mark budget
+      // both read this map, not the verbatim sidecar.
+      const mark = systemMessageMark(m);
+      if (mark) cacheControls.set(core.id, mark);
+      continue;
+    }
     const blocks =
       typeof m.content === "string"
         ? [{ type: "text" as const, text: m.content }]
@@ -280,11 +300,142 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
   return { msgs, cacheControls };
 }
 
+// Mid-conversation system messages (Pi's tool_addition / tool_removal
+// deltas, message-level output_config) are host control-plane state: one
+// core per wire message, re-emitted verbatim, never split into the
+// user/assistant block stream.
+function systemMessageCore(
+  m: AnthropicSystemMessage,
+  clusters: ClusterCounter,
+): BiliMessage {
+  const label = systemMessageText(m);
+  // A single-text-block message keeps the legacy per-block id (zero churn
+  // for Claude Code's trailing environment message).
+  const base = deriveCanonicalMessageId("system", "text", label);
+  return {
+    id: clusters.next(base),
+    role: "system",
+    contentType: "text",
+    text: label,
+    rawAnthropicMessage: m,
+  };
+}
+
+function systemMessageText(m: AnthropicSystemMessage): string {
+  const text =
+    typeof m.content === "string"
+      ? m.content
+      : m.content
+          .map((b) => (b.type === "text" ? b.text : `[${b.type}]`))
+          .join("\n");
+  return text.length > 0 ? text : "[system]";
+}
+
+function systemMessageMark(m: AnthropicSystemMessage): unknown {
+  if (typeof m.content === "string") return undefined;
+  let mark: unknown;
+  for (const b of m.content as { cache_control?: unknown }[])
+    if (b.cache_control) mark = b.cache_control;
+  return mark;
+}
+
+// Verbatim unless the kernel rewrote the text (e.g. emergency truncation of
+// a plain-text message) — re-emitting the original would undo it. A mark the
+// original lacks (host-stamped, #1637) lands on the last block.
+function rebuildSystemMessage(
+  m: BiliMessage,
+  mark: unknown,
+): AnthropicSystemMessage {
+  const raw = m.rawAnthropicMessage as AnthropicSystemMessage;
+  const cc = mark ? { cache_control: mark } : {};
+  const text = m.text ?? "";
+  if (text !== systemMessageText(raw) && isPlainTextSystemMessage(raw)) {
+    return { role: "system", content: [{ type: "text", text, ...cc }] };
+  }
+  if (!mark || systemMessageMark(raw) || typeof raw.content === "string") {
+    return raw;
+  }
+  const last = raw.content.length - 1;
+  if (last < 0) return raw;
+  return {
+    ...raw,
+    content: raw.content.map((b, i) => (i === last ? { ...b, ...cc } : b)),
+  };
+}
+
+// #4292 hardening, kept for #4457's backstop: a directive-only system
+// (empty content + output_config) is accepted at ANY position by
+// Anthropic's mid-conversation-system rule, so it is never healed; demoting
+// it would mint an empty-content user message that 400s on its own
+// (mirrors the reporter's isAnthropicDirectiveOnlySystem).
+function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
+  return (
+    e.role === "system" &&
+    Array.isArray(e.content) &&
+    e.content.length === 0 &&
+    (e as { output_config?: unknown }).output_config != null
+  );
+}
+
+// #4457: Anthropic accepts a mid-conversation system only immediately
+// before an assistant message or at the end of the array — any other
+// position 400s the whole request, permanently killing the session (a run
+// of consecutive systems is judged by the run's first non-system follower:
+// Pi's trailing tool-delta + effort-marker runs are legal at array end).
+// The fold layer keeps sidecar systems OUT of folds (kernel/src/protected.ts
+// never-fold carve): their tool deltas are FUNCTIONAL under Anthropic's
+// mid-conversation-tool-changes contract — tools[] stays static for cache
+// stability and the deltas control which tools are offered (defer_loading
+// surfacing, by-value definitions, removals, MCP toolsets) — so folding them
+// would silently alter the effective tool set. Orphans still arise when a
+// fold covers the assistant that legitimized one; this position-based
+// backstop heals whatever still arrives illegal: sessions folded by older
+// builds and positionally-illegal client input. Demotion re-voices to user
+// with tool_addition/tool_removal blocks stripped first (WC-022 forbids them
+// outside system) and drops the entry when nothing remains; a
+// directive-only system (empty content + output_config) is accepted at ANY
+// position, so it is never healed. Fresh objects only — sidecars stay
+// intact for future verbatim emission once re-legitimized.
+function isToolUpdateBlock(b: { type?: unknown }): boolean {
+  return b.type === "tool_addition" || b.type === "tool_removal";
+}
+
+function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
+  for (let j = 0; j < out.length; j++) {
+    const e = out[j];
+    if (!e || e.role !== "system" || isDirectiveOnlySystem(e)) continue;
+    let k = j + 1;
+    while (k < out.length && out[k]!.role === "system") k++;
+    const next = out[k];
+    if (!next || next.role === "assistant") continue;
+    if (typeof e.content === "string") {
+      // An empty string demoted to user would mint an empty-content user
+      // message, which 400s on its own — drop instead.
+      if (e.content === "") {
+        out.splice(j, 1);
+        j--;
+      } else {
+        out[j] = { role: "user", content: e.content };
+      }
+      continue;
+    }
+    const kept = e.content.filter(
+      (b) => !isToolUpdateBlock(b as { type?: unknown }),
+    );
+    if (kept.length === 0) {
+      out.splice(j, 1);
+      j--;
+      continue;
+    }
+    out[j] = { role: "user", content: kept };
+  }
+}
+
 export function coreToAnthropic(
   messages: BiliMessage[],
   cacheControls?: Map<string, unknown>,
-): AnthropicMessage[] {
-  const out: AnthropicMessage[] = [];
+): AnthropicWireMessage[] {
+  const out: AnthropicWireMessage[] = [];
   let current: { role: "user" | "assistant"; blocks: AnthropicBlock[] } | null =
     null;
   const flush = () => {
@@ -298,6 +449,14 @@ export function coreToAnthropic(
     return v ? { cache_control: v } : {};
   };
   for (const m of messages) {
+    if (m.rawAnthropicMessage) {
+      flush();
+      out.push(rebuildSystemMessage(m, cacheControls?.get(m.id)));
+      continue;
+    }
+    // #4292/#4457: fold-orphaned and client-illegal system positions are
+    // healed by the position-based backstop after assembly (see below) —
+    // no shape matching here.
     const target: "user" | "assistant" =
       m.role === "assistant" ? "assistant" : "user";
     if (!current || current.role !== target) {
@@ -345,6 +504,7 @@ export function coreToAnthropic(
     }
   }
   flush();
+  healIllegalSystemPositions(out);
   return out;
 }
 

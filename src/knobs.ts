@@ -108,6 +108,43 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : REPLAY_BASE_DELAY_MS;
 }
 
+// --- #4204 egress-side 429 throttle governor ---
+
+const THROTTLE_429_MAX_CONSECUTIVE = 5;
+const THROTTLE_429_BASE_DELAY_MS = 2_000;
+const THROTTLE_429_MAX_DELAY_MS = 30_000;
+
+/** BILI_THROTTLE_429 > network.throttle429Enabled > true. The egress 429
+ *  governor (#4204) is ON by default: consecutive upstream 429s put sends to
+ *  that origin+credential on local backoff instead of amplifying a
+ *  concurrency-style provider limit. "0"/"false" restores the legacy
+ *  always-forward behavior. Read per request so the switch flips live. */
+export function throttle429Enabled(): boolean {
+    const envRaw = process.env.BILI_THROTTLE_429;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return fileNetwork().throttle429Enabled !== false;
+}
+
+/** BILI_THROTTLE_429_MAX_CONSECUTIVE > network.throttle429MaxConsecutive > 5.
+ *  Consecutive upstream 429s before the hold turns TERMINAL (local 424 answers
+ *  outside every known SDK retry set, so hosts stop re-driving). */
+export function throttle429MaxConsecutive(): number {
+    const v = tInt("BILI_THROTTLE_429_MAX_CONSECUTIVE", fileNetwork().throttle429MaxConsecutive);
+    return Number.isInteger(v) && v >= 1 ? v : THROTTLE_429_MAX_CONSECUTIVE;
+}
+
+/** BILI_THROTTLE_429_BASE_DELAY_MS > network.throttle429BaseDelayMs > 2000. */
+export function throttle429BaseDelayMs(): number {
+    const v = tNum("BILI_THROTTLE_429_BASE_DELAY_MS", fileNetwork().throttle429BaseDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_BASE_DELAY_MS;
+}
+
+/** BILI_THROTTLE_429_MAX_DELAY_MS > network.throttle429MaxDelayMs > 30000. */
+export function throttle429MaxDelayMs(): number {
+    const v = tNum("BILI_THROTTLE_429_MAX_DELAY_MS", fileNetwork().throttle429MaxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_MAX_DELAY_MS;
+}
+
 /** BILI_MAX_SHRINK_PER_COMPRESS > network.maxShrinkPerCompress > unset (no steering). */
 export function maxShrinkPerCompress(): number | undefined {
     const v = tNum("BILI_MAX_SHRINK_PER_COMPRESS", fileNetwork().maxShrinkPerCompress);
@@ -154,14 +191,6 @@ export function preflightHoldGraceMs(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
 }
 
-const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
-
-/** BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS > network.preflightDeadEndCooldownMs > 300000. */
-export function preflightDeadEndCooldownMs(): number {
-    const v = tNumLoose("BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS", fileNetwork().preflightDeadEndCooldownMs);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
-}
-
 /** BILI_PROXY_KEEPALIVE_MAX_MS > network.proxyKeepAliveMaxMs > 55000 (0 = one-shot connections). */
 export function proxyKeepAliveMaxMs(): number {
     const v = tNum("BILI_PROXY_KEEPALIVE_MAX_MS", fileNetwork().proxyKeepAliveMaxMs);
@@ -205,13 +234,18 @@ const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
+const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
+/** See imageLossyBudgetBytes(): below the measured ~6 MiB failure cliff, above the 4-6 MiB all-pass band. */
+const DEFAULT_IMAGE_LOSSY_BYTES = 5 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
  *  HTTP path now resolves them here with a 5 GiB default so multi-gigabyte single
  *  requests are accepted instead of reset. They bound SINGLE-REQUEST in-RAM buffering
  *  (~2x peak while a body is read+decoded); cross-turn history lives in SQLite and is
- *  unaffected. The WebSocket lanes keep the fixed 100 MiB surface (MAX_REQUEST_BYTES). */
+ *  unaffected. The Responses WebSocket lanes resolve the same budget for their wire
+ *  frames, reconstructed-body admission, upstream guards and checkpoint accounting
+ *  (#4804: they previously kept a fixed 100 MiB surface). */
 export function limitsReceiveBytes(): number {
     const v = tInt("BILI_RECEIVE_BODY_BYTES", loadConfigFile().network?.receiveBodyBytes);
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_RECEIVE_BYTES;
@@ -243,6 +277,31 @@ export function limitsWsOutboundBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_WS_OUTBOUND_BYTES;
 }
 
+/** BILI_HTTP_OUTBOUND_BYTES > network.httpOutboundBytes > 10 MiB. Soft egress byte budget for the
+ *  plain/proxy/pi-native HTTP relay lane (#3909): above it, older non-protected images are shed from
+ *  the OUTBOUND COPY before sending, because an image-dense session can carry tens of MiB of base64
+ *  that upstreams reject on raw bytes / pixel-decode CPU (Cloudflare Worker 503) while token-space
+ *  folding stays below its trigger. Applies only when no managed transport is installed; the WS lane
+ *  uses network.wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never
+ *  shed (#3701 Finding 1). 0 disables the pre-send shed (legacy send-as-is). The hard refusal cap
+ *  stays network.outboundBodyBytes. */
+export function limitsHttpOutboundBytes(): number {
+    const v = tInt("BILI_HTTP_OUTBOUND_BYTES", loadConfigFile().network?.httpOutboundBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
+}
+
+/** BILI_IMAGE_LOSSY_BYTES > 5 MiB (env-only kill switch: 0 disables). Soft SIZE budget for the
+ *  request body, enforced by re-encoding the images in the OUTBOUND COPY (JPEG q88..q56, PNG
+ *  downscale when the pixels carry real alpha) — never by dropping an image and never touching
+ *  the stored original. Rationale (measured, 2026-10-29): a turn whose bulk was six 1264x805
+ *  screenshots (4.88 MiB of PNG, ~7.0 MiB body) reset in 0.2-0.5s, 29 of 44 requests >= 6 MiB
+ *  failed while 0 of 28 in the 4-6 MiB band did; lossless re-encoding makes those PNGs ~16%
+ *  BIGGER, so only a lossy pass keeps the turn deliverable. Owner decision: prefer a softer
+ *  picture over a request that can never succeed. */
+export function imageLossyBudgetBytes(): number {
+    const v = tInt("BILI_IMAGE_LOSSY_BYTES", undefined);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_IMAGE_LOSSY_BYTES;
+}
 // --- session persistence (was BILI_PERSIST_* env-only) ---
 
 function filePersist() {
@@ -519,6 +578,30 @@ export function dshAuthoredCompactionEnabled(): boolean {
     const file = loadConfigFile().dsh?.authoredCompaction;
     if (typeof file === "boolean") return file;
     return true;
+}
+
+/** BILI_DSH_CONTEXT_TAB > dsh.contextTab > true (#4237). Whether the official
+ *  dsh client registers its per-session Context tab (conversation.view slot).
+ *  Default ON = today's behavior; "0"/"false" (env) or false (file) hides the
+ *  top-bar entry only — compression is untouched and the ledger stays
+ *  reachable through the settings section, the plugin bundle config face, the
+ *  Web UI and /acp. Resolved by the host half at page-load time and shipped to
+ *  the browser half via the __BILI__ snapshot / /bili/origin route. */
+export function dshContextTabEnabled(): boolean {
+    const envRaw = process.env.BILI_DSH_CONTEXT_TAB;
+    if (envRaw !== undefined) return !(envRaw.trim() === "0" || envRaw.trim().toLowerCase() === "false");
+    return loadConfigFile().dsh?.contextTab !== false;
+}
+
+/** dsh.contextTabLabel (#4237): custom label for that Context tab. File-only
+ *  on purpose (#2030 env-var discipline: a display preference, not a secret /
+ *  spawn channel / host posture) and settable from the Web config page. A
+ *  trimmed non-empty string wins over the built-in localized label; anything
+ *  else keeps it. */
+export function dshContextTabLabel(): string | undefined {
+    const f = loadConfigFile().dsh?.contextTabLabel;
+    const s = typeof f === "string" ? f.trim() : "";
+    return s.length > 0 ? s : undefined;
 }
 
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */

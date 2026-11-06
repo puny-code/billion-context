@@ -344,6 +344,30 @@ export function withProjectAttribution(prompt: string): string {
     return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE;
 }
 
+/** The MCP-dialect name bili's fixed "bili" shim server (src/mcp.ts, #2578)
+ *  exposes an ACP tool under on MCP-bridged hosts: zcode/claude-code lanes
+ *  carry `mcp__bili__compress` etc. in their outbound tool tables. */
+export function mcpBiliToolName(name: string): string {
+    return "mcp__bili__" + name;
+}
+
+/** #4344: MCP-bridged plugin hosts expose the ACP tools under mcp__bili__*
+ *  names while the kernel prompts teach the bare names — the nudge/standing
+ *  prompt telling the model to call `compress` lands on a tool table that
+ *  holds no such tool (the #4344 zcode shape: nudges armed at 21-29% usage,
+ *  0 compressions across 46 requests). When the wire declares the prefixed
+ *  compress and NOT the bare one, this factual name mapping is appended so
+ *  the model can act on the prompt (a bare-name call would hit an unknown
+ *  tool — the MCP tool call routes through the host's MCP bridge, which bili
+ *  cannot rewrite in plugin mode). Static string + per-session-stable tool
+ *  table = cache-stable, the same premise the surface flag itself rides
+ *  (#3403). */
+export const MCP_DIALECT_NOTE = "On this host the context-management tools are exposed under MCP-prefixed names: call `mcp__bili__compress` (not `compress`) — likewise `mcp__bili__decompress`, `mcp__bili__search_context`, `mcp__bili__acp_status`.";
+
+export function withMcpDialectNote(prompt: string, on: boolean): string {
+    return on ? `${prompt}\n\n${MCP_DIALECT_NOTE}` : prompt;
+}
+
 /** Note mode for one request: the harness is code-mode-shaped when the
  *  client's own tools array carries a tool named like a known code-mode
  *  omnibus (run_code / code_run — see CODE_MODE_OMNIBUS_TOOL_NAMES, #3884). */
@@ -412,6 +436,35 @@ export const READ_ORIGINAL_IMAGE_TOOL = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, d
 export const READ_ORIGINAL_IMAGE_TOOL_OPENAI = { type: "function" as const, function: { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA } };
 export const READ_ORIGINAL_IMAGE_TOOL_RESPONSES = { type: "function" as const, name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
 export const READ_ORIGINAL_IMAGE_TOOL_GOOGLE = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
+
+// acp_history (#4738 follow-through): read STORED history that is no longer
+// visible. Folding preserves originals (decompress), and compressed ranges
+// stay searchable (search_context), but neither reaches a message the HOST
+// removed from the view when its native compaction ran — no block covers it
+// and no summary describes it. Storage still has every body, so this tool is
+// the third read side: bodies by keyword, or full text by mNNNNN range.
+// Read-only, and bounded on BOTH axes (hit count / scan depth on search, byte
+// budget / continuation cursor on range) so one call can never flood context.
+export const HISTORY_TOOL_NAME = "acp_history";
+const HISTORY_TOOL_DESCRIPTION = "Read conversation history that is stored but no longer visible in your context — folded ranges, or earlier messages the host dropped when its own compaction replaced them. Two modes. A) {query} keyword-searches the STORED message bodies (case-insensitive; every term must appear in one message) and returns bounded snippets with their mNNNNN refs plus how much of the history it actually scanned. B) {from,to} returns the full original text of an mNNNNN range. Read-only. Both modes are byte-capped: range mode stops at maxBytes and hands back the ref to continue from, so fetch only the span you need.";
+const HISTORY_PARAM_SCHEMA = {
+    type: "object" as const,
+    properties: {
+        query: { type: "string", description: "Search mode: keywords to find in stored message bodies. Prefer 1-3 distinctive terms." },
+        from: { type: "string", description: "Range mode: first ref, e.g. \"m00423\"." },
+        to: { type: "string", description: "Range mode: last ref (inclusive). Defaults to from." },
+        session: { type: "string", description: "Optional session id; defaults to the current conversation." },
+        limit: { type: "integer", description: "Search mode: max hits (default 8, max 20)." },
+        scan: { type: "integer", description: "Search mode: max stored messages to scan, newest first (default 4000, max 20000)." },
+        before: { type: "integer", description: "Search mode: continue backward from this seq (taken from a previous receipt that said \"continue with before:\")." },
+        maxBytes: { type: "integer", description: "Range mode: inline byte budget (default 24000, max 200000)." },
+    },
+    additionalProperties: false,
+};
+export const HISTORY_TOOL = { name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, input_schema: HISTORY_PARAM_SCHEMA };
+export const HISTORY_TOOL_OPENAI = { type: "function" as const, function: { name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, parameters: HISTORY_PARAM_SCHEMA } };
+export const HISTORY_TOOL_RESPONSES = { type: "function" as const, name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, parameters: HISTORY_PARAM_SCHEMA };
+export const HISTORY_TOOL_GOOGLE = { name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, parameters: HISTORY_PARAM_SCHEMA };
 
 // #1097: acp_retrieve — resolve a stored ID-referenced message back to its full
 // original. Kernel-owned tool (RETRIEVE_TOOL_NAME); synthesized in all four
@@ -538,6 +591,11 @@ export function parseCompressInput(input: unknown, callId?: string) {
     }
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
+    }
+    if (parsed.diagnostics.flatSummarySalvage === true) {
+        // Flat single-range call ({content: "<summary text>", startId, endId})
+        // — the two schema-advertised shapes merged — recovered by the kernel.
+        loggerLog("warn", `[acp-compress-input] flat-summary salvage: recovered ${parsed.ranges.length} range(s); summary text arrived in content alongside top-level refs`);
     }
     if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
         loggerLog("warn", `[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
@@ -691,11 +749,12 @@ export function withMarkerIntegrityNote(text: string, visibilityMarkers = true):
 const SUMMARY_BUDGET_NOTE =
     "\n\n[Per-summary length budget: every compress summary has a hard character cap, and a single oversized summary fails the WHOLE compress call — nothing gets folded. Dense content (many subagent results, long tool outputs) tempts you into writing one giant summary for a big range; don't. When a range is large or dense, SPLIT it into several smaller ranges at logical boundaries and give EACH its own concise, scannable summary, then batch all the ranges in one compress call (content: [{startId,endId,summary}, {…}]). Prefer several tight blocks over one bloated block: each stays under the cap, and smaller blocks are cheaper to re-send and independently searchable/decompressible.]";
 
-/** Append the per-summary length-budget rule to a nudge or system-prompt text.
- *  The budget note is unconditional (like withMarkerIntegrityNote): the cap
- *  always exists, so the guidance must be present whenever compression is
- *  possible. The external-summary disclosure is per-request, decided by the
- *  caller from the request's resolved Config. */
+/** Append the per-summary length-budget rule to a nudge or system-prompt text,
+ *  whenever the model writes the committed summary. In external-summary mode
+ *  (decided per request by the caller from the resolved Config) it gets the
+ *  external-summary disclosure instead: the model's summary is only a hint the
+ *  kernel never checks against the cap (the service's output is), so the
+ *  budget rule cannot apply (#4460). */
 export function withSummaryBudgetNote(text: string, external: boolean): string {
-    return text + SUMMARY_BUDGET_NOTE + (external ? EXTERNAL_SUMMARY_NOTE : "");
+    return text + (external ? EXTERNAL_SUMMARY_NOTE : SUMMARY_BUDGET_NOTE);
 }

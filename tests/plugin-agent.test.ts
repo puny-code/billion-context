@@ -77,7 +77,7 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 
 type FakeProxy = {
     origin: string;
-    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>;
+    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
     close(): Promise<void>;
@@ -772,7 +772,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(out.isError, undefined);
         // #2072: the pi host stamps its session-manager id as a confirmed
         // native caller — the captured wire body carries the flag.
-        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
+        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true, toolCallId: "call-1" }]);
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
         assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
         assert.equal(errOut.isError, true);
@@ -834,7 +834,7 @@ test("#2416: registered tools track the respawned proxy origin — live re-read 
         out = await pi.tools[0]!.execute("call-2", { content: [] }, undefined, undefined, ctx);
         assert.equal(out.isError, undefined, "the tool must reach the respawned proxy, not keep firing at the dead port");
         assert.match(out.content[0]!.text, /\[Compressed/);
-        assert.deepEqual(newProxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
+        assert.deepEqual(newProxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true, toolCallId: "call-2" }]);
         assert.equal(oldProxy.toolCalls.length, 1, "nothing further may hit the dead origin");
     } finally {
         if (prevEnv === undefined) delete process.env.BILLION_CONTEXT_PROXY;
@@ -1511,6 +1511,52 @@ test("/acp emits a persistent custom message via pi.sendMessage when available (
     } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+});
+
+test("/acp renderer collapses large reports and restores every block when expanded", () => {
+    type Renderer = NonNullable<Parameters<ReturnType<typeof createBiliPlugin>>[0]["registerMessageRenderer"]>;
+    let render: Parameters<Renderer>[1] | undefined;
+    biliPlugin({ on() {}, registerTool() {}, registerMessageRenderer: (name, renderer) => {
+        assert.equal(name, "bili-acp-status");
+        render = renderer;
+    } });
+    assert.ok(render, "register a renderer so Ctrl+O can control the report");
+    const text = ["╭─────────────────────────────────────────────╮", "│           ACP Context Analysis              │",
+        "╰─────────────────────────────────────────────╯", "billion-context@0.1.202", "storage: full", "",
+        "Context (session accounting): 50%", "", "Sent to LLM (after compression, est.): 50k",
+        "Prompt cache (provider-reported): 90%", "", "Blocks: 250 active / 250 total",
+        ...Array.from({ length: 250 }, (_, i) => `  [b${i}] T1 10k→1k: topic ${i}`),
+        "Web UI: http://127.0.0.1:8787/__bili/", "Tag visibility: footer"].join("\n");
+    const message = { role: "custom" as const, customType: "bili-acp-status", content: text, display: true, timestamp: 0 };
+    const backgrounds: string[] = [];
+    const theme = {
+        fg: (_color: string, value: string) => value,
+        bg: (color: string, value: string) => { backgrounds.push(color); return value; },
+        bold: (value: string) => value,
+        italic: (value: string) => value,
+        underline: (value: string) => value,
+        strikethrough: (value: string) => value,
+    } as Parameters<typeof render>[2];
+    const collapsed = render(message, { expanded: false, outputPad: 1 }, theme)!.render(120).join("\n");
+    assert.ok(collapsed.split("\n").length < 25);
+    assert.match(collapsed, /╭─/);
+    assert.match(collapsed, /ACP Context Analysis/);
+    assert.match(collapsed, /storage: full/);
+    assert.match(collapsed, /storage: full[^\n]*\n\s*\n/);
+    assert.match(collapsed, /Tag visibility: footer/);
+    assert.match(collapsed, /Blocks: 250 active/);
+    assert.match(collapsed, /Context .*50%/);
+    assert.match(collapsed, /Prompt cache .*90%/);
+    assert.match(collapsed, /Web UI:/);
+    assert.match(collapsed, /Ctrl\+O/);
+    assert.ok(!collapsed.includes("topic 249"));
+    assert.match(collapsed, /\[bili-acp-status\]/);
+    assert.ok(backgrounds.length > 0 && backgrounds.every((color) => color === "customMessageBg"));
+    assert.equal(render(message, { expanded: true, outputPad: 1 }, theme), undefined,
+        "expanded reports use pi's original styled Markdown renderer");
+    assert.equal(message.content, text, "display folding must preserve persisted report content");
+    assert.equal(render({ ...message, content: "Context: 0%\n\nBlocks: none" }, { expanded: false, outputPad: 1 }, theme),
+        undefined, "reports without block details keep pi's original renderer");
 });
 
 test("/acp sends renderAcpStatus fallback content via sendMessage when no panel string", async () => {

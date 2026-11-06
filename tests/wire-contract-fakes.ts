@@ -73,6 +73,14 @@ export const WIRE_RULES: readonly WireRule[] = [
             'live probe 2026-10-15: :streamRawPredict with "stream": true against the real endpoint answered 429 with an array-wrapped {"error":{"code":429,…,"status":"RESOURCE_EXHAUSTED"}}, the same request on :rawPredict answered the bare object. The fake reproduces the split so an error-path regression fails in CI rather than in production.',
     },
     {
+        id: "WC-022",
+        wire: "anthropic",
+        summary:
+            'tool_addition / tool_removal content blocks are only valid inside a role:"system" message in messages[] — the same blocks under role:"user" are a 400; a mid-conversation system message must therefore round-trip with its role intact, never be re-emitted as user or merged into an adjacent user turn',
+        provenance:
+            'live probe 2026-10-20 (pi 1.3.0 + pi-subagents 0.79.2, api.anthropic.com, claude-haiku-5-5) through a master b156c02f proxy: pi declares tools activated mid-session as tool_addition blocks inside a mid-conversation role:"system" message; #3410\'s unknown-block passthrough kept the blocks but coreToAnthropic re-emitted the message as role:"user" → upstream 400 "messages.2.content: \'tool_addition\'/\'tool_removal\' blocks are only permitted within `role: "system"` messages". On v0.1.202 the blocks were silently dropped instead (tools never reached the model). Repair: kernel/src/wire/anthropic.ts keeps each wire system message whole on the rawAnthropicMessage sidecar and re-emits it verbatim.',
+    },
+    {
         id: "WC-016",
         wire: "anthropic",
         summary:
@@ -249,10 +257,17 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-016 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    if (Array.isArray(body.messages))
+        body.messages.forEach((m, i) => {
+            if (!isPlainObject(m) || m.role === "system" || !Array.isArray(m.content)) return;
+            for (const b of m.content)
+                if (isPlainObject(b) && (b.type === "tool_addition" || b.type === "tool_removal"))
+                    out.push(`WC-022 messages[${i}].content: '${b.type}' blocks are only permitted within role:"system" messages`);
+        });
     if ("prompt_cache_key" in body)
         out.push("WC-007 top-level prompt_cache_key is not part of the Anthropic Messages API (#1403)");
     // WC-010 runs before the tools early-return: breakpoints can live in

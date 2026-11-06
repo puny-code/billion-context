@@ -261,6 +261,11 @@ async function main() {
     XDG_STATE_HOME: path.join(baseDir, "xdg/state"),
     XDG_CACHE_HOME: path.join(baseDir, "xdg/cache"),
     XDG_DATA_HOME: path.join(baseDir, "xdg/data"),
+    // npm metadata cache must be per-run: a shared ~/.npm/_cacache lets the
+    // dsh copy's dist-tags read serve a STALE latest from a previous round
+    // (observed: latest=<old candidate> for >60s after this round's publish,
+    // long enough to fail Lane U's up-to-date assertion inside the 240s poll).
+    NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
@@ -401,8 +406,13 @@ async function main() {
     if (!G.skip.includes("a")) {
       log(`\n-- Lane A: fold + post-fold continuity (${G.sglangModel}; window shrunk ${G.bigWindow} → ${G.smallWindow} mid-session)`);
       // T1 at the real window: read + answer, no fold expected (all fresh).
+      // dsh's read elides the MIDDLE of any result over ~8KB (head+tail kept):
+      // a single 90KB/441-line corpus read loses lines ~41–400 — S07 (line ~71)
+      // was never delivered and the t2 payload stayed under the fold threshold
+      // (#4288 then rightly skips folding). Force chunked reads so the whole
+      // corpus actually enters history (35 lines ≈ 7KB < the elision budget).
       const m1 = mark();
-      const t1 = await turn("Read corpus.md in your cwd fully, then reply with ONLY the TITLE line of section S40.", "t1");
+      const t1 = await turn(`Read corpus.md in your cwd fully. The read tool elides the middle of any large result — the file is 441 lines / ~90KB, so read it in EXACTLY these 13 chunks, one read call each, in order: offsets 1, 36, 71, 106, 141, 176, 211, 246, 281, 316, 351, 386, 421 with limit 35 each. After all 13 reads are done, reply with ONLY the TITLE line of section S40.`, "t1");
       ctx.sessionId = ctx.sessionId || t1.sessionId;
       record("A", "turn 1 (read @ real window) completes", t1.ok, t1.ok ? "" : t1.why.slice(0, 160));
       const s1 = slice(m1);
@@ -417,7 +427,7 @@ async function main() {
       if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
 
       const m2 = mark();
-      const t2 = await turn("Without reading any file again: reply with ONLY the TITLE line of section S07.", "t2");
+      const t2 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.", "t2");
       // T2b gives the cache a second stable-prefix request so the warm-up
       // after the fold is observable (first post-fold round often has no
       // upstream cache report at all).
@@ -454,11 +464,15 @@ async function main() {
       if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
 
       const m3 = mark();
-      const t3 = await turn("Without reading any file again: reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
+      const t3 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
       const s3 = slice(m3);
       const pfa3 = /\[sess=(pfa-[0-9a-f]+)\]/.exec(s3)?.[1];
       const forked = pfa3 && pfa3 !== pfaPre && s3.includes(`lineage=forked of ${pfaPre}`);
-      const adopted = /\[fork-adoption\] fork of .*: parent has \d+ adoptable block/.test(s3);
+      // Either the fork adopts the parent's blocks, or it takes the designed
+      // fresh-start path: "no fully-present blocks to adopt … starting fresh;
+      // lineage linked …" (#629/#3925) — the lineage link alone preserves the
+      // folded context via the startup sweep.
+      const adopted = /\[fork-adoption\] fork of [^:]+: (?:parent has \d+ adoptable block|no fully-present blocks to adopt .*starting fresh; lineage linked)/.test(s3);
       record("B", "switch turn completes", t3.ok, t3.ok ? "" : t3.why.slice(0, 160));
       // Same lineage across the switch: either the session continues on the
       // same pfa, or dsh's resume-replay forks it and the fork machinery
@@ -467,8 +481,11 @@ async function main() {
       record("B", "same lineage across switch + proxy restart", (!!pfaPre && pfa3 === pfaPre) || (forked && adopted), forked ? `${pfaPre} -> ${pfa3} (forked + adopted)` : `${pfaPre} -> ${pfa3}`);
       // If a usage-baseline measured on the OLD upstream gets cited while
       // routing to the NEW one, it must be demoted to untrusted (#2283/#2867).
-      // (A forked lineage may have no baseline at all — that's fine.)
-      const noBaseline = !/usage-baseline/.test(s3);
+      // (A forked lineage may have no baseline at all — that's fine, and a
+      // fork legitimately prints "usage-baseline=none"; the old
+      // !/usage-baseline/ pattern matched THAT line and red-flagged a healthy
+      // fork. Only a cited NUMERIC baseline needs the demotion check.)
+      const noBaseline = !/usage-baseline=\d/.test(s3);
       record("B", "cross-upstream baseline demoted when cited", noBaseline || /demoting to untrusted/.test(s3), noBaseline ? "no baseline cited this run" : "demoting to untrusted");
       record("B", "both markers recalled after switch", has(t3.final, CODEWORDS[6]) && has(t3.final, CODEWORDS[39]), `final="${t3.final.trim().slice(0, 90)}"`);
       record("B", `request routed to ${G.relayModel}`, s3.includes(G.relayUrl) || s3.includes(G.relayModel), "");

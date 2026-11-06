@@ -43,7 +43,7 @@ function makeIdPort(ctx: Ctx) {
   return (...args: Array<{ kind: string }>): SymStr => {
     const key = args.map((a) => (a.kind === "str" ? String((a as { t?: { c?: string } }).t?.c ?? "?") : a.kind)).join("|");
     let v = memo.get(key);
-    if (!v) { v = { kind: "str", t: strc(ctx, `id${n++}`) } as never; memo.set(key, v); }
+    if (!v) { v = strc(ctx, `id${n++}`); memo.set(key, v); }
     return v;
   };
 }
@@ -56,11 +56,11 @@ function makeCounterPorts(ctx: Ctx) {
   return {
     ClusterCounter: () => marker,
     __method_next: (recv: SymObj, base: SymStr): SymStr => {
-      if (recv !== marker) return { kind: "str", t: strc(ctx, "?") } as never;
+      if (recv !== marker) return strc(ctx, "?");
       const c = (counts.get(marker) ?? 0) + 1;
       counts.set(marker, c);
       const b = String(base?.t?.c ?? "?");
-      return { kind: "str", t: strc(ctx, c === 1 ? b : `${b}_${c - 1}`) } as never;
+      return strc(ctx, c === 1 ? b : `${b}_${c - 1}`);
     },
   };
 }

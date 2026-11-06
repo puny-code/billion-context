@@ -20,12 +20,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { probeBuiltinSqlite, probeHostBetterSqlite3, setPreferredSqliteEngineForTests, setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { _resetStorageRuntimeStatusForTest, recordEngineBootstrap } from "../src/storage/runtime-status.ts";
@@ -33,6 +31,7 @@ import { renderPage } from "../src/web/page.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { VERSION } from "../src/version.ts";
 import { rmrf } from "./tmp-rm.ts";
+import { BANNER_CHECKS, makeOpts, spawnCorruptIndexChild, type StorageWire } from "./corrupt-index-child.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 
@@ -83,19 +82,6 @@ async function freePort(): Promise<number> {
     return port;
 }
 
-interface StorageWire {
-    requested: string;
-    effective: string;
-    degraded: boolean;
-    intentionalOptOut: boolean;
-    reason: string | null;
-    engine: { name: string; source: string } | null;
-    bootstrap: string | null;
-    bootstrapFailure: unknown;
-    cooldownRemainingMs: number | null;
-    sidecarDisabled: boolean;
-}
-
 interface DiagnosticsWire {
     blob: string;
     title: string;
@@ -108,31 +94,9 @@ async function fetchJson<T>(port: number, p: string): Promise<T> {
     return (await res.json()) as T;
 }
 
-function makeOpts(upstreamPort: number): ProxyOptions {
-    return {
-        port: 0,
-        host: "127.0.0.1",
-        upstream: `http://127.0.0.1:${upstreamPort}`,
-        routes: {},
-        modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: false, injectNudge: false },
-        promptCache: { routing: "auto" },
-        sessionHeader: "x-acp-session",
-        log: false,
-        debug: false,
-        passthrough: false,
-        autoUpdate: false,
-        compat: { roles: {} },
-        streamErrorShape: "protocol",
-        passthroughSource: null,
-        autoRestartOnUpdate: false,
-        updateTag: "latest",
-        advisoryCheck: false,
-        releaseNotesCheck: false,
-        mitm: { enabled: false, domains: [] },
-    };
-}
+// makeOpts moved to ./corrupt-index-child.ts (#4338) — the corrupt-index
+// scenario now runs in a spawned child that needs the exact same server
+// opts, so there is one copy, imported by both sides.
 
 test("#3040 forced none-engine: status+overview report degraded; diagnostics blob + prefilled issue link", async () => {
     const snap = saveEnv();
@@ -299,39 +263,37 @@ test("#3040 BILI_ENCRYPTION_KEY opt-out is intentional: reported, never warned",
     }
 });
 
-test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reason", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
-    const snap = saveEnv();
+test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reason", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host", timeout: 180_000 }, async () => {
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
-    let store: SessionStore | null = null;
     try {
-        isolate(base);
-        resetSeams();
-        delete process.env.BILI_STORAGE_UNIFIED;
-        delete process.env.BILI_ENCRYPTION_KEY;
-        const dir = process.env.BILI_SESSIONS_DIR!;
-        writeFileSync(path.join(dir, "index.db"), Buffer.from("this is definitely not a sqlite database file".repeat(8)));
-        store = new SessionStore({ dir, enabled: true });
-        _setStoreForTest(store);
-        const upstreamPort = await freePort();
-        const proxy = await startServer(makeOpts(upstreamPort));
-        await once(proxy, "listening");
-        const port = (proxy.address() as { port: number }).port;
-        try {
-            const o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
-            assert.equal(o.storage.requested, "full");
-            assert.equal(o.storage.effective, "legacy");
-            assert.equal(o.storage.degraded, true, "corrupt index.db trips the warning");
-            assert.equal(o.storage.intentionalOptOut, false);
-            assert.match(o.storage.reason ?? "", /index database failed to open/);
-            assert.equal(o.storage.engine, null);
-        } finally {
-            await close(proxy);
+        // #4338: the whole corrupt-index scenario (write the bad index.db →
+        // construct the store → serve /__bili/overview → assert the degraded
+        // wire shape → close) runs in a spawned child. On Windows the FAILED
+        // open of the corrupt index can leave an OS handle with no JS
+        // reference to release, and this test's rmrf(base) then died on a
+        // persistent EBUSY that outlived the whole tmp-rm retry ladder; the
+        // child exiting RELEASES all its handles by OS guarantee, so the
+        // rmrf below cannot be blocked. The child prints a JSON verdict of
+        // named checks; every one is re-asserted here, so assertion coverage
+        // is 1:1 with the in-process era (same asserts, executed in the
+        // child, verified in the parent). The spawn env below is the child's
+        // only isolation — this process's own env and seams stay untouched.
+        const childEnv: NodeJS.ProcessEnv = { ...process.env };
+        delete childEnv.BILI_STORAGE_UNIFIED;
+        delete childEnv.BILI_ENCRYPTION_KEY;
+        childEnv.BILI_SESSIONS_DIR = path.join(base, "sessions");
+        childEnv.BILI_CONFIG_FILE = path.join(base, "absent-config.json");
+        childEnv.XDG_CACHE_HOME = path.join(base, "cache");
+        childEnv.XDG_STATE_HOME = path.join(base, "state");
+        childEnv.BILI_PERSIST_ZSTD = "0";
+        const verdict = spawnCorruptIndexChild("banner", [base], childEnv);
+        assert.equal(verdict.ok, true, verdict.failure ?? "corrupt-index child reported a failed check");
+        for (const name of BANNER_CHECKS) {
+            const check = verdict.checks.find((c) => c.name === name);
+            assert.ok(check?.ok, `corrupt-index child check failed/missing: ${name}${check?.detail ? ` — ${check.detail}` : ""}`);
         }
     } finally {
-        resetSeams();
-        store?.closeQuietly();
         rmrf(base);
-        restoreEnv(snap);
     }
 });
 

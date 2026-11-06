@@ -28,6 +28,7 @@
 // invariants only, replay mandatory, ports only at public seams, negative
 // controls mandatory.
 
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction, type SymVal } from "../verif/symbolic.ts";
@@ -35,7 +36,7 @@ import { newCtx, smt2Of, type Context, type Term } from "../verif/terms.ts";
 import { solveSmt2 } from "../verif/solve.ts";
 import { dshNativeCompactionWitness } from "../src/conflict-watch.ts";
 
-const CW = new URL("../src/conflict-watch.ts", import.meta.url).pathname;
+const CW = fileURLToPath(new URL("../src/conflict-watch.ts", import.meta.url));
 
 // ---------------------------------------------------------------- helpers --
 function haveSolver(): boolean {

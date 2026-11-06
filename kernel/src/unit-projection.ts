@@ -1,21 +1,36 @@
-import { activeBlocks, blockById, isLiveCheckpointCarrier } from "./state.js";
-import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
+import { activeBlocks, blockById } from "./state.js";
+import {
+  resolveBoundaries,
+  blockVisibleInRange,
+  buildIndexByMessageId,
+} from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
+  collectAgedCompressCallIds,
 } from "./protected.js";
-import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import type { LatestProtected } from "./protected.js";
+import {
+  buildIntegrityIndex,
+  computeIntegrityWithdrawals,
+} from "./turn-integrity.js";
+import type { IntegrityIndex } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
 import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
 import type {
+  CompressionBlock,
   CompressionState,
   CompressionTier,
   Config,
   CoreMessage,
 } from "./types.js";
+
+/** Shared empty set for plain-range projects that skip the carrier screen. */
+const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
 
 /**
  * #3236: the ONE definition of "can this range fold" — the exact sequence
@@ -58,6 +73,11 @@ export interface UnitProjectionInput {
   /** Warnings are pushed here in apply's original emission order so the
    * apply-side refactor stays byte-identical. Omit for read-only screens. */
   warnings?: string[];
+  /** Optional per-turn context (see {@link createProjectionContext}). Pass it
+   *  when projecting MANY ranges of ONE unchanged array: it hoists the
+   *  per-turn derived structures out of the per-range path. Omit it and this
+   *  function builds a throwaway one — same results, historical cost. */
+  context?: UnitProjectionContext;
 }
 
 export interface UnitProjectionFatal {
@@ -84,11 +104,304 @@ export interface UnitProjection {
   isBlockBoundary: boolean;
 }
 
+/** Per-call derived facts shared by every candidate range a caller projects.
+ *
+ *  The context is split in two layers with very different invalidation rules:
+ *
+ *  - the MESSAGES layer (`indexByMessageId`, `messageById`, `carrierCandidates`,
+ *    `protectedFold`, `pairByCallId`, `integrity`, media verdicts) is a pure
+ *    function of the message array + config. Rebuilding it costs O(messages) —
+ *    exactly the fixed per-call cost this context exists to remove — so a
+ *    caller projecting MANY ranges over ONE array builds it once.
+ *  - the STATE layer (`activeBlocks()`, `blockById`, `liveCarrierIds()`) reads
+ *    `state.blocks`. It is deliberately **never cached**: every access reads
+ *    the live block list through the bound `state`, so a caller that mutates
+ *    `state.blocks` between projections (the apply path appends a block,
+ *    deactivates consumed blocks and refolds blocks in place) can keep sharing
+ *    one context — its next projection sees the mutated state by construction.
+ *    Per-call memoization inside a single projection is the caller's job, and
+ *    projectUnit does exactly that for the one array it reuses within a call.
+ *
+ *  Invalidation is therefore narrow and fully checked at projectUnit entry: the
+ *  context is reused only while `messages`, `state` (object identity — content
+ *  mutations are fine, see above) and `config` are the very same objects; any
+ *  other binding is rebuilt. Nothing survives a turn. */
+export interface UnitProjectionContext {
+  readonly messages: CoreMessage[];
+  readonly state: CompressionState;
+  readonly config: Config;
+  /** id → index, built exactly as resolveBoundaries builds it. */
+  readonly indexByMessageId: Map<string, number>;
+  /** id → FIRST message with that id — the `messages.find(m => m.id === id)`
+   *  contract this module used everywhere. */
+  readonly messageById: Map<string, CoreMessage>;
+  /** active blocks of the bound state, read LIVE on every call. */
+  activeBlocks(): readonly CompressionBlock[];
+  /** blockId → the FIRST block with that id (blockById's contract), read LIVE
+   *  from the bound state so a state mutation between projections can never go
+   *  stale. */
+  blockById(blockId: string): CompressionBlock | undefined;
+  /** memoized hasUnrecoverableMediaPayload */
+  mediaUnrecoverable(message: CoreMessage): boolean;
+  /** ids of live host checkpoint carriers (#335), read live from state. */
+  liveCarrierIds(): ReadonlySet<string>;
+  /** memoized filterProtectedToolMessages inputs */
+  protectedFold(): ProtectedFoldIndex;
+  /** contentType tool-call/result → toolCallId ?? id ⇒ [callId, resultId] */
+  pairByCallId(): ReadonlyMap<string, [string, string]>;
+  /** turn-integrity index (turn groups, call/result maps) */
+  integrity(): IntegrityIndex;
+}
+
+/** Turn-invariant inputs of {@link filterProtectedToolMessages}: the protected
+ *  tool-call set plus memoized per-message verdicts. */
+export interface ProtectedFoldIndex {
+  /** latest-protected callIds ∪ every protected tool-call's callId — the seed
+   *  the per-range pass extends with the ids it carves. */
+  baseProtectedCallIds: ReadonlySet<string>;
+  failedCompressCallIds: ReadonlySet<string>;
+  agedCompressCallIds: ReadonlySet<string>;
+  latest: LatestProtected;
+  /** isMessageProtected(msg, config, failedCompressCallIds), memoized */
+  isProtected(message: CoreMessage): boolean;
+  /** true when the msg's exchange is aged enough to lose compress protection */
+  isExempt(message: CoreMessage): boolean;
+  /** isMessageLatestProtected(msg, latest) */
+  isLatestProtected(message: CoreMessage): boolean;
+}
+
+/** The MESSAGES layer of a projection context: everything that depends only on
+ *  `(messages, config)`. Expensive (O(messages)), immutable for the life of the
+ *  array, and therefore shared by every state binding of one apply batch. */
+interface ProjectionSeed {
+  messages: CoreMessage[];
+  config: Config;
+  indexByMessageId: Map<string, number>;
+  messageById: Map<string, CoreMessage>;
+  /** messages that DECLARE a checkpoint carrier — the only ones that can ever
+   *  be live carriers, so the per-state scan stays proportional to them. */
+  carrierCandidates: CoreMessage[];
+  mediaUnrecoverable(message: CoreMessage): boolean;
+  protectedFold(): ProtectedFoldIndex;
+  pairByCallId(): ReadonlyMap<string, [string, string]>;
+  integrity(): IntegrityIndex;
+}
+
+function buildProjectionSeed(
+  messages: CoreMessage[],
+  config: Config,
+): ProjectionSeed {
+  const indexByMessageId = buildIndexByMessageId(messages);
+  const messageById = new Map<string, CoreMessage>();
+  const carrierCandidates: CoreMessage[] = [];
+  for (const message of messages) {
+    if (!messageById.has(message.id)) messageById.set(message.id, message);
+    if (message.summaryOfBlockId !== undefined) carrierCandidates.push(message);
+  }
+  const mediaByMessage = new Map<CoreMessage, boolean>();
+  let protectedFoldIndex: ProtectedFoldIndex | undefined;
+  let pairIndex: Map<string, [string, string]> | undefined;
+  let integrityIndex: IntegrityIndex | undefined;
+  return {
+    messages,
+    config,
+    indexByMessageId,
+    messageById,
+    carrierCandidates,
+    mediaUnrecoverable(message) {
+      let verdict = mediaByMessage.get(message);
+      if (verdict === undefined) {
+        verdict = hasUnrecoverableMediaPayload(message);
+        mediaByMessage.set(message, verdict);
+      }
+      return verdict;
+    },
+    protectedFold() {
+      if (protectedFoldIndex === undefined) {
+        protectedFoldIndex = buildProtectedFoldIndex(messages, config);
+      }
+      return protectedFoldIndex;
+    },
+    pairByCallId() {
+      if (pairIndex === undefined) {
+        pairIndex = new Map<string, [string, string]>();
+        for (const message of messages) {
+          if (
+            message.contentType !== "tool-call" &&
+            message.contentType !== "tool-result"
+          ) {
+            continue;
+          }
+          const key = message.toolCallId ?? message.id;
+          const pair = pairIndex.get(key) ?? ["", ""];
+          if (message.contentType === "tool-call") pair[0] = message.id;
+          else pair[1] = message.id;
+          pairIndex.set(key, pair);
+        }
+      }
+      return pairIndex;
+    },
+    integrity() {
+      if (integrityIndex === undefined) {
+        integrityIndex = buildIntegrityIndex(messages);
+      }
+      return integrityIndex;
+    },
+  };
+}
+
+/** Bind the (cheap, potentially per-range) STATE layer of a context. Nothing is
+ *  computed eagerly: block-derived data is read from `state` when projectUnit
+ *  actually needs it, which is what makes rebinding after a state mutation free
+ *  and impossible to leave stale. */
+function bindProjectionState(
+  seed: ProjectionSeed,
+  state: CompressionState,
+): UnitProjectionContext {
+  return {
+    messages: seed.messages,
+    state,
+    config: seed.config,
+    indexByMessageId: seed.indexByMessageId,
+    messageById: seed.messageById,
+    // No caching: the apply path mutates state.blocks in place between
+    // projections, and an unbounded cache keyed by nothing is exactly the
+    // staleness bug this design avoids. projectUnit memoizes per INVOCATION
+    // when it needs the same block list twice.
+    activeBlocks: () => activeBlocks(state),
+    // Linear scan, exactly like the state module's own blockById: projectUnit
+    // looks up only a handful of block ids per range, while an eager block
+    // table would cost O(blocks) on every projection.
+    blockById: (blockId) => blockById(state, blockId),
+    mediaUnrecoverable: (message) => seed.mediaUnrecoverable(message),
+    liveCarrierIds() {
+      if (seed.carrierCandidates.length === 0) {
+        // No message declares a carrier: nothing can be one. This is the
+        // common case and keeps the cost at zero.
+        return EMPTY_ID_SET;
+      }
+      const liveCarriers = new Set<string>();
+      for (const message of seed.carrierCandidates) {
+        // Exact same predicate the selector/apply pair must share (#2663).
+        const carrierOf = message.summaryOfBlockId;
+        if (
+          carrierOf !== undefined &&
+          blockById(state, carrierOf)?.active === true
+        ) {
+          liveCarriers.add(message.id);
+        }
+      }
+      return liveCarriers;
+    },
+    protectedFold: () => seed.protectedFold(),
+    pairByCallId: () => seed.pairByCallId(),
+    integrity: () => seed.integrity(),
+  };
+}
+
+/** Build the projection context for `messages` / `state` / `config`.
+ *
+ *  The O(messages) layer is built here (lazily for the expensive parts, so a
+ *  caller that never reaches them pays nothing); the state layer is a set of
+ *  live reads and costs nothing up front. Two callers exist:
+ *   - `screenRecommendedUnits` (recommend.ts) builds ONE per screening pass.
+ *   - `applyCompression` (compress.ts) builds ONE per batch and shares it with
+ *     every range — safe even though apply mutates `state.blocks`, because the
+ *     state layer is never cached (see the interface docs). */
+export function createProjectionContext(
+  messages: CoreMessage[],
+  state: CompressionState,
+  config: Config,
+): UnitProjectionContext {
+  return bindProjectionState(buildProjectionSeed(messages, config), state);
+}
+
+function buildProtectedFoldIndex(
+  messages: CoreMessage[],
+  config: Config,
+): ProtectedFoldIndex {
+  // #4289: failed compress exchanges (result = "[Compression FAILED…", zero
+  // ranges applied) are NOT protected — they are dead drafts that must stay
+  // foldable so a failing compress loop cannot permanently bloat context.
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
+  const latest = collectLatestProtected(messages, config);
+  // #4348: compress exchanges older than the newest few lose the hard-coded
+  // ALWAYS_PROTECTED_TOOLS exemption inside the FOLD path — their receipts
+  // are exhaust and the summaries live on in block anchors. Newest exchanges
+  // keep it (working memory). The lift overrides host protection patterns for
+  // recognized compress dialects too — required, since the MCP lane's
+  // hard-protection hook would otherwise pin mcp__bili__compress forever;
+  // host patterns for all other tools are unaffected.
+  const agedCompressCallIds = collectAgedCompressCallIds(messages, config);
+  const baseProtectedCallIds = new Set<string>(latest.callIds);
+  const protectedVerdicts = new Map<CoreMessage, boolean>();
+  for (const message of messages) {
+    // Same scan filterProtectedToolMessages used to run per range.
+    if (
+      isMessageProtected(message, config, failedCompressCallIds) &&
+      message.toolCallId &&
+      !agedCompressCallIds.has(message.toolCallId)
+    ) {
+      baseProtectedCallIds.add(message.toolCallId);
+    }
+  }
+  return {
+    baseProtectedCallIds,
+    failedCompressCallIds,
+    agedCompressCallIds,
+    latest,
+    isProtected(message) {
+      let verdict = protectedVerdicts.get(message);
+      if (verdict === undefined) {
+        verdict = isMessageProtected(message, config, failedCompressCallIds);
+        protectedVerdicts.set(message, verdict);
+      }
+      return verdict;
+    },
+    isExempt(message) {
+      return (
+        !!message.toolCallId && agedCompressCallIds.has(message.toolCallId)
+      );
+    },
+    isLatestProtected(message) {
+      return isMessageLatestProtected(message, latest);
+    },
+  };
+}
+
 /** Read-only projection of one candidate range through the full apply
  * sequence. Never mutates `state`; never creates blocks. Throws
  * BoundaryNotFoundError when an endpoint ref cannot be resolved. */
 export function projectUnit(input: UnitProjectionInput): UnitProjection {
   const warnings = input.warnings ?? [];
+  // Every per-turn derived structure read below (id index, protected-tool
+  // facts, turn groups, pair maps) is a pure function of (messages, config) —
+  // FIXED across the candidate ranges of one screening pass or one apply
+  // batch. projectUnit therefore accepts an optional caller-owned context so
+  // the per-range work stays proportional to the range instead of to the log.
+  // The identity checks keep the parameter safe: a context built for a
+  // different message array, bound to a different state OBJECT, or built for a
+  // different config is ignored and rebuilt, never silently mis-used. In-place
+  // mutations of `state` (blocks appended / deactivated / refolded) need no
+  // check at all: the context caches nothing derived from state. The one thing
+  // identity alone would miss is an in-place edit of the MESSAGE array, so its
+  // length is compared too (O(1); catches push/splice/pop). No kernel path
+  // mutates message contents between projections — a caller that ever does must
+  // discard the context instead of reusing it.
+  const ctx =
+    input.context !== undefined &&
+    input.context.messages === input.messages &&
+    input.context.messages.length === input.messages.length &&
+    input.context.state === input.state &&
+    input.context.config === input.config
+      ? input.context
+      : createProjectionContext(input.messages, input.state, input.config);
+  // One projection never mutates state, so the live block list is safe to
+  // memoize for the duration of THIS call (it is read at most twice: the
+  // nested-block rescan and the merge path).
+  let activeBlocksInCall: readonly CompressionBlock[] | undefined;
+  const activeBlocksNow = (): readonly CompressionBlock[] =>
+    (activeBlocksInCall ??= ctx.activeBlocks());
   // Declared up front: every exit path (including the zone fatal below)
   // assembles the result through finish(), which reads these bindings.
   let withdrawnIds = new Set<string>();
@@ -100,6 +413,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     endRef: input.endRef,
     messages: input.messages,
     state: input.state,
+    indexByMessageId: ctx.indexByMessageId,
   });
 
   // Host checkpoint carriers (#335): a host that renders its own compression
@@ -111,15 +425,11 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // unknown id) fold like ordinary messages. Block-ref boundaries deliberately
   // distill across checkpoints and keep folding carriers.
   const plainRange = resolved.boundaryKind !== "block";
-  const liveCarrierIds = new Set<string>();
+  let liveCarrierIds: ReadonlySet<string> = EMPTY_ID_SET;
   if (plainRange) {
     // #2663: the selector screens with this same predicate — one definition,
     // two call sites, so advertise/validate cannot drift apart again.
-    for (const message of input.messages) {
-      if (isLiveCheckpointCarrier(message, input.state)) {
-        liveCarrierIds.add(message.id);
-      }
-    }
+    liveCarrierIds = ctx.liveCarrierIds();
   }
   const adjustedIds = applyPairBoundaryAdjustments(resolved, input.messages);
   const skippedCarrierIds = adjustedIds.filter((id) => liveCarrierIds.has(id));
@@ -137,8 +447,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // Re-scan for nested blocks in the ADJUSTED range (tool-pair extension may
   // have pulled in messages that are anchors of existing blocks).
   if (rangeMessageIds.length > resolved.messageIds.length) {
-    const indexByMessageId = new Map<string, number>();
-    input.messages.forEach((m, i) => indexByMessageId.set(m.id, i));
+    const indexByMessageId = ctx.indexByMessageId;
     const adjustedStart =
       rangeMessageIds.length > 0
         ? (indexByMessageId.get(rangeMessageIds[0]!) ?? resolved.startIndex)
@@ -149,7 +458,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           resolved.endIndex)
         : resolved.endIndex;
     const nestedSeen = new Set(resolved.nestedBlockIds);
-    for (const block of activeBlocks(input.state)) {
+    for (const block of activeBlocksNow()) {
       if (nestedSeen.has(block.blockId)) continue;
       if (
         blockVisibleInRange(block, indexByMessageId, adjustedStart, adjustedEnd)
@@ -162,7 +471,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
 
   const isBlockBoundary = resolved.boundaryKind === "block";
   const targetTier = resolveTargetTier(
-    input.state,
+    ctx,
     resolved.nestedBlockIds,
     isBlockBoundary,
   );
@@ -171,13 +480,13 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     : 1;
 
   const consumedBlockIds = resolved.nestedBlockIds.filter((id) => {
-    const block = blockById(input.state, id);
+    const block = ctx.blockById(id);
     return block?.active && block.tier === targetTier;
   });
 
   const effectiveMessageIds = new Set<string>(rangeMessageIds);
   for (const consumedId of consumedBlockIds) {
-    const consumed = blockById(input.state, consumedId);
+    const consumed = ctx.blockById(consumedId);
     if (consumed) {
       for (const id of consumed.effectiveMessageIds)
         effectiveMessageIds.add(id);
@@ -188,11 +497,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     (id) => !input.preExistingCoverage.has(id),
   );
 
-  let filteredIds = filterProtectedToolMessages(
-    directMessageIds,
-    input.messages,
-    input.config,
-  );
+  let filteredIds = filterProtectedToolMessages(directMessageIds, ctx);
 
   // filterProtectedToolMessages drops protected tool calls (and their paired
   // results) from the compressible set. They must also leave effectiveMessageIds,
@@ -206,8 +511,8 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   }
 
   const mediaExcluded = directMessageIds.filter((id) => {
-    const msg = input.messages.find((m) => m.id === id);
-    return !!msg && hasUnrecoverableMediaPayload(msg);
+    const msg = ctx.messageById.get(id);
+    return !!msg && ctx.mediaUnrecoverable(msg);
   });
   if (mediaExcluded.length > 0) {
     warnings.push(
@@ -256,19 +561,11 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       // semantics: fold what remains, exactly as before (#3953 changes
       // nothing there; the zone fatal below still fires only when even the
       // carve empties the range).
-      const pairByCallId = new Map<string, [string, string]>();
-      for (const m of input.messages) {
-        if (m.contentType === "tool-call" || m.contentType === "tool-result") {
-          const key = m.toolCallId ?? m.id;
-          const pair = pairByCallId.get(key) ?? ["", ""];
-          if (m.contentType === "tool-call") pair[0] = m.id; else pair[1] = m.id;
-          pairByCallId.set(key, pair);
-        }
-      }
+      const pairByCallId = ctx.pairByCallId();
       const keptIds = filteredIds.slice(0, firstProtectedIdx);
       const droppedIds = filteredIds.slice(firstProtectedIdx);
       const strandsPair = keptIds.some((id) => {
-        const m = input.messages.find((x) => x.id === id);
+        const m = ctx.messageById.get(id);
         if (!m || (m.contentType !== "tool-call" && m.contentType !== "tool-result")) return false;
         const pair = pairByCallId.get(m.toolCallId ?? m.id);
         return !!pair && pair.some((half) => half !== "" && half !== id && droppedIds.includes(half));
@@ -332,39 +629,120 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // computeIntegrityWithdrawals: withdrawing a pair for the result half can
   // strand a turn whose reasoning still folds and whose call now stays visible.
   {
-    const {
-      withdrawn: withdrawIds,
-      splitTurnCount: turns,
-      splitPairCount: pairs,
-    } = computeIntegrityWithdrawals(input.messages, effectiveMessageIds);
-    withdrawnIds = withdrawIds;
-    splitTurnCount = turns;
-    splitPairCount = pairs;
-    if (withdrawIds.size > 0) {
-      for (const id of withdrawIds) effectiveMessageIds.delete(id);
-      const beforeWithdraw = filteredIds.length;
-      filteredIds = filteredIds.filter((id) => !withdrawIds.has(id));
+    // #4484/#3322: on a MERGE (this unit consumes existing blocks) the integrity
+    // gate needs two things a fresh fold does not. (a) Judge POST-FOLD coverage —
+    // this unit's ids PLUS every still-active sibling block's coverage — so a tool
+    // half already covered by an unconsumed sibling reads as folded, not a spurious
+    // "visible" half (#3322 withdrew inherited coverage for exactly this reason).
+    // (b) Never drop an id whose ONLY covering block is consumed here: those blocks
+    // deactivate below, so removing their id strands it uncovered — the regression
+    // the host pre-commit guard then refuses (#4484). We therefore unfold only ids
+    // whose coverage does not depend on a consumed block, re-checking to a fixed
+    // point; if consistency would force unfolding such an id we fail honestly rather
+    // than emit a doomed regressive candidate. Fresh folds keep the legacy behavior.
+    const isMerge = consumedBlockIds.length > 0;
+    let consumedCoverage = new Set<string>();
+    let survivingCoverage = new Set<string>();
+    if (isMerge) {
+      const consumedSet = new Set(consumedBlockIds);
+      for (const block of activeBlocksNow()) {
+        const target = consumedSet.has(block.blockId)
+          ? consumedCoverage
+          : survivingCoverage;
+        for (const id of block.effectiveMessageIds) target.add(id);
+      }
+    }
+    let foldedRef = effectiveMessageIds;
+    if (isMerge) {
+      foldedRef = new Set(effectiveMessageIds);
+      for (const id of survivingCoverage) foldedRef.add(id);
+    }
+    // #5531: fresh folds judge on their OWN ids alone, so the coverage of OTHER
+    // active blocks must arrive as the invisible set — a covered call is not
+    // kept-visible and cannot strand its turn's reasoning (#564 reverse-split
+    // residue, billion-context#5531). Merges already model post-fold coverage
+    // through foldedRef ∪ survivingCoverage and stay untouched.
+    const initial = computeIntegrityWithdrawals(
+      input.messages,
+      foldedRef,
+      ctx.integrity(),
+      isMerge ? undefined : input.preExistingCoverage,
+    );
+    splitTurnCount = initial.splitTurnCount;
+    splitPairCount = initial.splitPairCount;
+    if (initial.withdrawn.size > 0) {
       const splitDesc = [
         splitTurnCount > 0 ? `${splitTurnCount} turn(s)` : null,
-        splitPairCount > 0
-          ? `${splitPairCount} tool call/result pair(s)`
-          : null,
+        splitPairCount > 0 ? `${splitPairCount} tool call/result pair(s)` : null,
       ]
         .filter((part): part is string => part !== null)
         .join(" and ");
-      if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
-        return finish({
-          fatal: {
-            kind: "split",
-            error: new Error(
-              `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
-            ),
-          },
-        });
+      if (!isMerge) {
+        withdrawnIds = initial.withdrawn;
+        for (const id of initial.withdrawn) effectiveMessageIds.delete(id);
+        const beforeWithdraw = filteredIds.length;
+        filteredIds = filteredIds.filter((id) => !initial.withdrawn.has(id));
+        if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
+          return finish({
+            fatal: {
+              kind: "split",
+              error: new Error(
+                `Range would split ${splitDesc} at the protected-zone boundary: a visible tool-call must keep its reasoning run and its results (strict providers reject a rebuilt request that lost either). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`,
+              ),
+            },
+          });
+        }
+        warnings.push(
+          `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
+        );
+      } else {
+        const unfoldable = new Set<string>(
+          [...effectiveMessageIds].filter((id) => !consumedCoverage.has(id)),
+        );
+        const unfolded = new Set<string>();
+        let current = initial.withdrawn;
+        let guard = unfoldable.size + 2;
+        let stuck = false;
+        while (current.size > 0 && guard-- > 0) {
+          let progress = false;
+          for (const id of current) {
+            if (unfoldable.has(id) && !unfolded.has(id)) {
+              unfolded.add(id);
+              progress = true;
+            }
+          }
+          if (!progress) {
+            stuck = true;
+            break;
+          }
+          const recheck = new Set(effectiveMessageIds);
+          for (const id of unfolded) recheck.delete(id);
+          for (const id of survivingCoverage) recheck.add(id);
+          current = computeIntegrityWithdrawals(
+            input.messages,
+            recheck,
+            ctx.integrity(),
+          ).withdrawn;
+        }
+        if (stuck || current.size > 0) {
+          const sample = [...consumedCoverage].slice(0, 5).join(", ");
+          return finish({
+            fatal: {
+              kind: "split",
+              error: new Error(
+                `Merging ${consumedBlockIds.join(", ")} cannot satisfy turn integrity without unfolding already-folded message(s) owned by those blocks (${sample}) — doing so would drop their existing coverage. Align the range to whole turns (do not cut through a reasoning/tool-call/result group) or merge fewer blocks.`,
+              ),
+            },
+          });
+        }
+        withdrawnIds = unfolded;
+        for (const id of unfolded) effectiveMessageIds.delete(id);
+        const beforeWithdraw = filteredIds.length;
+        filteredIds = filteredIds.filter((id) => !unfolded.has(id));
+        warnings.push(
+          `Withdrew ${beforeWithdraw - filteredIds.length} newly-folded message(s) from the merge to keep ${splitDesc} intact while preserving the existing coverage of ${consumedBlockIds.join(", ")}.`,
+        );
       }
-      warnings.push(
-        `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitDesc} intact (visible tool-call would lose its reasoning run or its results).`,
-      );
     }
   }
 
@@ -451,30 +829,29 @@ function applyPairBoundaryAdjustments(
 
 function filterProtectedToolMessages(
   directMessageIds: string[],
-  messages: CoreMessage[],
-  config: Config,
+  ctx: UnitProjectionContext,
 ): string[] {
   // Protected tool calls (and their results, paired by toolCallId) stay in
   // visible context and are simply dropped from the compressible set. They are
   // NOT folded into the summary — the summary reflects what the author wrote,
   // nothing auto-appended.
-  const protectedCallIds = new Set<string>();
+  //
+  // The per-MESSAGE facts (failed/aged compress exchanges, latest-protected
+  // callIds, host protection verdicts, media verdicts) are turn-invariant, so
+  // they come from the shared context; only the per-RANGE part below stays
+  // here: the seed set is copied (this pass EXTENDS it with the callIds it
+  // carves) and `removedIds` is range-local.
+  const fold = ctx.protectedFold();
+  const protectedCallIds = new Set<string>(fold.baseProtectedCallIds);
   const removedIds = new Set<string>();
-  const latest = collectLatestProtected(messages, config);
-  for (const id of latest.callIds) protectedCallIds.add(id);
-  for (const msg of messages) {
-    if (isMessageProtected(msg, config) && msg.toolCallId) {
-      protectedCallIds.add(msg.toolCallId);
-    }
-  }
 
   for (const id of directMessageIds) {
-    const msg = messages.find((m) => m.id === id);
+    const msg = ctx.messageById.get(id);
     if (!msg) continue;
     if (
-      hasUnrecoverableMediaPayload(msg) ||
-      isMessageProtected(msg, config) ||
-      isMessageLatestProtected(msg, latest)
+      ctx.mediaUnrecoverable(msg) ||
+      (fold.isProtected(msg) && !fold.isExempt(msg)) ||
+      fold.isLatestProtected(msg)
     ) {
       removedIds.add(id);
       if (msg.toolCallId) protectedCallIds.add(msg.toolCallId);
@@ -483,7 +860,7 @@ function filterProtectedToolMessages(
 
   for (const id of directMessageIds) {
     if (removedIds.has(id)) continue;
-    const msg = messages.find((m) => m.id === id);
+    const msg = ctx.messageById.get(id);
     if (!msg) continue;
     if (
       msg.contentType === "tool-result" &&
@@ -498,7 +875,7 @@ function filterProtectedToolMessages(
 }
 
 function resolveTargetTier(
-  state: CompressionState,
+  ctx: UnitProjectionContext,
   nestedBlockIds: string[],
   isBlockBoundary: boolean,
 ): CompressionTier {
@@ -506,7 +883,7 @@ function resolveTargetTier(
   if (nestedBlockIds.length === 0) return 1;
   let minTier: CompressionTier = 3;
   for (const id of nestedBlockIds) {
-    const block = blockById(state, id);
+    const block = ctx.blockById(id);
     if (block && block.tier < minTier) minTier = block.tier;
   }
   return minTier;

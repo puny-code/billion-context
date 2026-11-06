@@ -26,6 +26,7 @@
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
 import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
+import { log as loggerLog } from "../logger.js";
 import { MAX_CONSECUTIVE_FAILURES, sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
 
@@ -38,10 +39,28 @@ interface RuntimeState {
     sidecar: UnifiedShadow | null;
     sidecarOpenError: string | null;
     bootstrap: BootstrapOutcome | null;
+    /** #4175 durability trio facts. integrity/backup are null until the first
+     *  store open / backup call; secondProcess is set only while a live
+     *  foreign pid holds the db lockfile. */
+    integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
+    /** #4175/#3959: live foreign pid holding <db>.lock at open. Self-cleared
+     *  at status read once the pid dies (never freezes). #5082: coexistence
+     *  on one index.db is the supported topology, ALWAYS informational;
+     *  `benign` is kept for wire-shape compat and is always true from the
+     *  store path. */
+    secondProcess: { pid: number; at: number; lane?: string; instanceId?: string; benign: boolean } | null;
+    /** #3923/#3959: latest surfaced split-brain contest (newest wins; cleared
+     *  via the ack endpoint, which pins the acknowledged peer servedAt). */
+    splitBrain: SplitBrainContestInput | null;
+    /** ack guard: "sessionId|peerInstanceId" → acknowledged peer servedAt; a
+     *  re-contest at the same/older servedAt stays dismissed, a NEW contest
+     *  (newer servedAt) re-surfaces. */
+    splitBrainAcks: Map<string, number>;
+    backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
 }
 
 function freshState(): RuntimeState {
-    return { requested: null, encryptionBlocked: false, persistDisabled: false, sidecar: null, sidecarOpenError: null, bootstrap: null };
+    return { requested: null, encryptionBlocked: false, persistDisabled: false, sidecar: null, sidecarOpenError: null, bootstrap: null, integrity: null, secondProcess: null, splitBrain: null, splitBrainAcks: new Map(), backup: null };
 }
 
 let state: RuntimeState = freshState();
@@ -66,9 +85,78 @@ export function recordRequestedMode(mode: StorageMode, encryptionBlocked: boolea
     state.persistDisabled = persistDisabled;
 }
 
+/** #4175: quick_check outcome of the latest store open (pass or fail). */
+export function recordIntegrityOutcome(dbPath: string, ok: boolean, durationMs: number, detail?: string): void {
+    state.integrity = { ok, checkedAt: Date.now(), durationMs, ...(detail === undefined ? {} : { detail: `${dbPath}: ${detail}` }) };
+}
+
+/** #4175: a live foreign pid holds <db>.lock. `info` adds the registry facts
+ *  (pid/lane naming). #5082: purely informational, never an alarm; the
+ *  same-session hazard is reported by the split-brain contest instead. */
+export function recordSecondProcessOwner(pid: number, info?: { lane?: string; instanceId?: string; benign: boolean }): void {
+    state.secondProcess = { pid, at: Date.now(), benign: false, ...(info ?? {}) };
+}
+
+interface SplitBrainIdentity {
+    instanceId: string;
+    pid: number;
+    origin: string;
+    /** Undefined for instances/older markers that never declared one. */
+    lane?: string;
+    version: string;
+}
+
+export interface SplitBrainContestInput {
+    sessionId: string;
+    title?: string;
+    self: SplitBrainIdentity;
+    peer: SplitBrainIdentity & { servedAt: number };
+    at: number;
+}
+
+/** #3923/#3959: surface a split-brain contest on the web wire. Suppressed
+ *  when this exact contest (peer + servedAt) was already acknowledged. */
+export function recordSplitBrainContest(contest: SplitBrainContestInput): void {
+    const acked = state.splitBrainAcks.get(`${contest.sessionId}|${contest.peer.instanceId}`);
+    if (acked !== undefined && contest.peer.servedAt <= acked) return;
+    state.splitBrain = contest;
+}
+
+/** Dismiss the surfaced contest for `sessionId` (web ack). Returns false
+ *  when nothing matching is surfaced (→ HTTP 400). */
+export function ackSplitBrainContest(sessionId: string): boolean {
+    const cur = state.splitBrain;
+    if (cur === null || cur.sessionId !== sessionId) return false;
+    state.splitBrainAcks.set(`${cur.sessionId}|${cur.peer.instanceId}`, cur.peer.servedAt);
+    while (state.splitBrainAcks.size > MAX_SPLIT_BRAIN_ACKS) {
+        const oldest = state.splitBrainAcks.keys().next().value;
+        if (oldest === undefined) break;
+        state.splitBrainAcks.delete(oldest);
+    }
+    state.splitBrain = null;
+    return true;
+}
+
+const MAX_SPLIT_BRAIN_ACKS = 64;
+
+/** #4175: the last successful VACUUM INTO backup. */
+export function recordBackupOutcome(lastPath: string, lastBytes: number): void {
+    state.backup = { lastPath, lastAt: Date.now(), lastBytes };
+}
+
 export function _resetStorageRuntimeStatusForTest(): void {
     state = freshState();
     cooldownCache = null;
+}
+
+/** #4175: true when a pid belongs to a live process (EPERM = alive, foreign user). */
+function pidAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
 }
 
 /** Short one-line form of a raw error for interpolation into banner text. */
@@ -88,7 +176,10 @@ function degradeReason(): string {
     // sidecar open ALSO fails with the generic no-engine error — surface the real
     // reason first, or the sidecar-open-error branch below would shadow it (#3894).
     if (state.bootstrap?.status === "unsupported-node") {
-        return `no self-downloaded SQLite engine supports this Node.js (${state.bootstrap.detail ?? "unknown"})`;
+        // #4444: the specific coverage detail outranks the generic no-engine reason
+        // (#3894), but must still carry the Node.js upgrade lever the sidecar-open
+        // branch below carries — an unsupported Node is exactly where it's actionable.
+        return `no self-downloaded SQLite engine supports this Node.js (${state.bootstrap.detail ?? "unknown"})${nodeSqliteUpgradeHint()}`;
     }
     if (state.sidecarOpenError) {
         const e = shortenError(state.sidecarOpenError);
@@ -150,6 +241,13 @@ interface StorageRuntimeStatus {
     verifyDrift: number;
     /** #3135 ④/#3818: sessions currently served from the JSON envelope because the index view drifted. */
     driftedSessions: number;
+    /** #4175 durability trio. */
+    integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
+    secondProcess: { pid: number; at: number; lane?: string; instanceId?: string; benign: boolean } | null;
+    splitBrain: SplitBrainContestInput | null;
+    backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
+    /** #4323: sessions whose JSON-envelope writes this process froze after repeated non-converging drift samples. */
+    frozenEnvelopeSessions: number;
 }
 
 function getStorageRuntimeStatus(): StorageRuntimeStatus {
@@ -168,6 +266,13 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         requested !== "legacy" && !intentionalOptOut && sidecar && !disabled ? requested : "legacy";
     const degraded = requested !== "legacy" && !intentionalOptOut && (sidecar === null || disabled);
     const cd = cooldownState();
+    // #3923/#3959: the second-process warning must never freeze — a foreign
+    // pid that has since exited is cleared here, at the status read.
+    const sp = state.secondProcess;
+    if (sp !== null && !pidAlive(sp.pid)) {
+        state.secondProcess = null;
+        loggerLog("info", `[storage] second-process pid ${sp.pid} has exited — stale warning cleared`);
+    }
     return {
         requested,
         effective,
@@ -187,6 +292,11 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         // (persist.ts loadSync) while the envelope still exists.
         verifyDrift: sidecar?.stats.verifyDrift ?? 0,
         driftedSessions: sidecar?.driftedSessions.size ?? 0,
+        integrity: state.integrity,
+        secondProcess: state.secondProcess,
+        splitBrain: state.splitBrain,
+        backup: state.backup,
+        frozenEnvelopeSessions: sidecar?.frozenEnvelopeIds.size ?? 0,
     };
 }
 
@@ -206,6 +316,20 @@ interface StorageStatusWire {
     /** #3135 ④/#3818: drift observability on the wire. */
     verifyDrift: number;
     driftedSessions: number;
+    /** #4175 durability trio. */
+    integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
+    secondProcess: { pid: number; at: number; lane?: string; instanceId?: string; benign: boolean } | null;
+    /** #3923/#3959: the surfaced split-brain contest, if any (servedAt stripped). */
+    splitBrain: { sessionId: string; title?: string; self: SplitBrainIdentity; peer: SplitBrainIdentity; at: number } | null;
+    backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
+    /** #4323: envelope-write freeze count on the wire. */
+    frozenEnvelopeSessions: number;
+}
+
+function splitBrainWire(cur: SplitBrainContestInput | null): { sessionId: string; title?: string; self: SplitBrainIdentity; peer: SplitBrainIdentity; at: number } | null {
+    if (cur === null) return null;
+    const strip = (x: SplitBrainIdentity): SplitBrainIdentity => ({ instanceId: x.instanceId, pid: x.pid, origin: x.origin, version: x.version, lane: x.lane });
+    return { sessionId: cur.sessionId, title: cur.title, self: strip(cur.self), peer: strip(cur.peer), at: cur.at };
 }
 
 export function storageStatusWire(): StorageStatusWire {
@@ -223,6 +347,11 @@ export function storageStatusWire(): StorageStatusWire {
         sidecarDisabled: st.sidecarDisabled,
         verifyDrift: st.verifyDrift,
         driftedSessions: st.driftedSessions,
+        integrity: st.integrity,
+        secondProcess: st.secondProcess,
+        splitBrain: splitBrainWire(st.splitBrain),
+        backup: st.backup,
+        frozenEnvelopeSessions: st.frozenEnvelopeSessions,
     };
 }
 

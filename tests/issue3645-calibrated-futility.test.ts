@@ -11,6 +11,18 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { normalizeUpstreamOrigin } from "../src/util.ts";
+
+// #4185: an identified fresh session whose preflight ends in deterministic
+// exhaustion now forwards once for upstream arbitration instead of failing
+// fast locally. This control asserts the LOCAL futility-skip contract, so it
+// carries a settled usage baseline to keep testing the evidence-driven path.
+function seedEvidence(upstreamPort: number, sessionId: string): void {
+    const s = getSession(sessionId);
+    s.stats.lastInputTokens = 100;
+    s.stats.lastInputTokensSource = "usage";
+    s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
+}
 
 // #3645: the raw-range futility gate compared an UNCALIBRATED foldable mass against
 // a CALIBRATED payload deficit. Once a matching-origin k̂>1 is set (#1933 F1), the
@@ -358,6 +370,7 @@ test("#3645 control: uncalibrated (k̂ absent) futility skip is unchanged (#1841
             plain("user", "ok"),
             plain("assistant", "done"),
         ];
+        seedEvidence(p.upstreamPort, sessionId);
         const resp = await post(p, sessionId, messages);
         const body = await resp.text();
         assert.equal(resp.status, 413, `a raw-futile round must still fail fast non-retryably: HTTP ${resp.status} ${body.slice(0, 240)}`);

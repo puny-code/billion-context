@@ -376,8 +376,9 @@ export async function reportAttributionHealth(proxyBase: string, health: Attribu
  *  partial note in `text`. Absent on legacy envelopes without the fields. */
 export type ForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
-    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false, toolCallId?: string): Promise<ForwardedToolResult> {
+    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string } = { conversationId, tool, args: args ?? {} };
+    if (toolCallId !== undefined) body.toolCallId = toolCallId;
     // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
     // by the host's own session manager — declare it so a stale sibling witness
     // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).
@@ -424,6 +425,15 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
     const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/status?conversationId=dsh&fallback=latest`, undefined, STATUS_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") return undefined;
     return json as Record<string, unknown>;
+}
+
+/** DSH only: service liveness is insufficient after SQLite fails open to legacy.
+ * Unknown/old status is not affirmative permission to own host compression. */
+export async function fetchDshTakeoverReady(proxyBase: string): Promise<boolean> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/status`, undefined, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return false;
+    const storage = (json as { storage?: { effective?: unknown; degraded?: unknown } }).storage;
+    return storage?.effective === "full" && storage.degraded === false;
 }
 
 /** Liveness + version probe for status UIs: same loopback origin as the
@@ -486,8 +496,8 @@ export const V2_SYNTHETIC_TEXT = "[bili-acp-status] ACP status panel was display
 
 /** Armed-but-idle /acp notice (proxy live, no model request sent yet). One
  *  source of truth for pi / dsh / opencode (#883). */
-export function armedIdleNotice(version: string): string {
-    return `billion-context@${version} — proxy connected, compression armed. No model request yet; send one, then run /acp again.`;
+export function armedIdleNotice(version: string, base?: string): string {
+    return `billion-context@${version} — proxy connected${base ? ` via ${base}` : ""}, compression armed. No model request yet; send one, then run /acp again.`;
 }
 
 /** Fallback when the version probe also fails — a warning, not an info notice. */

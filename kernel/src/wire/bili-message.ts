@@ -29,6 +29,12 @@ export interface BiliMessage extends CoreMessage {
    *  coreToAnthropic (redacted_thinking must reach the wire byte-exact —
    *  Anthropic rejects modified thinking-family blocks). */
   rawAnthropicBlock?: unknown;
+  /** Anthropic: a whole mid-conversation `role:"system"` wire message
+   *  (Pi's `tool_addition` / `tool_removal` deltas, message-level
+   *  `output_config`). Re-emitted verbatim by coreToAnthropic as its own
+   *  system-role message; kernel-synthesized system cores (rendered
+   *  summaries) never carry it and keep their user-role mapping. */
+  rawAnthropicMessage?: unknown;
   /** OpenAI chat: the original content part for an image_url (data: or
    *  remote URL) or the original message object for a developer-role
    *  message. */

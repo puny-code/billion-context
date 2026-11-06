@@ -30,6 +30,16 @@ export interface CoreMessage {
    *  inactive/unknown block folds normally. Reserved-prefix ids
    *  (`acp_summary_*`) stay kernel-internal and never need this marker. */
   summaryOfBlockId?: string;
+  /** #4316 layer 3 — server-ledger numbering. Set by store-served views
+   *  (snapshot-render prefix rows, incremental canonical rows): the unified
+   *  transcript's (session, seq) for this message, assigned once at ingest
+   *  and never re-minted. When present, assignRefs issues the ref as the
+   *  direct display of this number, so client-side byte churn (model-switch
+   *  re-stamps, image re-encodes) cannot renumber the model's citations.
+   *  Callers must guarantee per-session uniqueness; a collision falls back
+   *  to the counter path for the loser. Not serialized into wire payloads —
+   *  it rides CoreMessage sidecars and the persisted store rows verbatim. */
+  ledgerSeq?: number;
 }
 
 export type CompressionTier = 1 | 2 | 3;
@@ -75,6 +85,16 @@ export interface CompressionBlock {
   compressCallId?: string;
   startRef?: string;
   endRef?: string;
+  /** #4316 layer 3: the block's coverage as a unified-ledger seq interval
+   *  [startSeq, endSeq] (inclusive, 1-based display space — same space as
+   *  CoreMessage.ledgerSeq). Recorded ONLY when the fold can prove the claim
+   *  exact: every direct folded message carried a ledgerSeq stamp, every
+   *  consumed block carried its own bounds, and the union of those segments
+   *  is one contiguous span (a hole means min/max would swallow uncovered
+   *  messages, so no bounds are recorded — the id path stays authoritative).
+   *  Undefined = unstamped traffic or provably-loose coverage; never guessed. */
+  startSeq?: number;
+  endSeq?: number;
 }
 
 /** A compression block's current ref span, pre-resolved for display. */
@@ -285,7 +305,13 @@ export interface CompressionState {
    *  the next successful fold (applyCompression) — after a fold the watermark
    *  re-evaluates from scratch. Optional: pre-feature states have none (the
    *  pre-latch node clipped from scratch each turn). */
+  /** #3939 ③: emergency truncation latch entries (see above). Optional:
+     pre-existing persisted states lack it. */
   emergencyTruncateLatch?: EmergencyTruncateLatchEntry[];
+  /** #4316 layer 3 PR3/3: refs have been aligned onto the unified ledger
+     (ref = store row seq + 1) exactly once. Set by restampRefsToLedger;
+     assignRefs' stamp path keeps new arrivals aligned from then on. */
+  refLedgerAligned?: boolean;
   /** Ref-migration render deferral (#3939 ②/#3805): padded refs minted by the
    *  BLOCKED→numeric migration (assignRefs, #2607). The number exists (citable
    *  via decompress({ imageRef }) bookkeeping) but the carrier message keeps

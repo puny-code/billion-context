@@ -113,7 +113,7 @@ test("#3384: legacy paths stay byte-identical — no refusal recorded, or floor 
 });
 
 // ---------------------------------------------------------------------------
-// e2e: refuse a compaction envelope (records the ledger high-water), then a
+// e2e: native compaction creates no high-water; seed a historical floor, then a
 // normal turn with a modest budget must go out UNCLAMPED. Pre-fix the second
 // turn's max_tokens came back ~8056 instead of 20000 (floor ~87.5K against a
 // 100K window), which is exactly how the reported session starved.
@@ -206,7 +206,7 @@ async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<
     };
 }
 
-test("e2e #3384: after a refused compaction envelope, a modest-budget turn goes out unclamped", async () => {
+test("e2e #3384: native compaction creates no floor; a historical floor still cannot starve a modest turn", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-3384-"));
     const cfgFile = path.join(root, "billion-context.json");
     writeFileSync(cfgFile, '{"providers":{}}\n', "utf8");
@@ -222,11 +222,8 @@ test("e2e #3384: after a refused compaction envelope, a modest-budget turn goes 
         assert.equal(r.status, 200, "seed turn accepted");
         await r.text();
 
-        // The dsh compaction envelope (~350KB of core text -> ledger floor
-        // ~87.5K tokens): the guard refuses it (default posture) and records
-        // the high-water byte count. The size is chosen so the pre-fix cap
-        // floor(100000 - 87.5K - ceil(87.5K*0.05)) = ~8056 sits BELOW the 20K
-        // request — this assertion only discriminates in that band.
+        // Native relay must not create a planning floor; a persisted historical
+        // high-water is then seeded to retain the original starvation regression.
         const envelope = JSON.stringify({
             model: "gpt-test",
             stream: true,
@@ -235,14 +232,15 @@ test("e2e #3384: after a refused compaction envelope, a modest-budget turn goes 
                 { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} ${"x".repeat(350_000)}` },
             ],
         });
-        r = await postRaw(envelope);
-        assert.equal(r.status, 422, "guard refuses the compaction call (default)");
+        r = await fetch(ctx.url, { method: "POST", headers: { ...ctx.headers, "x-bili-plugin": "dsh" }, body: envelope });
+        assert.equal(r.status, 200, "native compaction relays");
         await r.text();
         const s = getSession("s-3384-e2e");
         assert.ok(s, "session exists");
-        assert.equal(s.metadata.dshCompactionRefused, true, "refusal flag set");
+        assert.equal(s.metadata.dshCompactionRefused, undefined, "relay does not set refusal metadata");
         const floor = Math.ceil(Buffer.byteLength(envelope) / 4);
-        assert.equal(s.metadata.dshCompactionRefusedBytes, Buffer.byteLength(envelope), "high-water bytes recorded");
+        assert.equal(s.metadata.dshCompactionRefusedBytes, undefined, "relay does not record a high-water");
+        s.metadata.dshCompactionRefusedBytes = Buffer.byteLength(envelope);
         assert.ok(floor > E2E_WINDOW * 0.25 && floor < E2E_WINDOW, `floor ${floor} sits in the discriminating band (25%, window) of a ${E2E_WINDOW} window`);
 
         // Turn 2: a normal short turn with a MODERATE budget (20K < 25K = the

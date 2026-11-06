@@ -274,7 +274,9 @@ export interface CooldownMarker {
 
 /** Absolute path of the failure marker (#3788): surfaced in the storage
  *  diagnostics blob so a user can delete it to force an immediate retry
- *  instead of waiting out the whole cooldown window. */
+ *  instead of waiting out the whole cooldown window. #4427: the publish-boundary
+ *  sink (redactForPublish) rewrites any $HOME prefix to ~ before the blob ships,
+ *  so this absolute form never leaks the user's home dir / username publicly. */
 export function bootstrapFailureMarkerPath(): string {
     return cooldownFile();
 }
@@ -353,14 +355,14 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     const spec = specOverride ?? pinnedSpecForThisNode();
     if (!spec) {
         const detail = unsupportedNodeDetail();
-        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${detail}; staying on legacy storage`);
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${detail}; staying on legacy storage${nodeSqliteUpgradeHint()}`);
         return { status: "unsupported-node", detail };
     }
     const unusable = specUnusableReason(spec);
     if (unusable) {
         // Never register a binding outside the range it declares: the load
         // faults uncatchably, so a probe cannot save us — only refusing can.
-        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${unusable}; a self-downloaded engine would crash this process on load, staying on legacy storage`);
+        loggerLog("warn", `[storage] sqlite engine self-bootstrap: skipped — ${unusable}; a self-downloaded engine would crash this process on load, staying on legacy storage${nodeSqliteUpgradeHint()}`);
         return { status: "unsupported-node", detail: unusable };
     }
     const target = platformOverride ?? platformTargetKey();

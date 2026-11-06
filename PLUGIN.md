@@ -43,7 +43,10 @@ Fetch once at plugin startup.
     "agent": "x-bili-plugin",
     "conversation": "x-bili-plugin-conversation",
     "contextWindow": "x-bili-plugin-context-window",
-    "instructionsMutable": "x-bili-plugin-instructions-mutable"
+    "maxOutput": "x-bili-plugin-max-output",
+    "model": "x-bili-plugin-model",
+    "instructionsMutable": "x-bili-plugin-instructions-mutable",
+    "compression": "x-bili-plugin-compression"
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
@@ -53,7 +56,7 @@ Fetch once at plugin startup.
 }
 ```
 
-Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
+Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents. `headers.compression` names an optional per-request override (#4855): when your host keeps the registered ACP tools out of the outgoing request (Hermes defers every plugin toolset behind `tool_search`), stamp `proxy` on that header alongside the identity headers — the proxy then keeps the session identity and model budget bound to your conversation but serves compression through its own wire channel (it injects the tools and executes compress server-side). Use it only when advertised; older proxies omit it, and the proxy honors it only from a request that already carries `headers.agent`.
 
 ### 2. Request headers
 
@@ -65,6 +68,8 @@ On **every model request** the plugin sends:
 - `x-bili-plugin-instructions-mutable: 1` (optional; send only if true) — declares that your conversation ids are **persona-scoped**: one id per persona, and the request's system/instructions text may change mid-conversation without changing the persona (e.g. opencode re-renders AGENTS.md into `instructions` on every edit). The proxy now keys plugin conversation ids verbatim by default (#1106), so this flag is vestigial for current proxies — keep stamping it for compatibility with older proxy versions, which use it to stop mixing the instructions text into the compression-namespace fingerprint.
 
 - `x-bili-plugin-agent: main` (optional) — vetoes side-request demotion for this one request. Requests are otherwise demoted to the verbatim side lane when they look like auxiliary traffic (#388: small `max_tokens`, or a known side persona such as opencode's title generator). A full main turn that re-sends the conversation can still trip those heuristics; stamping `main` keeps it on the kernel path so it captures history, stays compressible and remains forkable. Any other value declares the side persona id itself (it is then matched against the known side-request persona set, not treated as `main`).
+
+Every proxied 2xx response carries `x-bili-session: <server-side session id>` (#4082) — the id the proxy itself keys this conversation by. A client that keeps its own conversation object may store it from any response and send it back as `x-bili-plugin-conversation` on later requests (retries, model switches, resends after resume), keeping identity stable even when the request is driven from an execution context the plugin cannot attribute. The dsh bridge does this automatically in-process (it learns the mapping while attribution works and re-stamps when it breaks); other hosts may adopt the header directly.
 
 Effects on the proxy for that session:
 

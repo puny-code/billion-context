@@ -11,7 +11,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL_NAME, RULE_TOOL_NAME } from "./compress-tool.js";
+import { PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL_NAME, HISTORY_TOOL_NAME, RULE_TOOL_NAME } from "./compress-tool.js";
 import { effectiveRulesEnabled } from "./rules-feature.js";
 import { ccrEnabled, retrieveToolName } from "./store.js";
 import { log as loggerLog } from "./logger.js";
@@ -52,6 +52,10 @@ export function isProxyToolFor(name: string, session: Session | undefined, confi
     // where it is not registered in the manifest (codex) a hallucinated call
     // must never reach the client as an unsupported tool.
     if (name === READ_ORIGINAL_IMAGE_TOOL_NAME) return true;
+    // acp_history is a server-side read of local storage on EVERY lane: the
+    // history it returns was never the client's to provide, so forwarding the
+    // call would surface an unsupported tool instead of an answer.
+    if (name === HISTORY_TOOL_NAME) return true;
     const absorb = effectiveAbsorbConfig(session, config);
     if (absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME)) return true;
     if (ccrEnabled(session) && name === retrieveToolName(session)) return true;

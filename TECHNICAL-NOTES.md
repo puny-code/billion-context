@@ -384,6 +384,43 @@ remove <client>` best-effort queries the live proxy (instance file →
 `GET /__bili/sessions`, 2.5 s timeout, silent on failure) and prints a note
 when sessions of that client were active within the last **10 minutes**.
 
+## Degraded direct fallback — refuse, self-heal, announce (#4516, #3304, #2924, #4079)
+
+When a native lane's proxy is unavailable, model traffic falls back to direct
+sends (`directSendOrRefuse`, `src/agent/native-intercept.ts`). That path is a
+degraded mode with three contracts, all shared by every lane (the gateless
+lanes pi/omp/opencode-V1 had none of them before #4516 — a 1.06M-token raw
+history rode straight to the provider):
+
+- **Size arm** — before ANY degraded send, the body is priced with the same
+  doom math as dsh's gate (`bodyProvablyOverWindow`): stage 1 is the raw
+  byte floor vs the window, stage 2 strips structural media bytes (#4111
+  direction: media-heavy bodies whose core TEXT fits are NOT refused). The
+  bar never assumes a window below `MIN_ASSUMED_WINDOW_TOKENS` (1M, #4079 —
+  declared windows can be wrong-small); bodies in that band are left to
+  preflight. Missing data (no `x-bili-plugin-context-window` header,
+  unreadable body) fails OPEN to the direct send — a local guard must never
+  false-block on its own ignorance. Verdict: 422
+  `x-bili-gate: oversize-refusal-fallback`, retryable, wire-shaped per
+  upstream dialect, message names floor/core/window and the unavailability
+  reason (`bootstrap-failed` vs `dead` — the latter only after the lane held
+  an origin and lost it).
+- **Self-heal** — a failed bootstrap no longer means
+  direct-for-process-lifetime. Each request that finds no live origin fires
+  the owner's `respawn` (singleFlight — concurrent requests share ONE
+  attempt) under a 15 s cooldown, then holds out for the in-flight attempt
+  under `state.spawnWaitMs ?? readyTimeoutMs ?? 15_000`: the pi spawn lane
+  sets `SPAWN_BUDGET_MS + 10 s` so a slow cold start (#4515) is waited out
+  instead of refused at the generic cap. Recovery needs no host restart.
+- **Announce** — every TRANSITION into/out of the degraded state logs one
+  line to bili.log (proxy recovered / goes direct / refused), not one line
+  per request; `state.lastUnavailableReason` carries WHY into the refusal
+  wording so the user can tell "still starting" from "died".
+
+The opencode V2 resolver lanes (`createLiveOriginResolver`) keep their own
+probe-driven retry; this contract covers the plain intercept path they do
+not. Attribution reporting into the panel remains dsh-only (see #4516).
+
 ## Unified ACP tag-echo remediation — the four invariants (#2023/#2066/#2190/#2248)
 
 One PR folds the three remediation legs together (refs-run residue #2023,
@@ -475,3 +512,18 @@ Settled design = **stamp-by-default + empirical self-heal (probe-and-remember)**
 - Modes: only the plugin lane (registered agent / dsh plugin, internal conversation header present) ever stamps; plain proxy mode stays pure passthrough in both directions, byte-for-byte unchanged.
 
 Tests: `tests/issue2645-pck-probe.test.ts` (strict upstream self-heals turn 1, remembers turn 2, lenient pool never probes, poisoned upstream forwards the 400 and learns nothing, client-owned keys drop after ablation, model-granular pairs) + the rewritten matrix in `tests/issue2218-relay-affinity-signal.test.ts`.
+
+## Uncovered-history audit — honest minimum verdict (#4331)
+
+The "no compressible ranges remain — the context is already at its minimum" stop signal was structurally unverifiable: it fired whenever the PRE-FOLD OFFER was exhausted (`postCompressTail`, #2404 pinning), but nothing ever compared the union of active-block ranges against the session's ref set. A live ZCode session showed the failure at scale — 138 mid-history refs (~65K tok, ~16% of context) in no active block, largest run `m00312`–`m00411` (100 msgs), while the receipt declared the global minimum three times in a row. The kernel DOES find such spans when they are offered (verified by repro on master); what was missing was a GLOBAL coverage audit plus a verdict that only claims "minimum" when one holds.
+
+Design (`src/uncovered.ts`, host-side only, no kernel change):
+
+- `uncoveredHistoryRuns()`: walk the message array for entries outside every active block's coverage (the `collectVisible` predicate), group contiguous runs, then classify each run: skip if any current offer covers part of it (the model can act on it now); otherwise diff TWO `core.processTurn` passes over a `structuredClone(state)` — normal config vs relaxed `{preserveRecentMessages: 0, preserveRecentTokens: 0}` — and treat refs offered only in the relaxed pass as zone-hidden (inside the protected recent window). The empirical zone diff deliberately re-uses the kernel's own protected-zone rules instead of copying them, so it self-maintains as those rules evolve (over-approximation errs toward under-reporting). Runs below `VIABLE_RANGE_MIN_TOKENS` (200) stay silent. A caller that already ran the normal offer pass may pass it via `normalRanges` (array = trust-and-reuse, even empty; undefined = no caller data, audit runs its own pass) so acp_status pays ONE extra `processTurn`, not two. Whole function is advisory: any throw degrades to "no runs found" and never breaks receipts or status.
+- **acp_status** gains an additive `UNCOVERED HISTORY` section (top-5 runs by tokens, rest counted) listing mass that sits outside every active block AND is absent from the live Compressible-ranges list above — including isolated sub-gate runs between covered blocks that no merge will ever fold (the permanent-hole class of #4331 / #847). Named for visibility, explicitly not as fold suggestions; rows drill down via `scope:"uncompressed"` unchanged.
+- **Tier-2 coverage invariant (reviewed, pinned by P4)**: the audit's covered-set is `coveredMessageIds` = the union of ACTIVE blocks' `effectiveMessageIds` with NO child recursion (kernel/src/state.ts:57-64). That is safe because every block-creation path unions consumed children's `effectiveMessageIds` into the new parent (kernel/src/unit-projection.ts:178-183) and deactivates the children (kernel/src/compress.ts:1578-1581) — a T2/T3 parent therefore carries its full distilled span in the state model, and hydration preserves it (whole state JSON). DB-side walks of `blocks.payload_json` do NOT have that property and need `directBlockIds` recursion (the reason an earlier independent attempt carried one); the state model does not.
+- **postCompressTail**: on clean whole-offer exhaustion with no tier distillation, the audit runs before the verdict. Runs found AND totalling ≥ `UNCOVERED_RECEIPT_FLOOR_TOKENS` (10K, receipt-only) → honest text naming them ("not at its minimum", pointer to acp_status). Below the floor — or with no runs — the verbatim #1387 contract string fires byte-stable, exactly as on master: small declined leftovers must not re-nag on every fold (pi #521 rule), while material leaks override it. The floor is deliberately NOT applied to the acp_status section: an explicit inspection surface is not a nag surface, and option 1 of #4331 specified no size gate there. The 10K total is a product value pending owner ack (matches the reviewer's independent pick).
+
+Behavior change (disclosed): old = unconditional "already at its minimum" on offer exhaustion; new = that claim only when the global audit verifies it AND the uncovered mass clears the 10K receipt floor — below the floor the receipt is byte-identical to master (so `tests/compress-success-tail.test.ts` stays at master bytes, zero diff), and its #2404/#1387 sub-floor residue fixtures now double as the floor's pins. Sub-gate residue became visible in acp_status (previously invisible on every surface). No config/env surface added; nudge prompt text untouched (kernel-owned). Known limitation left as a separate observation: the receipt's remaining-calc removes a WHOLE offered batch when any submitted span overlaps it, so a partially-folded merged batch can under-report rather than over-report.
+
+Tests: `tests/issue4331-uncovered-history.test.ts` (hole session → honest verdict + named span; drained session → verbatim contract string; sub-floor silence; tier precedence; **tier-2 distillation coverage pin** — three T1s distilled into one T2 parent via the real host path must not leak child spans into the audit; both acp_status directions; formatter caps) + `tests/compress-success-tail.test.ts` UNCHANGED from master (its < 10K-residue fixtures pin the floor), `tests/issue2029-status-baseline-provenance.test.ts` (every status-reader kernel call feeds the provenance baseline), `tests/issue847-compress-failure-guards.test.ts` (sub-gate residue visible in the diagnostic, still never offered).

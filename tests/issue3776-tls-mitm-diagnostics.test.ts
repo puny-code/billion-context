@@ -278,7 +278,10 @@ test("#3776 e2e (A): untrusted MITM upstream => 502 carrying structured upstream
     const { resp, body } = await startTlsScenario(false);
     assert.equal(resp.status, 502);
     const parsed = JSON.parse(body) as { error?: string; detail?: string; upstreamFailure?: { kind?: string; code?: string; hint?: string } };
-    assert.equal(parsed.error, "acp-proxy failure");
+    // #4254: `error` is now informative (the client-rendered field); the legacy
+    // prefix is preserved so hosts matching the old constant still match.
+    assert.ok((parsed.error ?? "").startsWith("acp-proxy failure"), `legacy prefix kept, got: ${parsed.error}`);
+    assert.match(parsed.error ?? "", /tls/, "informative error carries the tls kind");
     assert.ok(parsed.detail?.includes("kind=tls"), `detail should name the kind, got: ${body}`);
     assert.equal(parsed.upstreamFailure?.kind, "tls");
     assert.ok(parsed.upstreamFailure?.code, "structured code present");

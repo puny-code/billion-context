@@ -4,13 +4,14 @@ import { VERSION, BUILD_COMMIT } from "../version.js";
 export {
     handleConfigGet,
     handleConfigPut,
+    handlePricingGet,
     handleSummaryCredentialPut,
     readProviders,
     readUpstreamSettings,
 } from "./api.js";
 
-export { buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, buildBlockContent, buildMessageContent, hiddenEmptyCount } from "./sessions-data.js";
-export type { BlockContentLookup, BlockContentView, MessageContentLookup } from "./sessions-data.js";
+export { buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, buildSessionTree, buildBlockContent, buildMessageContent, hiddenEmptyCount } from "./sessions-data.js";
+export type { BlockContentLookup, BlockContentView, MessageContentLookup, WebSessionTreeNode } from "./sessions-data.js";
 
 export function renderUI(origin: string, opts?: { embed?: boolean; theme?: "light" | "dark" }): string {
     // #1426 fix: reuse the bundle-safe VERSION from src/version.ts — resolving

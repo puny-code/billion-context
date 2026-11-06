@@ -25,6 +25,7 @@ import {
     maskUrlForDiagnostics,
     maskUrlForLog,
     maskUrlsForDiagnostics,
+    maskUrlsForPublish,
     maskUrlsInText,
     redactSecretsInText,
     setMaskHostsEnabled,
@@ -77,6 +78,49 @@ test("maskUrlsInText: masks URLs embedded in arbitrary strings", () => {
         "forward POST → https://api.openai.com/v1/chat/completions",
     );
     assert.equal(maskUrlsInText("no urls here"), "no urls here");
+});
+
+test("maskUrlsInText: non-http userinfo schemes are masked too (#4191)", () => {
+    assert.equal(maskUrlsInText(" socks5://u:p@10.0.0.1:1080 "), " socks5://<private-host>:1080 ");
+    assert.equal(
+        maskUrlsInText("forward ws://user:pass@relay.internal:8080/ws failed"),
+        "forward ws://<private-host>:8080/ws failed",
+    );
+    assert.equal(maskUrlsInText("wss://a:b@host.example/x"), "wss://<private-host>/x");
+    assert.equal(maskUrlsInText("ftp://user:pass@ftp.example/pub"), "ftp://<private-host>/pub");
+    // userinfo/query/hash dropped, path kept; a pathless non-special scheme keeps no trailing "/"
+    assert.equal(maskUrlsInText("socks5h://x:y@r.internal/a/b?c=d#f"), "socks5h://<private-host>/a/b");
+    assert.equal(maskUrlsInText("socks5://10.0.0.1:1080"), "socks5://<private-host>:1080");
+    assert.equal(maskUrlsInText("junk http:// trailing stays"), "junk http:// trailing stays");
+    assert.equal(maskUrlsInText("mailto:x@y.com stays"), "mailto:x@y.com stays");
+});
+
+test("maskUrlsInText: word-char-glued URL stays masked — no leading \\b in the entry regex (#4191)", () => {
+    // A leading \b would skip these (word char → no boundary) and leak the host;
+    // over-masking is safe, under-masking is not. Pins the unbounded pattern.
+    assert.ok(!maskUrlsInText("_https://foo.com/bar underscore").includes("foo.com"));
+    assert.ok(!maskUrlsInText("xhttps://foo.com/bar glued").includes("foo.com"));
+});
+
+test("maskUrlsForDiagnostics: non-http userinfo schemes are masked too (#4191)", () => {
+    assert.equal(maskUrlsForDiagnostics(" socks5://u:p@10.0.0.1:1080 "), " socks5://<private-host>:1080 ");
+    assert.equal(
+        maskUrlsForDiagnostics("forward ws://user:pass@relay.internal:8080/ws failed"),
+        "forward ws://<private-host>:8080/ws failed",
+    );
+    // loopback exemption applies per-scheme: bili's own local proxy stays verbatim
+    assert.equal(maskUrlsForDiagnostics("probe ws://127.0.0.1:9000/acp"), "probe ws://127.0.0.1:9000/acp");
+});
+
+test("maskUrlsForPublish: non-http userinfo schemes masked on the PUBLIC boundary (#4191)", () => {
+    // unlike the log/diagnostics paths, publish masks non-public hosts unconditionally (ignores BILI_LOG_MASK_HOSTS=0)
+    assert.equal(maskUrlsForPublish(" socks5://u:p@10.0.0.1:1080 "), " socks5://<private-host>:1080 ");
+    assert.equal(
+        maskUrlsForPublish("forward ws://user:pass@relay.internal:8080/ws failed"),
+        "forward ws://<private-host>:8080/ws failed",
+    );
+    assert.equal(maskUrlsForPublish("ftp://user:pass@ftp.example/pub"), "ftp://<private-host>/pub");
+    assert.equal(maskUrlsForPublish("https://api.anthropic.com/v1/messages"), "https://api.anthropic.com/v1/messages");
 });
 
 test("maskUrlForDiagnostics: loopback exempt (identifies bili's own proxy), non-public still masked (#3651)", () => {

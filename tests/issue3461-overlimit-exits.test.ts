@@ -199,16 +199,16 @@ test("#3461 e2e: a payload that can never fit fails fast 413 non-retryable, cool
         assert.match(String(err?.["message"]), /NOT forwarded/, "the diagnostic says the payload was not forwarded");
         assert.match(String(err?.["message"]), /exhaust|window|session/i, "the diagnostic carries the exhaustion reason");
 
-        // Turn 3: identical payload hits the dead-end cooldown — same verdict,
-        // zero upstream traffic.
+        // Turn 3 (#4079): identical payload re-runs the deterministic exhaustion
+        // check — same local 413, no marker, and still zero upstream traffic.
         const before = upstreamCalls;
         const r3 = await post(hugeSystem, [{ role: "user", content: "go?" }, { role: "assistant", content: "ok" }, { role: "user", content: "again?" }]);
-        assert.equal(r3.status, 413, "cooldown replays the 413 verdict");
+        assert.equal(r3.status, 413, "the deterministic 413 verdict replays");
         await r3.text();
-        assert.equal(upstreamCalls, before, "the cooldown round must not touch the upstream");
+        assert.equal(upstreamCalls, before, "a deterministic local refusal must not touch the upstream");
         const s = listSessions().find((x) => x.id === id);
         assert.ok(s, "session exists");
-        assert.equal((s!.metadata.preflightDeadEnd as Record<string, unknown>)["status"], 413, "the dead-end marker carries the 413 status");
+        assert.equal(s!.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker is written anymore");
     } finally {
         await new Promise<void>((r) => proxy.close(() => r()));
         await new Promise<void>((r) => server.close(() => r()));

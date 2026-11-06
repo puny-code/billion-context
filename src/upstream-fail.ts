@@ -121,6 +121,23 @@ export interface UpstreamFailureDetail {
     kind?: UpstreamFailureKind;
     code?: string;
     hint?: string;
+    /** #4254: display-form host[:port] of the failing endpoint (loopback-exempt
+     *  masked) so the egress can name WHICH endpoint failed in the client-facing
+     *  `error` string and the structured diag. */
+    host?: string;
+    /** #4254: true when this is a round-level circuit-breaker fail-fast (endpoint
+     *  proven dead, bili NOT contacting it) — drives 503 + Retry-After at the
+     *  egress instead of a generic 502. */
+    circuitOpen?: boolean;
+    /** #4254: seconds until the next half-open probe (circuitOpen only) — becomes
+     *  the Retry-After header so compliant hosts back off instead of resending. */
+    retryAfterSeconds?: number;
+    /** Measured bytes of the body this attempt actually put on the wire. Present
+     *  only when the failure shape makes the measurement meaningful (a
+     *  pre-response reset) — see payloadResetNote. */
+    outboundBytes?: number;
+    /** Wall-clock age of the failed attempt, in milliseconds. */
+    attemptElapsedMs?: number;
 }
 
 const UPSTREAM_FAILURE = Symbol("upstreamFailure");
@@ -136,6 +153,99 @@ export function upstreamFailureOf(err: unknown): UpstreamFailureDetail | undefin
         if (value !== null && typeof value === "object") return value as UpstreamFailureDetail;
     }
     return undefined;
+}
+
+// #4254: marks an error as a DELIBERATE circuit-breaker fail-fast so the egress catch
+// can skip its per-request [error]+stack — the throttled [warn] at the throw site is
+// the canonical record. Stops the log amplification where every blocked request used
+// to re-log the full errno/url/hint.
+const EXPECTED_FAIL_FAST = Symbol("expectedFailFast");
+
+export function markExpectedFailFast(err: Error): Error {
+    Object.defineProperty(err, EXPECTED_FAIL_FAST, { value: true, enumerable: false });
+    return err;
+}
+
+export function isExpectedFailFast(err: unknown): boolean {
+    return err !== null && typeof err === "object" && (err as Record<symbol, unknown>)[EXPECTED_FAIL_FAST] === true;
+}
+
+/** #4254: build the client-facing proxy-failure response (status + headers + JSON
+ *  body) from a thrown error, shared by EVERY egress site (startServer dispatch
+ *  catch + the inline engine) so they render identically. Three deliberate changes
+ *  vs the old inline code:
+ *   - `error` is no longer a constant: when the failure carries a structured slice
+ *     it reads "acp-proxy failure: <kind> [<code>] [host[:port]]" plus a
+ *     "(circuit open, next probe +Ns)" suffix for fail-fast — the prefix is kept
+ *     verbatim so clients matching the old constant still match, and the shape stays
+ *     a STRING (never the OpenAI {error:{message}} object form, which would break
+ *     hosts that render error.text).
+ *   - a round-level circuit-breaker fail-fast answers 503 + Retry-After (next-probe
+ *     interval) instead of a generic 502, so compliant hosts back off rather than
+ *     resending full context (#2847 precedent: the status carries retry semantics).
+ *   - the structured diag gains host/circuitOpen/retryAfterSeconds alongside the
+ *     existing kind/code/hint (purely additive; byte-identical when none present). */
+export function buildProxyFailureResponse(msg: string, err: unknown): { status: number; headers: Record<string, string>; body: string } {
+    const uf = upstreamFailureOf(err);
+    let cause = "";
+    if (uf && uf.kind !== undefined) {
+        const bits: string[] = [uf.kind];
+        if (uf.code !== undefined) bits.push(uf.code);
+        if (uf.host !== undefined) bits.push(uf.host);
+        cause = bits.join(" ");
+        if (uf.circuitOpen === true) {
+            cause += typeof uf.retryAfterSeconds === "number" ? ` (circuit open, next probe +${Math.max(1, Math.ceil(uf.retryAfterSeconds))}s)` : " (circuit open)";
+        }
+    }
+    const errorField = cause !== "" ? `acp-proxy failure: ${cause}` : "acp-proxy failure";
+    let status: number;
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (msg.includes("exceeds")) {
+        status = 413; // context-overflow doom (#2490/#2847) — unchanged
+    } else if (uf && uf.circuitOpen === true) {
+        status = 503;
+        if (typeof uf.retryAfterSeconds === "number") headers["retry-after"] = String(Math.max(1, Math.ceil(uf.retryAfterSeconds)));
+    } else {
+        status = 502;
+    }
+    const diag: Record<string, unknown> = {};
+    if (uf && uf.kind !== undefined) diag.kind = uf.kind;
+    if (uf && uf.code !== undefined) diag.code = uf.code;
+    if (uf && uf.hint !== undefined) diag.hint = uf.hint;
+    if (uf && uf.host !== undefined) diag.host = uf.host;
+    if (uf && uf.circuitOpen === true) diag.circuitOpen = true;
+    if (uf && typeof uf.retryAfterSeconds === "number") diag.retryAfterSeconds = uf.retryAfterSeconds;
+    if (uf && typeof uf.outboundBytes === "number") diag.outboundBytes = uf.outboundBytes;
+    if (uf && typeof uf.attemptElapsedMs === "number") diag.attemptElapsedMs = uf.attemptElapsedMs;
+    const body = JSON.stringify({ error: errorField, detail: msg, ...(Object.keys(diag).length > 0 ? { upstreamFailure: diag } : {}) });
+    return { status, headers, body };
+}
+
+/** Thresholds for the payload-size hypothesis. Deliberately a REPORT, not a
+ *  decision: nothing downstream sheds, retries or rewrites based on these. */
+const PAYLOAD_RESET_MIN_BYTES = 1 << 20;
+const PAYLOAD_RESET_MAX_MS = 1500;
+
+/** Describe an oversized pre-response reset, or return null when the failure
+ *  shape is not the one worth reporting.
+ *
+ *  Shape: a reset that lands within ~1.5s on an upload of >=1MiB. The upstream
+ *  took the connection, read the request head, and closed — too fast to have
+ *  processed it, too big to be a coincidence. The observed field case: a 7.0MiB
+ *  body (6 screenshots at 1264x805, under the rescale gate) died in ~0.4s on
+ *  every attempt while every request under ~6MiB went through, and the user only
+ *  saw `502 "acp-proxy failure"`.
+ *
+ *  What this note must NOT do: claim the cause is proven (the same reset can be
+ *  a plain network drop), and never trigger a shrunken resend — a reset does not
+ *  prove the upstream did not already run the request, so re-sending different
+ *  bytes could double-execute it. Wording stays a hypothesis; tests pin it. */
+export function payloadResetNote(kind: UpstreamFailureKind, outboundBytes: number, elapsedMs: number): string | null {
+    if (kind !== "upstream-reset" && kind !== "proxy-reset") return null;
+    if (!Number.isFinite(outboundBytes) || outboundBytes < PAYLOAD_RESET_MIN_BYTES) return null;
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > PAYLOAD_RESET_MAX_MS) return null;
+    const mib = (outboundBytes / (1024 * 1024)).toFixed(1);
+    return `the connection died ${Math.round(elapsedMs)}ms into a ${mib} MiB upload, before any response byte — if every attempt at this size fails while smaller requests succeed, the endpoint is rejecting payload size`;
 }
 
 /** Fail-fast kinds: the attempt died BEFORE any response byte existed, so a

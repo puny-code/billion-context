@@ -5,6 +5,8 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
+import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +16,9 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, sweepStale, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
@@ -76,6 +80,7 @@ type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
+    registerMessageRenderer?: (customType: string, renderer: MessageRenderer) => void;
     // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
     // completion notifications through the host's persistent transcript
     // channel; optional because older hosts and non-pi hosts lack it.
@@ -391,6 +396,34 @@ export function replayedMessageCount(ctx: Ctx): number | undefined {
     }
 }
 
+/** #4491 omp msgids wiring: (id, role) of the branch's message entries in
+ *  session order — the hint the fetch-layer incremental planner
+ *  (omp-native) aligns against the ACTUALLY-sent wire messages and carries
+ *  as `msgIds` when they match 1:1. Non-message entries (model_change,
+ *  native-compaction summaries) are skipped — they have no message id, so a
+ *  summary that DID become a wire message leaves the counts short and the
+ *  alignment refuses the whole field (all-or-nothing). An entry without a
+ *  stable id yields an empty one, which the consumer's screen rejects the
+ *  same way. Total: a missing/throwing getBranch yields [] — this request
+ *  cannot vouch ids, and [] forces the degrade instead of leaving a stale
+ *  earlier hint in place. */
+export function ompBranchMsgIdEntries(ctx: Ctx): HostMsgIdHintEntry[] {
+    const out: HostMsgIdHintEntry[] = [];
+    try {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) return out;
+        for (const entry of branch) {
+            if (entry === null || typeof entry !== "object" || (entry as { type?: unknown }).type !== "message") continue;
+            const id = (entry as { id?: unknown }).id;
+            const role = (entry as { message?: { role?: unknown } | null }).message?.role;
+            out.push({ id: typeof id === "string" ? id : "", role: typeof role === "string" ? role : "" });
+        }
+    } catch {
+        return [];
+    }
+    return out;
+}
+
 // #2583: OMP's Cowork transport (can1357/oh-my-pi 642892ae, proxy handling
 // e22a5ff2) picks egress PER MODEL: default anthropic/anthropic-messages
 // requests go out over node:https DIRECTLY — stable header order, HTTP/1.1,
@@ -566,7 +599,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         description: tool.description,
         parameters: tool.inputSchema,
         loadMode: "essential",
-        execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+        execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
                 // #2416: read the LIVE base — a native respawn after a proxy
@@ -586,7 +619,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
                 // rebinding (onRoutedOriginObserved) converges env back to the
                 // observed routed origin.
                 const base = proxyBaseForCtx(ctx) ?? proxyBase;
-                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown");
+                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown", toolCallId);
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
@@ -1035,6 +1068,39 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             pi.on("session_start", (_event, ctx) => repin(ctx));
             pi.on("session_switch", (_event, ctx) => repin(ctx));
         }
+        if (agent === "pi" && typeof pi.registerMessageRenderer === "function") {
+            pi.registerMessageRenderer("bili-acp-status", (message, { expanded, outputPad }, theme) => {
+                if (expanded) return undefined;
+                const text = typeof message.content === "string" ? message.content
+                    : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+                const lines = text.split("\n");
+                // Block-detail line shape is owned by the kernel's buildStatusPanel
+                // (kernel/src/panel/panel.ts); if it ever changes, folding degrades to full display.
+                const collapsed = lines.filter((line) => !/^  \[b\d+\] T\d+ /.test(line));
+                if (collapsed.length === lines.length) return undefined;
+                const box = new Box(outputPad ?? 1, 1, (line) => theme.bg("customMessageBg", line));
+                box.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[bili-acp-status]\x1b[22m"), 0, 0));
+                box.addChild(new Spacer(1));
+                box.addChild(new Markdown(collapsed.join("\n"), 0, 0, {
+                    heading: (value) => theme.fg("mdHeading", value),
+                    link: (value) => theme.fg("mdLink", value),
+                    linkUrl: (value) => theme.fg("mdLinkUrl", value),
+                    code: (value) => theme.fg("mdCode", value),
+                    codeBlock: (value) => theme.fg("mdCodeBlock", value),
+                    codeBlockBorder: (value) => theme.fg("mdCodeBlockBorder", value),
+                    quote: (value) => theme.fg("mdQuote", value),
+                    quoteBorder: (value) => theme.fg("mdQuoteBorder", value),
+                    hr: (value) => theme.fg("mdHr", value),
+                    listBullet: (value) => theme.fg("mdListBullet", value),
+                    bold: (value) => theme.bold(value),
+                    italic: (value) => theme.italic(value),
+                    underline: (value) => theme.underline(value),
+                    strikethrough: (value) => theme.strikethrough(value),
+                }, { color: (value) => theme.fg("customMessageText", value) }));
+                box.addChild(new Text(theme.fg("dim", "Ctrl+O to expand full ACP report"), 0, 0));
+                return box;
+            });
+        }
         if (typeof pi.registerCommand === "function") {
             pi.registerCommand("acp", {
                 description: "Show ACP context-compression status for this session",
@@ -1071,7 +1137,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             version = undefined;
                         }
                         if (version !== undefined) {
-                            notify(armedIdleNotice(version), "info");
+                            notify(armedIdleNotice(version, proxyBase), "info");
                         } else {
                             notify(noSessionWarning(), "warning");
                         }
@@ -1333,12 +1399,32 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (state.toolsReady !== true) return undefined; // no marker stamped → must not replace
             const payload = event.payload as { messages?: unknown; system?: unknown } | undefined;
             if (payload === null || typeof payload !== "object" || !Array.isArray((payload as { messages?: unknown }).messages)) return undefined;
+            if (!wireMessagesLookAnthropic(payload.messages)) return undefined; // anthropic wire only — OpenAI tool shapes resend full (#3433)
             const sid = sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return undefined;
             let proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return undefined;
             if (!(await probeIncrementalTurns(proxyBase))) return undefined;
+            // #4352: the response-header ack channel is transport-dependent —
+            // pi's after_provider_response only exposes headers for some
+            // provider transports, and a missed ack makes EVERY next turn
+            // re-seed the full history (the 2026-10-22 incident: turn 2 sent
+            // sinceSeq=0 again). Before planning, reconcile any still-pending
+            // un-acked turn by PULLING the lane's receipt and adopting it only
+            // when the boundary hash proves the canonical absorbed OUR last
+            // message — never on mere seq progress (a foreign full-resend can
+            // advance the canonical too).
+            const pendingAck = pendingIncrementalAcks.get(sid);
+            if (pendingAck !== undefined && pendingAck.messages.length > 0) {
+                const receipt = await pullIncrementalReceipt(proxyBase, sid);
+                const expected = incrementalWireHash(pendingAck.messages[pendingAck.messages.length - 1]);
+                if (receipt !== null && receipt.appliedSeq > 0 && receipt.boundary === expected) {
+                    pendingIncrementalAcks.delete(sid);
+                    piIncrementalOriginals.delete(sid);
+                    noteIncrementalAck(sid, receipt.appliedSeq, pendingAck.messages, pendingAck.system);
+                }
+            }
             const plan = planIncrementalTurn({
                 conversationId: sid,
                 // The marker divert uses the ORIGINAL request URL server-side;
@@ -1354,7 +1440,25 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // swapped envelope lands on the wire.
             stashPiIncrementalOriginal(sid, payload);
             pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
-            return JSON.parse((plan as { body: string }).body) as unknown;
+            const body = JSON.parse((plan as { body: string }).body) as { messages: IncrementalWireMessage[]; msgIds?: string[] };
+            // #4491 pi msgids wiring: attach the pi session's stable message
+            // ids (aligned to the FULL outgoing wire) sliced to the plan's
+            // delta messages, all-or-nothing — one unresolvable message, a
+            // multi-block delta message (the lane pins 1:1 onto the flattened
+            // core messages and 400s otherwise), or a poison-shaped id leaves
+            // the field off entirely and the turn rides content-derived ids.
+            let branch: unknown;
+            try {
+                branch = ctx.sessionManager?.getBranch?.();
+            } catch {
+                branch = undefined;
+            }
+            const ids = laneMsgIdsForWire(payload.messages, branch);
+            if (ids !== undefined && body.messages.every((m) => lanePinnableContent(m.content))) {
+                const sliced = ids.slice(ids.length - body.messages.length);
+                if (sliced.length === body.messages.length && validateMsgIds(sliced, sliced.length).ok) body.msgIds = sliced;
+            }
+            return body;
         }
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
@@ -1384,6 +1488,16 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #4491 omp msgids: snapshot the branch's stable entry ids BEFORE
+            // any await below — the hint must be the generation of THIS
+            // payload. The fetch-layer planner (omp-native) reads it back by
+            // the prompt_cache_key conversation id and carries `msgIds` only
+            // when the ids align 1:1 with the actually-sent messages; any
+            // mismatch degrades to no field, never a misaligned array.
+            if (agent === "omp") {
+                const hintSid = sessionIdOf(ctx);
+                if (hintSid !== undefined && hintSid.length > 0) noteHostMsgIdHint(hintSid, ompBranchMsgIdEntries(ctx));
+            }
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.

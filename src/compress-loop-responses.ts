@@ -18,7 +18,6 @@ import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
-import { revoiceMidSystemDevelopers } from "./util.js";
 
 interface CompressLoopResponsesCtx {
     signal?: AbortSignal;
@@ -198,19 +197,22 @@ export async function compressLoopResponsesJson(
             }
                 const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${toolResult.text.slice(0, 120).replace(/\n/g, " ")}]`);
-            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, toolResult.text) });
+            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text) });
         }
         // #1097: retrieval injections ride the re-request after their ack —
-        // coreToResponses re-voices system as developer, so mirror that here.
+        // as user items (bili's own artifacts take the #377-sanctioned user
+        // voice from birth; input_text is the user-side part convention).
         for (const injection of drainPendingRetrievals(ctx.session)) {
-            inputItems.push({ type: "message", role: "developer", content: [{ type: "output_text", text: injection.text }] });
+            inputItems.push({ type: "message", role: "user", content: [{ type: "input_text", text: injection.text }] });
         }
-        // #1999 residual: this re-request rides mid-history developer items
-        // (the visibility marker above, retrieval injections, and any
-        // client-origin mid system/developer from the raw body) — re-voice them
-        // as user while preserving the leading system/developer prefix so
-        // strict single-system backends accept the round trip.
-        requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(revoiceMidSystemDevelopers(inputItems)));
+        // #4166: no blanket re-voicing on this path. Everything bili pushes
+        // above is born user; the resent client items keep their own voices —
+        // client-origin mid system/developer is conversation data now (it
+        // re-rides verbatim exactly as the client sent it; a strict backend's
+        // rejection of it is the client's own shape, honestly forwarded). The
+        // #1999 carrier concern does not apply here: this re-request is built
+        // from the RAW client input, which never contains kernel carriers.
+        requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
         const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
         requestOptions.resign?.(requestOptions.headers, roundBody);
         const result = await fetchWithRetry(requestOptions.url, {

@@ -5,9 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateNativeBypassForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
-import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
+import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
 import { startServer } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
@@ -87,6 +87,54 @@ test("#3370: dsh incremental conversion is atomic (marker + body on the same ini
     }
 });
 
+// #3433: OpenAI wire shapes (assistant.tool_calls / role:"tool") must NOT be
+// converted onto the incremental lane — the lane ingests with anthropicToCore
+// and would silently drop the tool calls. They stay on full resend, exactly
+// like omp/opencode do behind wireMessagesLookAnthropic.
+test("#3433: dsh OpenAI tool shapes ride full resend; anthropic shapes still convert", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-inc-3433" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            assert.ok(beforeSend, "conversion seam armed");
+            const url = `${proxy.origin}/v1/chat/completions`;
+
+            // OpenAI chat-completions shape: assistant.tool_calls + role:"tool"
+            const openaiMsgs = [
+                { role: "user", content: "list the files" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "a.txt b.txt" },
+                { role: "user", content: "now read a.txt" },
+            ];
+            const original = JSON.stringify({ model: "gpt-test", max_tokens: 64, messages: openaiMsgs });
+            const init: RequestInit = { method: "POST", body: original };
+            await beforeSend(url, init);
+            assert.equal(init.body, original, "OpenAI tool shape rides full resend (body untouched)");
+            assert.equal(new Headers(init.headers ?? {}).get("x-bili-plugin-turn"), null, "no marker on the untouched body");
+
+            // control: the anthropic wire shape still converts (guard does not over-block)
+            const init2: RequestInit = { method: "POST", body: JSON.stringify({ model: "claude-test", max_tokens: 64, messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }] }) };
+            await beforeSend(url, init2);
+            const body2 = JSON.parse(init2.body as string) as { conversationId?: string };
+            assert.equal(body2.conversationId, "dsh-inc-3433", "anthropic shape still converts to a lane turn");
+            assert.equal(new Headers(init2.headers).get("x-bili-plugin-turn"), "1", "marker stamped on the anthropic turn");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+    }
+});
+
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -99,6 +147,13 @@ afterEach(() => { void _settleNativeForTest(); });
 // grace tiny so the POLL_DEADLINE_MS cap dominates timing. Pinned-path tests
 // override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
+
+// #1365: a dev shell that runs DSH itself exports a live attach target; every
+// suite below must start from a clean slate or it silently binds to the real
+// proxy instead of the mock it set up. withEnv() only restores the keys it was
+// given, so the host values have to go here.
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
@@ -587,11 +642,10 @@ function mockCtx() {
     type HostCtx = Parameters<typeof apply>[0];
     type HostListener = Parameters<NonNullable<PluginContext["on"]>>[1];
     const listeners: Record<string, HostListener[]> = {};
-    // #3354: capture the load-time compaction-disable overlay — event order,
-    // provided services, and the internal/config middleware for simulation.
+    // #3354/#3662: capture registration event order + provided services
+    // (the overlay itself now lives in the always-on gate entry).
     const order: string[] = [];
     const providedServices: Array<{ name: string; value: unknown }> = [];
-    let compactionMiddleware: ((raw: unknown, next: () => unknown) => unknown) | undefined;
     // Stable service identities (like real cordis services: one facade per
     // process whose state mutates underneath); getters gate exposure on the
     // backing fakes so T4's no-services degradation still reads absent.
@@ -617,7 +671,6 @@ function mockCtx() {
         registeredCommands: commands,
         on: (event: string, listener: HostListener, _options?: { global?: boolean }) => {
             order.push(`on:${event}`);
-            if (event === "internal/config") compactionMiddleware = listener as (raw: unknown, next: () => unknown) => unknown;
             (listeners[event] ??= []).push(listener);
         },
         emit: (event: string, ...args: unknown[]) => { for (const l of listeners[event] ?? []) (l as (...a: unknown[]) => void)(...args); },
@@ -651,7 +704,6 @@ function mockCtx() {
         reflect: { provide: (name: string, value: unknown) => { order.push(`provide:${name}`); providedServices.push({ name, value }); } },
         providedServices,
         registrationOrder: () => [...order],
-        compactionMiddleware: () => compactionMiddleware,
     };
 }
 
@@ -1065,19 +1117,23 @@ test("apply() inactive-context registration failure is silent and terminal (dsh 
 test("apply() is a no-op under the kill switches", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-off-"));
     try {
+        _resetDshCompactionVerdictForTest();
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PLUGIN: "0" }, () => {
             _resetRegisterForTest(undefined);
             const ctx = mockCtx();
             apply(ctx);
             assert.equal(ctx.registeredTools.length, 0);
             assert.equal(ctx.registeredCommands.length, 0);
-            // #3354: a kill-switched bili must not register the load-time
-            // overlay either — the lane goes back to stock dsh behavior.
+            // #3354/#3662: a kill-switched bili must neither register the
+            // overlay nor declare the lane owned — the gate entry then leaves
+            // every preset row stock while its service keeps them bootable.
             assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
             assert.equal(ctx.providedServices.length, 0);
+            assert.ok(!isDshCompactionActive(), "kill switch must not declare the lane owned");
         });
     } finally {
         rmrf(home);
+        _resetDshCompactionVerdictForTest();
     }
 });
 
@@ -1092,7 +1148,7 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
     const clientLines = (phrase: string): string[] => fs.existsSync(logFile)
         ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes(phrase))
         : [];
-    const warnLines = (): string[] => clientLines("stays OFF in this profile");
+    const warnLines = (): string[] => clientLines("native compaction remains enabled and");
     const nonWebTraceLines = (): string[] => clientLines("do not include @deepseek-ai/dsh-web-app");
     const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
     // #1791: hermetic fallback seam — a deferred probe must never reach a real
@@ -1106,15 +1162,13 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             ctx.setProfileContext({ startedBundles: webBundles });
             apply(ctx);
             assert.equal(warnLines().length, 1);
-            assert.match(warnLines()[0], /#1772/);
+            assert.match(warnLines()[0], /summary requests go DIRECT/);
             // #3354: the note now states bili disables the preset rows at load
             // time (vendored overlay, attribution preserved) and keeps the
             // #2474 full-snapshot recipe as the documented fallback — pin both
             // pointers so either regression is caught.
-            assert.match(warnLines()[0], /#3354/);
-            assert.match(warnLines()[0], /deshark42\/dsh-compaction-basic-disable/);
-            assert.match(warnLines()[0], /#2474/);
-            assert.match(warnLines()[0], /cordis\.patch\.yml/);
+            assert.match(warnLines()[0], /no preset override is required/);
+            assert.doesNotMatch(warnLines()[0], /stays OFF|Apply the #2474/);
             // #1791: settle each apply's attach chain while the mock is still
             // open — a deferred probe settling against a closed mock runs the
             // spawn fallback mid-way through a LATER test and clobbers the
@@ -1140,8 +1194,8 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(plain);
             assert.equal(warnLines().length, 0);
             assert.equal(nonWebTraceLines().length, 1);
-            assert.match(nonWebTraceLines()[0], /#3354/);
-            assert.match(nonWebTraceLines()[0], /#2474/);
+            assert.match(nonWebTraceLines()[0], /native compaction remains enabled/);
+            assert.doesNotMatch(nonWebTraceLines()[0], /#2474|refuses such native compaction/);
             await _stateToolsReadyForTest();
 
             // once-per-process: a later non-web apply adds no further trace
@@ -1205,10 +1259,9 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
             const lines = clientLines();
             assert.equal(lines.length, 1);
             assert.match(lines[0], /@deepseek-ai\/dsh-web-app/);
-            assert.match(lines[0], /could not latch/i);
-            assert.match(lines[0], /no-config-hook/);
-            assert.match(lines[0], /#2474/);
-            assert.match(lines[0], /ARMED/i);
+            assert.match(lines[0], /native compaction remains enabled/);
+            assert.match(lines[0], /summary requests go DIRECT/);
+            assert.doesNotMatch(lines[0], /could not latch|#2474|ARMED/i);
             assert.doesNotMatch(lines[0], /deshark42\/dsh-compaction-basic-disable/);
             await _stateToolsReadyForTest();
         });
@@ -1222,54 +1275,57 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
     }
 });
 
-test("#3354 apply(): registers the load-time compaction-disable overlay and publishes its gate", async () => {
+test("native hand-back re-probes attribution after a transient disposed scope", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-attr-recover-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetAttributionHealthForTest();
+            _setThrewRetryForTest({ attempts: 1 });
+            const ctx = mockCtx();
+            const lookup = ctx.agents.currentInitiator;
+            ctx.agents.currentInitiator = () => { throw new Error("temporarily disposed"); };
+            apply(ctx);
+            await _stateToolsReadyForTest();
+            await _stateTakeoverGateForTest()!("https://api.anthropic.com/v1/messages");
+            assert.equal(_attributionHealthForTest().state, "threw");
+            assert.equal(await _stateNativeBypassForTest()!(), true);
+            ctx.agents.currentInitiator = lookup;
+            ctx.setInitiator({ session: { id: "recovered-agent" } });
+            await _stateNativeBypassForTest()!();
+            assert.equal(_attributionHealthForTest().state, "ok", "native posture must not permanently suppress fresh attribution probes");
+        });
+    } finally {
+        proxy.close(); rmrf(home); _resetRegisterForTest(undefined);
+        _resetAttributionHealthForTest(); _setThrewRetryForTest();
+    }
+});
+
+test("#3354/#3662 apply(): declares lane ownership instead of registering the overlay", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));
     try {
+        _resetDshCompactionVerdictForTest();
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
-            // the gate service publishes AFTER the middleware registers — the
-            // preset inject latch can never be satisfied before the transform
-            // is live
-            const iOn = ctx.registrationOrder().indexOf("on:internal/config");
-            const iProvide = ctx.registrationOrder().indexOf(`provide:${BILI_COMPACTION_DISABLE_SERVICE}`);
-            assert.ok(iOn >= 0, "internal/config middleware must be registered");
-            assert.ok(iProvide > iOn, "gate service must publish after the middleware registers");
-            assert.deepEqual(ctx.providedServices.map((s) => s.name), [BILI_COMPACTION_DISABLE_SERVICE]);
-
-            const mw = ctx.compactionMiddleware();
-            assert.equal(typeof mw, "function");
-            const run = (self: unknown, cfg: Record<string, unknown>) =>
-                (mw as (raw: unknown, next: () => unknown) => unknown).call(self, null, () => cfg);
-            // agent-preset entry: both compaction rows disabled, everything else untouched
-            const plugins: Array<Record<string, unknown>> = [
-                { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
-                { name: "@deepseek-ai/dsh-command-compact" },
-                { name: "@deepseek-ai/dsh-other" },
-            ];
-            const presetCfg: Record<string, unknown> = { plugins, x: 1 };
-            const out = run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, presetCfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
-            assert.equal(out.x, 1);
-            assert.deepEqual(out.plugins?.[0]?.config, { auto: true });
-            assert.equal(out.plugins?.[0]?.disabled, true);
-            assert.equal(out.plugins?.[1]?.disabled, true);
-            assert.equal(out.plugins?.[2]?.disabled, undefined);
-            // the original input is not mutated — detached copies only
-            assert.equal(plugins[0].disabled, undefined);
-            // non-preset entries pass through verbatim
-            const otherCfg: Record<string, unknown> = { plugins };
-            assert.equal(run({ entry: { options: { name: "something-else" } } }, otherCfg), otherCfg);
-            // a preset config without a plugins key passes through verbatim
-            const emptyCfg: Record<string, unknown> = {};
-            assert.equal(run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, emptyCfg), emptyCfg);
+            // #3662: the overlay + gate service moved to the always-on
+            // bili-compaction-gate entry; bili-native only declares the verdict
+            // that transform honors (tests/issue3662-dsh-gate-fallback.test.ts
+            // pins the transform + service side).
+            assert.equal(isDshCompactionActive(), false, "activation must never disable retained native compaction generations");
+            assert.equal((globalThis as Record<string, unknown>).__BILI_DSH_COMPACTION_READY_FOR_AGENT__, undefined, "plugin never claims native compaction ownership");
+            assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
+            assert.equal(ctx.providedServices.length, 0);
             await _stateToolsReadyForTest();
         });
     } finally {
         proxy.close();
         rmrf(home);
         _resetRegisterForTest(undefined);
+        _resetDshCompactionVerdictForTest();
     }
 });
 
@@ -1848,7 +1904,11 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
             const gate = _stateTakeoverGateForTest();
             assert.ok(gate !== undefined, "takeoverGate installed");
             // unattributed (background chain, third-party in-process plugin) → NOT claimed
-            assert.equal(gate("https://api.anthropic.com/v1/messages"), false);
+            const rawNoneGate = gate("https://api.anthropic.com/v1/messages");
+            // #4829 review: the no-init (WS-lane-shaped) call must keep its SYNCHRONOUS
+            // verdict class — native-ws-intercept.ts compares with === false, no await.
+            assert.equal(rawNoneGate, false);
+            assert.equal(await rawNoneGate, false);
             // attributed (the host's own agent chain) → claimed
             ctx.setInitiator({ session: { id: "s1117" } });
             assert.equal(gate("https://api.anthropic.com/v1/messages"), true);
@@ -1883,8 +1943,9 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-probe.test/v1/chat/completions";
-                assert.equal(gate(url), false, "unattributed → refused");
-                assert.equal(gate(url), false, "second refusal of the same endpoint");
+                // #4829: the none arm settles async — the recall claim may decode bodies
+                assert.equal(await gate(url), false, "unattributed → refused");
+                assert.equal(await gate(url), false, "second refusal of the same endpoint");
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
                 // #3651 paste-safe sink: non-public hosts are masked in the line; the dedup key
@@ -1892,11 +1953,11 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
                 assert.match(lines[0]!, /https:\/\/<private-host>\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 // A query string neither spawns a new line nor leaks into it.
-                assert.equal(gate(`${url}?key=sk-do-not-log`), false);
+                assert.equal(await gate(`${url}?key=sk-do-not-log`), false);
                 assert.equal(refusedLines().length, 1);
                 assert.ok(!fs.readFileSync(logFile, "utf8").includes("do-not-log"), "query string must not reach the log");
                 // A different endpoint earns its own line.
-                assert.equal(gate("https://api.other-probe.test/v1/messages"), false);
+                assert.equal(await gate("https://api.other-probe.test/v1/messages"), false);
                 assert.equal(refusedLines().length, 2);
                 // Attributed traffic claims silently.
                 ctx.setInitiator({ session: { id: "s1158" } });
@@ -1938,11 +1999,12 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-l2.test/v1/chat/completions";
-                // four same-state (none) refusals → exactly one line; counting continues silently
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
+                // four same-state (none) refusals → exactly one line; counting continues
+                // silently (#4829: the none arm settles async — the recall claim may decode bodies)
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /no active initiator attribution/);
@@ -1966,7 +2028,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(refusedLines().length, 2);
                 // back to plain none → transition the other way, count keeps running
                 ctx.agents.currentInitiator = () => undefined;
-                assert.equal(gate(url), false);
+                assert.equal(await gate(url), false);
                 lines = refusedLines();
                 assert.equal(lines.length, 3);
                 assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
@@ -2063,13 +2125,18 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             const url = "https://api.gate-2924b.test/v1/chat/completions";
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const localLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("refused") && l.includes("LOCALLY"));
-            // 4004 B / 4 = 1001 tok > 1000 window → the OPTIMISTIC estimate
+            // 4,000,004 B / 4 = 1,000,001 tok > the floored bar max(1000
+            // declared, 1M assumed, #4079) = 1M → the OPTIMISTIC estimate
             // already overflows: forwarding direct can only 400 upstream.
-            assert.equal(await gate(url, { bytes: 4004 }), "refuse-oversized");
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /≥1001 tok \(floor est 4004B\/4\) exceeds window 1000/);
-            // 4000 B / 4 = 1000 tok == window: NOT provably over → #1117 direct.
-            assert.equal(await gate(url, { bytes: 4000 }), false);
+            assert.match(localLines()[0]!, /≥1000001 tok \(core est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            // 4,000,000 B / 4 = 1M tok == floored bar: NOT provably over → direct.
+            assert.equal(await gate(url, { bytes: 4_000_000 }), false);
+            // #4079 floor both-ways: a body over the DECLARED window (4004B/4
+            // = 1001 tok > 1000) but under the assumed minimum must NOT be
+            // refused — a mis-sized small window can never false-refuse.
+            assert.equal(await gate(url, { bytes: 4004 }), false);
             // Unreadable body / unknown size → #1117 direct semantics.
             assert.equal(await gate(url), false);
             // No window resolvable → the size arm disarms entirely → direct.
@@ -2084,6 +2151,212 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
         rmrf(home);
         _resetRegisterForTest(undefined);
     }
+});
+
+test("#4068 gate `none` oversize arm: an unattributed body that provably cannot fit any window refuses LOCALLY instead of riding #1117 DIRECT into a guaranteed upstream 4xx", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4068-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4068-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // No initiator wired → attributionOf answers `none`: the #1117
+            // agentless lane this arm guards. Window resolution needs the
+            // global default target (an unattributed call has no session
+            // header to read).
+            class Llm4068 {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm4068(), { currentSelection: () => ({ provider: "p4068", model: "m4068" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setModelInfoForTest({ provider: "p4068", model: "m4068", contextWindow: 1000 });
+            const url = "https://api.gate-4068.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const localLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("refused") && l.includes("LOCALLY"));
+            // 4,000,004 B / 4 = 1,000,001 tok > the floored bar max(1000
+            // declared, 1M assumed, #4079) = 1M → provably over: a DIRECT send
+            // is a guaranteed upstream 400/413 and the host retries the SAME
+            // oversized history every turn (#4068's 6.16M-token send).
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized-unattributed");
+            assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
+            assert.match(localLines()[0]!, /unattributed body ≥1000001 tok \(core est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            // 4,000,000 B / 4 = 1M tok == floored bar: NOT provably over → direct.
+            assert.equal(await gate(url, { bytes: 4_000_000 }), false);
+            // #4079 floor both-ways: over the DECLARED window (1001 tok >
+            // 1000) but under the assumed minimum → #1117 direct, not a
+            // false refusal on a mis-sized declaration.
+            assert.equal(await gate(url, { bytes: 4004 }), false);
+            // Unreadable body / unknown size → #1117 direct semantics.
+            assert.equal(await gate(url), false);
+            // No window resolvable → the size arm disarms entirely → direct.
+            _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 4004 }), false);
+            // Attributed traffic is untouched by the arm (#3617 both-ways):
+            // a claimed oversized body goes to the proxy, where preflight's
+            // own doom math decides.
+            ctx.setInitiator({ session: { id: "s4068" } });
+            assert.equal(await gate(url, { bytes: 4_000_004 }), true);
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4111 gate oversize arms are media-aware: a base64-heavy body the raw bytes/4 math falsely refused rides #1117 direct; genuinely over-limit TEXT still refuses locally", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4111-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4111-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // Same scaffolding as #4068: no initiator → `none` attribution;
+            // window resolution needs the global default target.
+            class Llm4111 {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm4111(), { currentSelection: () => ({ provider: "p4111", model: "m4111" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            _setModelInfoForTest({ provider: "p4111", model: "m4111", contextWindow: 1000 });
+            const url = "https://api.gate-4111.test/v1/chat/completions";
+            // The #4111 field shape: a ~4.2MB screenshot as an inline data-URL
+            // (billed upstream at a few thousand resolution tokens) + modest
+            // text, on a window floored at 1M (#4079). Raw bytes/4 = >1M
+            // "tokens" — the OLD math's false local 422; core text is ~200B.
+            const shot = "A".repeat(4_200_000);
+            const dataUrl = `data:image/png;base64,${shot}`;
+            const mediaBody = JSON.stringify({
+                model: "m4111",
+                messages: [
+                    { role: "user", content: "Fix the overlapping footer button in this screenshot." },
+                    { role: "user", content: [
+                        { type: "image_url", image_url: { url: dataUrl } },
+                        { type: "text", text: "The save button overlaps the footer on narrow viewports." },
+                    ] },
+                ],
+            });
+            const mediaBodyBytes = Buffer.byteLength(mediaBody);
+            assert.ok(mediaBodyBytes > 4_000_004, "raw body mass is over the old raw-bytes bar (the false-refusal shape)");
+            assert.equal(mediaBytesOfWireBody(mediaBody), Buffer.byteLength(dataUrl), "media walker prices exactly the data-URL payload");
+            // (a) unattributed arm, #3617 direction 1: media-heavy body is NOT
+            // provably over once media is excluded → #1117 direct semantics.
+            assert.equal(await gate(url, { bytes: mediaBodyBytes }, { method: "POST", body: mediaBody }), false, "media-heavy unattributed body is no longer falsely refused");
+            // (b) unattributed arm, #3617 direction 2: genuinely over-limit
+            // TEXT at the same mass still refuses LOCALLY.
+            const textBody = JSON.stringify({ model: "m4111", messages: [{ role: "user", content: "x".repeat(4_000_004) }] });
+            assert.ok(Buffer.byteLength(textBody) > 4_000_004, "text-only body is over the raw bar too");
+            assert.equal(mediaBytesOfWireBody(textBody), 0, "no media in the text body");
+            assert.equal(await gate(url, { bytes: Buffer.byteLength(textBody) }, { method: "POST", body: textBody }), "refuse-oversized-unattributed", "genuinely over-limit text still refuses");
+            // Both directions on the `threw` arm as well (#4111 fixed both).
+            _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
+            ctx.agents.currentInitiator = () => {
+                throw new Error("agent initiator scope is disposed");
+            };
+            assert.equal(await gate(url, { bytes: mediaBodyBytes }, { method: "POST", body: mediaBody }), false, "media-heavy threw body keeps #1117 direct semantics");
+            assert.equal(await gate(url, { bytes: Buffer.byteLength(textBody) }, { method: "POST", body: textBody }), "refuse-oversized", "over-limit text still refuses on the threw arm");
+        });
+    } finally {
+        _setThrewRetryForTest();
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4111 mediaBytesOfWireBody/bodyProvablyOverWindow: prices the inline-media shapes of every wire family, never treats pasted-text base64 as media, and re-prices the doom math only when media is the mass", () => {
+    const b64 = "QUJDREVGR0g=".repeat(32); // 384 chars of pure base64
+    // anthropic base64 source blocks (image/document/audio share the shape)
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: b64 } }] }] })), Buffer.byteLength(b64));
+    // anthropic redacted_thinking opaque payload
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "assistant", content: [{ type: "redacted_thinking", data: b64 }] }] })), Buffer.byteLength(b64));
+    // google inlineData parts
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ contents: [{ parts: [{ inlineData: { mimeType: "image/png", data: b64 } }] }] })), Buffer.byteLength(b64));
+    // openai chat input_audio
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "input_audio", input_audio: { data: b64, format: "wav" } }] }] })), Buffer.byteLength(b64));
+    // openai/responses data: URLs (image_url.url and file file_data)
+    const dataUrl = `data:image/png;base64,${b64}`;
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }] })), Buffer.byteLength(dataUrl));
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "file", file: { file_data: dataUrl } }] }] })), Buffer.byteLength(dataUrl));
+    // responses-wire input_image singular form: the whole data URL is a STRING
+    // under image_url (not an object with .url) — still media mass.
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ input: [{ role: "user", content: [{ type: "input_image", image_url: dataUrl }] }] })), Buffer.byteLength(dataUrl));
+    // remote URLs are references, not media mass
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://cdn.test/shot.png" } }] }] })), 0);
+    // base64 pasted AS TEXT is NOT media on any wire — stays billed as text
+    // (the genuinely-huge-text direction keeps its teeth, #3617 both-ways).
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: b64 }] })), 0);
+    assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: b64 }] }] })), 0);
+    // non-JSON body → nothing to exclude → the raw floor keeps its old verdict
+    assert.equal(mediaBytesOfWireBody("<not-json>"), 0);
+    // The predicate's two stages: raw bytes trip the old bar only when the
+    // RAW mass exceeds 4× the floored window (1M tok) — so build bodies
+    // around a ~4.2MB media payload (media-only: disarmed by the re-price;
+    // media + >4MB text: still provably over, numbers carry core bytes).
+    const bigB64 = "A".repeat(4_200_000);
+    const bigUrl = `data:image/png;base64,${bigB64}`;
+    const mediaOnlyInit: RequestInit = { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: bigUrl } }] }] }) };
+    assert.equal(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 1000), undefined, "media-heavy body (raw mass over the old bar) is NOT provably over once media is excluded");
+    const mixedInit: RequestInit = { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "y".repeat(4_000_004) }, { type: "image_url", image_url: { url: bigUrl } }] }] }) };
+    const mixedBytes = Buffer.byteLength(String(mixedInit.body));
+    const mixedDoom = bodyProvablyOverWindow({ bytes: mixedBytes }, mixedInit, 1000);
+    assert.ok(mixedDoom !== undefined, "same media PLUS >4MB of text stays provably over");
+    assert.equal(mixedDoom?.mediaBytes, Buffer.byteLength(bigUrl), "doom numbers carry the excluded media mass");
+    assert.equal(mixedDoom?.coreBytes, mixedBytes - Buffer.byteLength(bigUrl), "doom numbers carry media-excluded core bytes");
+    assert.equal(mixedDoom?.window, 1_000_000, "#4079 floor never assumes below the 1M common window");
+    assert.equal(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 10_000_000), undefined, "media-heavy body under a big declared window never even trips stage 1");
+    const textInit: RequestInit = { method: "POST", body: "x".repeat(4_000_004) };
+    assert.notEqual(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(textInit.body)) }, textInit, 1000), undefined, "text-only body stays provably over");
+    assert.equal(bodyProvablyOverWindow(undefined, mediaOnlyInit, 1000), undefined, "no body → no size arm");
+    assert.equal(bodyProvablyOverWindow({ bytes: mixedBytes }, mixedInit, undefined), undefined, "no window → no size arm");
+    assert.notEqual(bodyProvablyOverWindow({ bytes: mixedBytes }, undefined, 1000), undefined, "no init to re-price → media cannot be proven → the raw floor keeps the old (conservative) verdict");
+});
+
+test("#4912 typed-array init.body: an undecodable buffer degrades to the conservative verdict instead of throwing out of the gate face", () => {
+    // Models V8's real limit: only buffers whose decoded form exceeds the
+    // max string length throw RangeError; small decodes keep working.
+    const savedDecoder = globalThis.TextDecoder;
+    const Real = globalThis.TextDecoder;
+    const passthrough = new Real();
+    const bigUrl = `data:image/png;base64,${"A".repeat(4_200_000)}`;
+    const raw = JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: bigUrl } }] }] });
+    const init: RequestInit = { method: "POST", body: new TextEncoder().encode(raw) };
+    const bytes = Buffer.byteLength(raw);
+    try {
+        globalThis.TextDecoder = class {
+            constructor(_label?: string, _options?: unknown) {}
+            decode(buf?: Uint8Array | ArrayBuffer): string {
+                if (buf !== undefined && buf.byteLength > 1_000_000) throw new RangeError("Invalid string length");
+                return passthrough.decode(buf);
+            }
+        } as unknown as typeof TextDecoder;
+        // Pre-fix this call threw RangeError out of the gate face. Now the
+        // undecodable buffer bills ALL bytes as core text (media unprovable).
+        const doom = bodyProvablyOverWindow({ bytes }, init, 1000);
+        assert.ok(doom !== undefined, "undecodable over-bar body keeps the conservative (all-core-text) verdict");
+        assert.equal(doom?.mediaBytes, 0);
+        assert.equal(doom?.coreBytes, bytes);
+    } finally {
+        globalThis.TextDecoder = savedDecoder;
+    }
+    // Decodable twin of the SAME body: media credited exactly → not provably over.
+    assert.equal(bodyProvablyOverWindow({ bytes }, init, 1000), undefined, "the guard must not zero media credits on the normal path");
 });
 
 test("#3581 gate degradation reports event-driven; give-up latch stops pointless settle-retries on a dead scope", async () => {
@@ -2297,6 +2570,7 @@ test("#3578 transition contract: disposed-scope refusal lands on the REAL /__bil
         const server = srv;
         if (server) await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
         await new Promise<void>((resolve, reject) => upstream.close((e) => (e ? reject(e) : resolve())));
+        await (await import("../src/persist.ts")).getStore().flushAll();
         rmrf(base);
         rmrf(stateHome);
         rmrf(home);
@@ -2385,7 +2659,7 @@ test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invis
             // proxy's own line shape, origin-marked — stderr alone is invisible
             // to GUI hosts, which is exactly how #1158 stayed silent.
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
             assert.equal(errs.filter((e) => e.includes("not healthy")).length, 0, "#2831: must not reach the terminal surface");
         });
     } finally {
@@ -2407,7 +2681,7 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
             persistClientEvent("probe https://relay.internal.example/v1/chat/completions?k=secret http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages");
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
             assert.match(content, /probe https:\/\/<private-host>\/v1\/chat\/completions http:\/\/127\.0\.0\.1:18788\/bili\/x https:\/\/api\.deepseek\.com\/v1\/messages$/m);
         });
         // Broken target (state root under a regular file): must swallow, never throw.
@@ -2589,6 +2863,153 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         _setSpawnForTest(undefined);
         rmrf(home);
         rmrf(stateHome);
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1365 explicit BILLION_CONTEXT_ATTACH remains the tool endpoint when the routed model origin denies the plugin manifest", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const attach = await startMockProxy(toolCalls);
+    let modelManifestRequests = 0;
+    const modelServer = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            modelManifestRequests += 1;
+            res.writeHead(403);
+            res.end("Forbidden");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", () => resolve()));
+    const modelOrigin = `http://127.0.0.1:${(modelServer.address() as { port: number }).port}`;
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:2";
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365-explicit-attach-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_ATTACH: attach.origin, BILLION_CONTEXT_PROXY: undefined, BILI_ATTACH_HEALTH_DEADLINE_MS: "40" }, async () => {
+            _resetRegisterForTest(attach.origin);
+            _resetRoutedForTest();
+            _noteRoutedForTest(`${modelOrigin}/bili/${R1365_UPSTREAM}`);
+            const ctx = mockCtx();
+            apply(ctx);
+            assert.equal(await _stateRespawnForTest()?.(), attach.origin, "recovery must probe the explicit plugin endpoint, not the model-only origin");
+            await waitFor(() => ctx.registeredTools.length === 1, "explicit-attach tool registration");
+            assert.equal(spawnCalls, 0, "a second proxy must not be spawned for an API-only model route");
+            assert.equal(modelManifestRequests, 0, "pre-existing model-route evidence must not override explicit attach");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365-explicit" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365-explicit", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+        });
+    } finally {
+        attach.close();
+        modelServer.close();
+        _setSpawnForTest(undefined);
+        rmrf(home);
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4894 declaredWindowForDirect: session model beats global default; unknown window fails open", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4894-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            class Llm4894 {
+                async resolveModelInfo(): Promise<undefined> { return undefined; }
+            }
+            ctx.setModelServices(new Llm4894(), { currentSelection: () => ({ provider: "pG4894", model: "mG4894" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            // Seed AFTER registration settles: apply()'s inject already fired
+            // one refreshModelInfo for the global target, and its failure-
+            // shaped settle would otherwise clobber the seeded entry.
+            _setModelInfoForTest({ provider: "pS4894", model: "mS4894", contextWindow: 111 });
+            _setModelInfoForTest({ provider: "pG4894", model: "mG4894", contextWindow: 222 });
+            const hook = _nativeStateForTest().declaredWindowForDirect;
+            assert.ok(hook !== undefined, "apply() arms the direct-path window source");
+            // #2381 resolution, minus the plugin-mode gates: the session's own
+            // live header first...
+            ctx.setInitiator({ session: { id: "s4894", requestHeader: () => ({ config: { provider: "pS4894", model: "mS4894" } }) } });
+            assert.equal(hook(), 111, "session model wins over the global default");
+            // ...the host's global default as fallback...
+            ctx.setInitiator({ session: { id: "s4894" } });
+            assert.equal(hook(), 222, "global default when the session carries no header");
+            // ...and a resolvable model without cached window info → undefined
+            // (a wrong model's window is worse than none — fail open).
+            ctx.setInitiator({ session: { id: "s4894", requestHeader: () => ({ config: { provider: "pX4894", model: "mX4894" } }) } });
+            assert.equal(hook(), undefined, "unknown window fails open");
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4894 declaredWindowForDirect: no model services at all → undefined (fail-open)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4894b-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const hook = _nativeStateForTest().declaredWindowForDirect;
+            assert.ok(hook !== undefined, "apply() arms the hook regardless of services");
+            assert.equal(hook(), undefined, "no services → no window source → fail-open direct sends");
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("explicit attach keeps the DSH tool base when a late routed model origin denies the manifest", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const attach = await startMockProxy(toolCalls);
+    let modelManifestRequests = 0;
+    const modelServer = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            modelManifestRequests += 1;
+            res.writeHead(403);
+            res.end("Forbidden");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", () => resolve()));
+    const modelOrigin = `http://127.0.0.1:${(modelServer.address() as { port: number }).port}`;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-explicit-attach-late-route-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_ATTACH: attach.origin, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            _resetRegisterForTest(attach.origin);
+            _resetRoutedForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "explicit-attach tools before route observation");
+            _noteRoutedForTest(`${modelOrigin}/bili/${R1365_UPSTREAM}`);
+            await waitFor(() => modelManifestRequests === 1, "manifest liveness probe of late routed origin");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365-explicit-late" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365-explicit-late", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+        });
+    } finally {
+        attach.close();
+        modelServer.close();
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
@@ -2837,8 +3258,11 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
                 upTimer = setTimeout(() => server.listen(port, "127.0.0.1", () => resolve()), 100);
             });
             const recovered = await recoveredPromise;
-            clearTimeout(upTimer);
+            // Recovery may resolve from a still-valid origin verdict before the
+            // simulated external restart fires. Do not cancel the only producer
+            // of `up` and then await that permanently pending promise.
             await up;
+            clearTimeout(upTimer);
             assert.equal(recovered, origin, "recovery lands back on the pinned origin");
             assert.equal(spawnCalls, 0);
             assert.equal(process.env.BILLION_CONTEXT_PROXY, origin);

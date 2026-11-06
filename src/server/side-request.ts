@@ -1,10 +1,10 @@
 import type { WireProtocol } from "../util.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
-import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
+import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
-import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
+import { HISTORY_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -115,6 +115,65 @@ export function isDshTitleRequest(parsed: unknown): boolean {
     return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
 }
 
+// #4438: dsh's auto-review sidecar (@deepseek-ai/dsh-experimental-auto-review's
+// classifyRisk()) fires before every native tool call under the Auto permission
+// tier: a fixed REVIEW_POLICY system prompt + exactly ONE freshly-flattened user
+// blob (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION),
+// no tools, same conversation id as the main turn. On at least one deployment
+// class (web profile behind a gateway) the extension's own model client reaches
+// bili UNSTAMPED — no x-bili-plugin — while the session's sticky plugin binding
+// keeps the #2432 rebase gate armed for it: every header-gated isolation gate
+// (persona fork #1916, title clause #2503) misses the request, the blob rides
+// the raw main key through the FULL pipeline, its embedded old-checkpoint
+// framing false-positives the local-compaction carrier (#2621 class, total fold
+// state wipe), and its usage sample clobbers the main baseline so the next turn
+// skips the output clamp (#453) into permanent upstream 400s.
+// Shape-decisive WITHOUT a caller-side header gate — deliberately different from
+// isDshTitleRequest's discipline: the shape carries its own client evidence
+// (dsh's fixed REVIEW_POLICY first line, version-pinned like
+// DSH_TITLE_SYSTEM_PREFIX / DSH_COMPACTION_INSTRUCTION_PREFIX), and the header
+// gate is precisely what failed here. A main turn can never match: it carries a
+// tools surface and multi-turn history; the single-blob bar rejects every
+// history-replaying request.
+export const DSH_AUTO_REVIEW_SYSTEM_PREFIX = "You are the final authorization reviewer for exactly one pending tool call";
+
+export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest: any action surface
+    // marks an agent turn, not the reviewer's one-shot call.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // The fixed reviewer policy on ANY wire's system carrier (top-level system,
+    // instructions, systemInstruction.parts, or a role:system entry in
+    // messages[]/input[]) — systemCarrierTexts reads them all (#3149 lesson).
+    if (!systemCarrierTexts(p).some((t) => t.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX))) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let users = 0;
+    let userHasContent = false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        // Responses-side typed items that are not plain messages (reasoning,
+        // function_call, …) can only appear in a real model round-trip.
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        const c = rec.content ?? rec.parts;
+        if (typeof c === "string") {
+            if (c.length > 0) userHasContent = true;
+        } else if (Array.isArray(c) && c.length > 0) {
+            userHasContent = true;
+        }
+    }
+    // Exactly ONE non-system message with content: the freshly-flattened review
+    // snapshot. A replayed history (any assistant/tool turn or a second user
+    // message) vetoes — see the comment above the constant.
+    return users === 1 && userHasContent;
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the
@@ -190,6 +249,7 @@ export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     RULE_TOOL_NAME,
     RETRIEVE_TOOL_NAME,
     READ_ORIGINAL_IMAGE_TOOL_NAME,
+    HISTORY_TOOL_NAME,
 ]);
 
 /** Tool names declared by `parsed.tools`, proto-agnostically. null when the
@@ -457,7 +517,7 @@ export function restoreOutputBudget(
         clearNoCeilingDegraded(session, modelName);
         // #3438: dsh-lane mid-band with NO known ceiling — bili cannot judge
         // collapse from intent here, so forward verbatim but surface the gap once.
-        if (dshLane === true && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
+        if (dshLane === true && ceiling === undefined && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
             log("warn", `[${session.id}] dsh-lane main request carries output budget ${value} with NO known output ceiling for model=${modelName} — cannot tell a raw-history collapse from deliberate intent, forwarding verbatim; declare the model's max output (providers.<url>.models."${modelName}".output) to arm the mid-band collapse rescue (#3438)`);
         }
         return;
@@ -540,9 +600,12 @@ const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
  *  from this path. Block here instead of forwarding: estimate the RAW body
  *  (CJK-aware text + image tokens) against the effective window — the declared
  *  modelContextLimit (#987: no learned window exists anymore) minus the output
- *  reservation on wires where output counts against the window. blocked=false
- *  with limit<=0 means "window unknown — forward as before". blocked requires
- *  estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE (estimator bias). */
+ *  reservation on routes that carry one (#4205: decided by the caller via
+ *  shouldReserveOutputHeadroom with route+model evidence — the guard stays
+ *  pure mechanics and self-reserves once from the UNRESERVED limit it is
+ *  handed). blocked=false with limit<=0 means "window unknown — forward as
+ *  before". blocked requires estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE
+ *  (estimator bias). */
 export function sideRequestGuard(
     parsed: unknown,
     protocol: WireProtocol,
@@ -555,6 +618,11 @@ export function sideRequestGuard(
      *  prior) — replaces the internal billing-based estimate when provided so
      *  the guard sees the same image channel every other gate consumes. */
     imageReserve?: number,
+    /** #4205: whether THIS route reserves the output budget from the window —
+     *  policy lives at the call site (shouldReserveOutputHeadroom sees route +
+     *  model evidence the guard cannot); default false keeps non-reserving
+     *  callers byte-identical. */
+    reserveHeadroom: boolean = false,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     // #987: no learned window exists, but a usage-grounded arm left by an
@@ -565,7 +633,7 @@ export function sideRequestGuard(
     if (armedLimit > 0 && (limit <= 0 || armedLimit < limit)) limit = armedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
-    if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
+    if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
     const estimate = estimateRawBodyTokens(parsed) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };

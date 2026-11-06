@@ -197,8 +197,11 @@ test("#3713: the k̂ denominator counts masked mid-history sys/dev items (respon
             // two tiny messages instead of ~5k) and fails the lower bound.
             assert.ok(dE >= bigTok - 160, `lastLocalTextEstimate must gain the mid-history sys/dev mass: delta=${dE}, expected ≈ ${bigTok}`);
             assert.ok(dE <= bigTok + 640, `lastLocalTextEstimate delta over-counted: delta=${dE}, expected ≈ ${bigTok}`);
-            assert.ok(dSP >= bigTok - 160, `systemPromptTokens must gain the mid-history sys/dev mass: delta=${dSP}, expected ≈ ${bigTok}`);
-            assert.ok(dSP <= bigTok + 640, `systemPromptTokens delta over-counted: delta=${dSP}, expected ≈ ${bigTok}`);
+            // #4166: a mid-history developer item is positioned conversation
+            // data, not system prompt — systemPromptTokens must NOT absorb
+            // its mass (pre-#4166 the hoist folded it into systemParts and
+            // this delta was ≈ bigTok; that shape is retired).
+            assert.ok(dSP <= 160, `systemPromptTokens must not absorb positioned mid-history sys/dev mass (#4166): delta=${dSP}`);
         } finally {
             await h.close();
         }

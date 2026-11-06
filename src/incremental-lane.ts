@@ -58,6 +58,7 @@
  * (R1 message ids), durable acks.
  */
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { anthropicToCore, coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "./persist.js";
@@ -65,6 +66,7 @@ import { peekSession } from "./session.js";
 import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
 
 export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
 
@@ -90,6 +92,19 @@ export function incrementalTurnBodyShape(raw: Buffer): boolean {
         && typeof body.sinceSeq === "number" && Number.isInteger(body.sinceSeq) && body.sinceSeq >= 0
         && Array.isArray(body.messages)
         && body.model === undefined;
+}
+
+/** Lane-side mirror of wireMessagesLookAnthropic (src/agent/incremental-client.ts — keep the two in sync): the lane ingests with anthropicToCore and re-emits with coreToAnthropic, so only the anthropic wire shape is convertible. OpenAI tool shapes (assistant.tool_calls, role:"tool"/"function", tool_call_id) would be silently dropped or mis-mapped into user text — reject loudly at the boundary instead of trusting every host to pre-filter (#3433). Empty lists PASS here: a pure sticky-system update carries no messages (the client-side predicate rejects them; the empty-without-system case is already a 400 below). */
+function laneMessagesLookAnthropic(messages: unknown): boolean {
+    if (!Array.isArray(messages)) return false;
+    for (const m of messages) {
+        if (m === null || typeof m !== "object") return false;
+        const msg = m as { role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown };
+        if (typeof msg.role !== "string" || msg.role === "tool" || msg.role === "function") return false;
+        if (msg.tool_calls !== undefined || msg.tool_call_id !== undefined) return false;
+        if (typeof msg.content !== "string" && !Array.isArray(msg.content)) return false;
+    }
+    return true;
 }
 
 const EXT_KEY_SYSTEM = "inc:system";
@@ -162,6 +177,12 @@ interface Canonical {
     marks: Map<string, unknown>;
     system: unknown;
     systemSet: boolean;
+    /** #4352 ack pull: hash of the last WIRE message the canonical was
+     *  advanced with (the client-side incrementalWireHash formula over the
+     *  delta's final message). Warm-cache only — a cold rebuild has no wire
+     *  bytes to hash and reports null; clients treat a null boundary as
+     *  "cannot adopt, keep full resend" and self-heal on the next turn. */
+    boundary: string | null;
 }
 const canonicalCache = new Map<string, Canonical>();
 const inFlight = new Set<string>();
@@ -248,7 +269,12 @@ function parseCanonicalRows(rows: { seq: number; content: string }[]): BiliMessa
         if (!parsed || typeof parsed !== "object" || typeof (parsed as BiliMessage).id !== "string" || typeof (parsed as BiliMessage).role !== "string") {
             return null;
         }
-        msgs.push(parsed as BiliMessage);
+        // #4316 layer 3: stamp the unified-ledger seq (store rows are 0-based,
+        // the ledger display space is 1-based — same convention as the
+        // plugin render endpoint). Store-served canonical messages carry
+        // their position on the server-owned log, so fold coverage can key
+        // on seq intervals instead of content-hash ids (id churn immune).
+        msgs.push({ ...(parsed as BiliMessage), ledgerSeq: row.seq + 1 });
     }
     return msgs;
 }
@@ -336,6 +362,13 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
                 return;
             }
             ptrs.push(seq);
+            // #4316 PR2/3: while walking the settled rows anyway, stamp the
+            // in-memory canonical with its ledger position — the warm entry
+            // keeps in-memory messages that predate the rows, so the stamps
+            // must flow BACK into it each wrap-up for the next turn's
+            // assembly (store seq is 0-based; the ledger display space is
+            // 1-based, same convention as parseCanonicalRows).
+            m.ledgerSeq = seq + 1;
         }
         store.setSessionExt(sessionId, EXT_KEY_CANONICAL_PTRS, ptrs);
     } catch (err) {
@@ -377,7 +410,7 @@ function persistLaneState(sessionId: string, system: unknown, systemSet: boolean
     }
 }
 
-function loadSystem(sessionId: string): unknown {
+export function loadSystem(sessionId: string): unknown {
     try {
         return getStore().getSessionExt(sessionId, EXT_KEY_SYSTEM);
     } catch {
@@ -386,12 +419,26 @@ function loadSystem(sessionId: string): unknown {
 }
 
 /** Seed/append/resync validation + application. Pure over the canonical. */
+/** Byte-identical to the client-side incrementalWireHash
+ *  (src/agent/incremental-client.ts) over the raw wire message — the two
+ *  formulas must never diverge or the pull-ack boundary check degrades into
+ *  permanent false mismatches. */
+function hashWireBoundary(m: { role: string; content: unknown }): string {
+    return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
+}
+
 function applyTurn(
     entry: Canonical,
     sinceSeq: number,
     resync: boolean,
     deltaWire: { role: string; content: unknown }[],
     systemUpdate = false,
+    /** #4491: optional client msgids parallel to deltaWire. Pinned onto the
+     *  converted core messages so the canonical (and every downstream row /
+     *  ref) carries the CLIENT's identity, not a content-derived hash. A
+     *  malformed or already-claimed id hard-fails the turn (400) — an id
+     *  collision in the ledger would misattribute decompress lookups. */
+    deltaIds?: string[],
 ): { ok: true; appliedSeq: number; marks: Map<string, unknown> } | { ok: false; status: 400 | 409; error: string; serverSeq: number } {
     const serverSeq = entry.msgs.length;
     if (resync) {
@@ -407,9 +454,36 @@ function applyTurn(
         return { ok: false, status: 400, error: "messages must be a non-empty array", serverSeq };
     }
     const flat = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
+    let deltaMsgs = flat.msgs;
+    if (deltaIds !== undefined) {
+        const v = validateMsgIds(deltaIds, flat.msgs.length);
+        if (!v.ok && v.reason !== "length-mismatch") {
+            return { ok: false, status: 400, error: `msgIds invalid (${v.reason})`, serverSeq };
+        }
+        if (v.ok) {
+            const claimed = new Set(entry.msgs.map((m) => m.id));
+            for (const id of v.ids) {
+                if (!resync && claimed.has(id)) return { ok: false, status: 400, error: "msgIds reuse an existing canonical id", serverSeq };
+            }
+            deltaMsgs = applyMsgIdPin(flat.msgs, v.ids);
+        }
+        // !v.ok && reason === "length-mismatch": the envelope gate already
+        // proved the ids are parallel to the WIRE messages, so a mismatch
+        // HERE means the wire→core conversion expanded multi-block messages
+        // (1 wire → N core rows — assistant [text+tool_use], user
+        // [text+tool_result]) — exactly the "core conversion can legally map
+        // wire messages non-1:1" case the lane contract (#4491, envelope
+        // gate in applyIncrementalTurn) says must DEGRADE to derived ids,
+        // never hard-fail. A 400 here made every dsh/omp turn carrying a
+        // multi-block message fail forever — the client retries the same
+        // shape and has no 400 recovery (only 200/409/503 are handled).
+    }
     const base = resync ? [] : entry.msgs;
-    entry.msgs = [...base, ...flat.msgs];
+    entry.msgs = [...base, ...deltaMsgs];
     for (const [id, mark] of flat.cacheControls) entry.marks.set(id, mark);
+    entry.boundary = deltaWire.length > 0
+        ? hashWireBoundary(deltaWire[deltaWire.length - 1])
+        : (resync ? null : entry.boundary);
     return { ok: true, appliedSeq: entry.msgs.length, marks: flat.cacheControls };
 }
 
@@ -457,7 +531,7 @@ export function incrementalTurnsEnabled(): boolean {
 /** GET probe on the turn path: capabilities for native extensions. A 404 on
  *  older servers means "no incremental support" — clients fall back to full
  *  resend, which is the default everywhere. */
-export function handleIncrementalProbe(res: http.ServerResponse): void {
+export function handleIncrementalProbe(res: http.ServerResponse, conversationId?: string): void {
     const sidecar = (() => {
         try {
             return getStore().replicasAvailable();
@@ -465,12 +539,29 @@ export function handleIncrementalProbe(res: http.ServerResponse): void {
             return false;
         }
     })();
+    // #4352 ack pull: `?conversation=<id>` upgrades the probe into a receipt
+    // poll. Served from the WARM canonical only — a cold rebuild here must
+    // not touchCache (a probe is not a turn), and a rebuilt entry has no wire
+    // boundary to hash, so an honest null forces the client to keep full
+    // resend for one more turn instead of adopting a guess.
+    let conversation: { appliedSeq: number; boundary: string | null } | undefined;
+    if (conversationId !== undefined && conversationId.length > 0) {
+        const entry = canonicalCache.get(conversationId);
+        conversation = {
+            appliedSeq: entry !== undefined && entry.sessionId === laneSessionId(conversationId) ? entry.msgs.length : 0,
+            boundary: entry !== undefined && entry.sessionId === laneSessionId(conversationId) ? entry.boundary : null,
+        };
+    }
     jsonReply(res, 200, {
         ok: true,
         protocol: 1,
         feature: "pluginIncrementalTurns",
         enabled: featureEnabled("pluginIncrementalTurns") && sidecar,
         storage: sidecar ? "unified" : "legacy-only",
+        // #4491: server-owned history for plugin lanes (msgid pinning + the
+        // /__bili/plugin/render endpoint). Shims gate their splice on this.
+        serverHistory: featureEnabled("pluginLaneServerHistory"),
+        ...(conversation !== undefined ? { conversation } : {}),
     });
 }
 
@@ -517,7 +608,23 @@ export async function handleIncrementalTurn(
     if (typeof forwarded.model !== "string" || forwarded.model.length === 0) return jsonReply(res, 400, { error: "request.model is required" });
     if (!Array.isArray(payload.messages)) return jsonReply(res, 400, { error: "messages must be an array (seed: full history; delta: everything after sinceSeq; empty allowed for a pure sticky-system update)" });
     if (payload.messages.length === 0 && payload.system === undefined) return jsonReply(res, 400, { error: "messages must be a non-empty array (seed: full history; delta: everything after sinceSeq)" });
+    if (!laneMessagesLookAnthropic(payload.messages)) return jsonReply(res, 400, { error: 'messages must be anthropic wire shape — OpenAI tool shapes (assistant.tool_calls, role:"tool", tool_call_id) cannot ride the lane and stay on full resend', conversationId });
     const deltaWire = payload.messages;
+    // #4491: optional client msgids parallel to messages (absent = legacy
+    // content-derived identities). Identity-poisoning shapes (bad entry,
+    // duplicate, reserved prefix, re-claimed id) hard-fail in applyTurn; a
+    // mere count mismatch degrades to derived ids — the core conversion can
+    // legally map wire messages non-1:1, and a mismatched array pins nothing.
+    let deltaIds: string[] | undefined;
+    if (payload.msgIds !== undefined) {
+        if (!Array.isArray(payload.msgIds)) return jsonReply(res, 400, { error: "msgIds must be an array parallel to messages" });
+        const candidate = payload.msgIds as string[];
+        if (candidate.length === deltaWire.length) {
+            deltaIds = candidate;
+        } else {
+            log("warn", `[incremental] ${conversationId}: msgIds length ${String(candidate.length)} != messages length ${String(deltaWire.length)} — ignoring ids this turn (#4491)`);
+        }
+    }
 
     // Per-conversation turn lock: the ack contract is strictly sequential.
     // The 409 fires only for turns arriving while the holder is INSIDE its
@@ -554,9 +661,9 @@ export async function handleIncrementalTurn(
                 log("warn", `[incremental] canonical rebuild failed for ${sessionId}: ${rebuilt.err} — requesting client resync`);
                 return jsonReply(res, 409, { error: "seq-mismatch", serverSeq: 0, reason: rebuilt.err, conversationId });
             }
-            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false };
+            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false, boundary: null };
         }
-        const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload);
+        const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload, deltaIds);
         if (!applied.ok) {
             touchCache(conversationId, entry);
             return jsonReply(res, applied.status, { error: applied.error, serverSeq: applied.serverSeq, conversationId });
@@ -572,6 +679,33 @@ export async function handleIncrementalTurn(
 
         const body: Record<string, unknown> = { ...forwarded, messages: coreToAnthropic(entry.msgs, entry.marks) as never };
         if (entry.system !== undefined && entry.system !== null) body.system = entry.system;
+        // #4491: the assembled prefix re-enters the pipeline as a fresh body —
+        // stamp the canonical ids so prepare pins exactly what the lane owns
+        // (content-derived when the client sent none; client-pinned when it
+        // did). The pipeline strips the field before forwarding upstream.
+        if (featureEnabled("pluginLaneServerHistory")) {
+            body[MSG_IDS_BODY_FIELD] = entry.msgs.map((m) => m.id);
+            // #4316 PR2/3: seq stamps ride the same internal transport. The
+            // canonical prefix carries its stamps from the unified rows
+            // (parseCanonicalRows); this turn's delta tail has no rows yet,
+            // but the wrap-up will append them at maxSeq+1 in order — the
+            // projection is exact, and partial knowledge is never sent: if
+            // the prefix itself is unstamped (first resync, cold replay), the
+            // field stays absent and the kernel keeps its id-based behavior.
+            let maxSeq = -1; // 0-based store seq of the last stamped message
+            for (const m of entry.msgs) if (typeof m.ledgerSeq === "number") maxSeq = Math.max(maxSeq, m.ledgerSeq - 1);
+            if (maxSeq >= 0) {
+                let next = maxSeq + 1;
+                for (const m of entry.msgs) {
+                    if (typeof m.ledgerSeq !== "number") {
+                        m.ledgerSeq = next + 1;
+                        next++;
+                    }
+                }
+            }
+            const seqs = entry.msgs.map((m) => m.ledgerSeq);
+            if (seqs.every((s) => typeof s === "number")) body[MSG_SEQS_BODY_FIELD] = seqs;
+        }
         const bodyBuf = Buffer.from(JSON.stringify(body));
 
         const headers: Record<string, string> = {

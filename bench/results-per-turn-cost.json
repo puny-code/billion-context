@@ -1,0 +1,102 @@
+{
+  "1000": {
+    "n": 1000,
+    "bytesMiB": 3.1557083129882812,
+    "tokens": 828000,
+    "preflightLimit": 23931,
+    "estimate": 0.6712,
+    "ptCold": 32.233,
+    "ptOver": 32.0537,
+    "nodeSum": 26.236200000000004,
+    "units": 250,
+    "recCold": 243.9511,
+    "recWarm": 1.683,
+    "nodeDetail": "reconcile-live-ids=0.0 assign-refs=3.0 sync-blocks=6.3 prune=0.0 pre-transform-snapshot=0.0 ccr-store=NaN absorb-hide=NaN crush=NaN absorb-prompt=NaN filter=NaN hide-compress-calls=0.6 view-latch=1.6 recommend=11.9 nudge-inject=0.9 emergency-truncate=0.4 render-refs=1.5"
+  },
+  "2000": {
+    "n": 2000,
+    "bytesMiB": 6.3114166259765625,
+    "tokens": 1656000,
+    "preflightLimit": 47861,
+    "estimate": 0.2384,
+    "ptCold": 33.8078,
+    "ptOver": 15.34,
+    "nodeSum": 15.750399999999999,
+    "units": 500,
+    "recCold": 298.2084,
+    "recWarm": 1.9403,
+    "nodeDetail": "reconcile-live-ids=0.0 assign-refs=1.2 sync-blocks=1.8 prune=0.0 pre-transform-snapshot=0.0 ccr-store=NaN absorb-hide=NaN crush=NaN absorb-prompt=NaN filter=NaN hide-compress-calls=0.4 view-latch=1.0 recommend=7.9 nudge-inject=0.7 emergency-truncate=0.3 render-refs=2.5"
+  },
+  "4000": {
+    "n": 4000,
+    "bytesMiB": 12.622833251953125,
+    "tokens": 3312000,
+    "preflightLimit": 95723,
+    "estimate": 0.2154,
+    "ptCold": 34.6196,
+    "ptOver": 28.1787,
+    "nodeSum": 24.4261,
+    "units": 1000,
+    "recCold": 578.5039,
+    "recWarm": 3.623,
+    "nodeDetail": "reconcile-live-ids=0.0 assign-refs=2.2 sync-blocks=3.4 prune=0.0 pre-transform-snapshot=0.0 ccr-store=NaN absorb-hide=NaN crush=NaN absorb-prompt=NaN filter=NaN hide-compress-calls=0.7 view-latch=0.8 recommend=13.0 nudge-inject=0.9 emergency-truncate=0.4 render-refs=3.2"
+  },
+  "8650": {
+    "n": 8650,
+    "bytesMiB": 27.296876907348633,
+    "tokens": 7162200,
+    "preflightLimit": 207000,
+    "estimate": 0.5647,
+    "ptCold": 73.3443,
+    "ptOver": 69.0332,
+    "nodeSum": 64.30839999999999,
+    "units": 2162,
+    "recCold": 1176.2767,
+    "recWarm": 8.2188,
+    "nodeDetail": "reconcile-live-ids=0.0 assign-refs=5.7 sync-blocks=7.5 prune=0.0 pre-transform-snapshot=0.0 ccr-store=NaN absorb-hide=NaN crush=NaN absorb-prompt=NaN filter=NaN hide-compress-calls=0.2 view-latch=2.1 recommend=37.7 nudge-inject=1.9 emergency-truncate=1.4 render-refs=7.8"
+  },
+  "preflight:1000": {
+    "n": 1000,
+    "elapsed": 198.8112,
+    "rounds": 1,
+    "cap": 512,
+    "aborted": "no",
+    "perRound": 198.8112,
+    "compressedRanges": 250,
+    "fitsWindow": "false",
+    "failure": "exhausted"
+  },
+  "preflight:2000": {
+    "n": 2000,
+    "elapsed": 262.3079,
+    "rounds": 1,
+    "cap": 512,
+    "aborted": "no",
+    "perRound": 262.3079,
+    "compressedRanges": 500,
+    "fitsWindow": "false",
+    "failure": "exhausted"
+  },
+  "preflight:4000": {
+    "n": 4000,
+    "elapsed": 712.2908,
+    "rounds": 1,
+    "cap": 512,
+    "aborted": "no",
+    "perRound": 712.2908,
+    "compressedRanges": 1000,
+    "fitsWindow": "false",
+    "failure": "exhausted"
+  },
+  "preflight:8650": {
+    "n": 8650,
+    "elapsed": 2922.1187,
+    "rounds": 1,
+    "cap": 512,
+    "aborted": "no",
+    "perRound": 2922.1187,
+    "compressedRanges": 2162,
+    "fitsWindow": "false",
+    "failure": "exhausted"
+  }
+}

@@ -81,7 +81,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.exposureLogIntervalMs(), 3_600_000);
     assert.equal(knobs.streamKeepAliveMs(), 15_000);
     assert.equal(knobs.preflightHoldGraceMs(), 30_000);
-    assert.equal(knobs.preflightDeadEndCooldownMs(), 5 * 60_000);
+    // (#4079) the #726 dead-end cooldown knob was removed with the mechanism.
     assert.equal(knobs.proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
     assert.equal(knobs.postResponseLingerMs(), 5_000);
     assert.equal(knobs.allowPrivateHttpProviders(), false);
@@ -125,7 +125,7 @@ test("file tier: every migrated block resolves from the config file", () => {
         network: {
             upstreamTimeoutMs: 60000, requestWatchdogMs: 90000, keepAliveTimeoutMs: 7000,
             clientErrorBackstopMs: 45000, exposureLogIntervalMs: 0, streamKeepAliveMs: 20000,
-            preflightHoldMs: 40000, preflightDeadEndCooldownMs: 60000, replayRetryMax: 5,
+            preflightHoldMs: 40000, replayRetryMax: 5,
             replayRetryBaseMs: 250, maxShrinkPerCompress: 0.4, proxyKeepAliveMaxMs: 60000,
             postResponseLingerMs: 12345, allowPrivateHttpProviders: true,
         },
@@ -153,7 +153,6 @@ test("file tier: every migrated block resolves from the config file", () => {
     assert.equal(knobs.exposureLogIntervalMs(), 0);
     assert.equal(knobs.streamKeepAliveMs(), 20000);
     assert.equal(knobs.preflightHoldGraceMs(), 40000);
-    assert.equal(knobs.preflightDeadEndCooldownMs(), 60000);
     assert.equal(knobs.replayMaxAttempts(), 5);
     assert.equal(knobs.replayBaseDelayMs(), 250);
     assert.equal(knobs.maxShrinkPerCompress(), 0.4);

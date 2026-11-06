@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert";
 import { translateFunction } from "../verif/symbolic.ts";
@@ -25,7 +26,11 @@ import type { Term } from "../verif/terms.ts";
  * negative controls via UNSAT.
  */
 
-const KP = "/home/dog/tmp/bili-verif2/kernel/src/wire/anthropic.ts";
+const KP = fileURLToPath(new URL("../kernel/src/wire/anthropic.ts", import.meta.url));
+
+const haveSolver = (() => {
+  try { void solveSmt2("(check-sat)", []); return true; } catch { return false; }
+})();
 
 function makeIdPort(): (role: SymVal, ct: SymVal, text: SymVal, opts?: SymVal) => SymVal {
   const memo = new Map<string, SymVal>();
@@ -64,7 +69,7 @@ function makeCounterPorts(): Record<string, (recv: SymVal, ...rest: SymVal[]) =>
   };
 }
 
-test("wire-anthropic round-trip: block order + payload preserved (same-role pairs)", { timeout: 240_000 }, () => {
+test("wire-anthropic round-trip: block order + payload preserved (same-role pairs)", { timeout: 240_000, skip: !haveSolver }, () => {
   // Pin each run's block types to constants: the symbolic-type union across
   // switch arms merges payloads through the tool_use arm's safeStringify
   // degrade ({kind:"any"} has no term to query). ORDER+payload per pinned
@@ -106,7 +111,7 @@ test("wire-anthropic round-trip: block order + payload preserved (same-role pair
   }
 });
 
-test("wire-anthropic round-trip: thinking keeps its own message after same-role group (cross-message order)", { timeout: 240_000 }, () => {
+test("wire-anthropic round-trip: thinking keeps its own message after same-role group (cross-message order)", { timeout: 240_000, skip: !haveSolver }, () => {
   const ctx = newCtx();
   const strv = (t: unknown) => ({ kind: "str", t }) as SymVal;
   const TYPE1 = ctx.String.val("text"); // block-1 type pinned: this test exercises
@@ -126,57 +131,12 @@ test("wire-anthropic round-trip: thinking keeps its own message after same-role 
   const msgsArr = (parse.ret as { fields: Map<string, SymVal> }).fields.get("msgs") as SymVal;
   const rebuild = translateFunction({ file: KP, function: "coreToAnthropic", params: { messages: msgsArr, cacheControls: { kind: "undef" } as SymVal }, ctx, options: { maxArrayLength: 32, portImpls: {} } }).exec();
   if (rebuild.degradations.length) console.log("REBUILD2 DEGR:", JSON.stringify(rebuild.degradations));
-  {
-    const kk = (v: unknown): string => { const o = v as { kind?: string; fields?: Map<string, unknown> }; if (o?.fields) return "obj{" + [...o.fields.entries()].map(([k2, v2]) => k2 + ":" + ((v2 as { kind?: string })?.kind ?? "?")).slice(0, 8).join(",") + "}"; return String(o?.kind); };
-    const m1v = (msgsArr as { elems?: unknown[] }).elems?.[1] as { kind?: string; nullUnder?: unknown; fields?: Map<string, unknown> } | undefined;
-    const m1t = m1v?.fields?.get("text") as { kind?: string; nullUnder?: unknown } | undefined;
-    const kk2 = (v: unknown): string => { const o = v as { kind?: string; fields?: Map<string, unknown>; nullUnder?: unknown }; return o?.fields ? "obj{" + (o.nullUnder !== undefined ? "NU " : "") + [...o.fields.keys()].slice(0, 5).join(",") + "}" : String(o?.kind); };
-    const ea = (msgsArr as { elems?: unknown[] }).elems ?? [];
-    console.log("DBG slots=", ea.length, [...ea.slice(0, 6).map((v, i2) => i2 + ":" + kk2(v))].join(" | "));
-    { // walk slot1.text term leaves
-      const seen = new Set<unknown>(); const leaves: string[] = [];
-      const walk = (t: unknown): void => {
-        if (!t || typeof t !== "object" || seen.has(t)) return; seen.add(t);
-        const tt = t as { c?: unknown; op?: string; kids?: unknown[]; kind?: string };
-        if (tt.kids === undefined || tt.kids.length === 0) { leaves.push(`${tt.op ?? "?"}:${JSON.stringify(tt.c)}`); return; }
-        for (const k3 of tt.kids) walk(k3);
-      };
-      const s1 = ea[1] as { kind?: string; fields?: Map<string, unknown> } | undefined;
-      const txt = s1?.fields?.get("text") as { kind?: string; t?: unknown } | undefined;
-      console.log("DBG slot1.kind=", s1?.kind, "text.kind=", txt?.kind);
-      if (txt?.kind === "str") { walk(txt.t); console.log("DBG slot1.text leaves=", leaves.slice(0, 12).join(" ")); }
-      else if (txt) { walk(txt); console.log("DBG slot1 TEXTVAL leaves=", leaves.slice(0, 12).join(" ")); }
-    }
-  }
   assert.deepEqual(rebuild.degradations, [], "rebuild must translate cleanly");
   const outArr = rebuild.ret as { elems: SymVal[]; len: unknown };
   const blocksOf = (m: SymVal): { elems: SymVal[]; len: unknown } => (m as { fields: Map<string, SymVal> }).fields.get("content") as never;
   const fld = (o: SymVal, k: string): { t: unknown } => ((o as { fields: Map<string, SymVal> }).fields.get(k) ?? { kind: "undef" }) as never;
   // block 2 is thinking → rebuild splits: out[1] exists and holds the thinking block
   const out1 = (outArr.elems[1] ?? { kind: "undef" }) as SymVal;
-  const dbg = (v: unknown): string => { const o = v as { kind?: string; fields?: Map<string, unknown> }; return o?.fields ? "obj[" + [...o.fields.keys()].join(",") + "]" : String(o?.kind); };
-  const roleOf = (v: unknown): unknown => { const o = v as { fields?: Map<string, unknown> }; const r = o?.fields?.get("role"); return (r as { t?: { c?: unknown } } | undefined)?.t?.c ?? String((r as { kind?: string } | undefined)?.kind); };
-  const blocksOf2 = (v: unknown): unknown => (v as { fields?: Map<string, unknown> })?.fields?.get("blocks") ?? (v as { fields?: Map<string, unknown> })?.fields?.get("content");
-  const bdbg = (v: unknown): string => { const a = v as { kind?: string; elems?: unknown[]; len?: { c?: unknown } }; return a?.kind === "arr" ? `arr[${a.elems?.length}]len=${a.len?.c}` : String(a?.kind); };
-  const rolec = (v: unknown): unknown => { const r = (v as { fields?: Map<string, unknown> })?.fields?.get("role"); return (r as { t?: { c?: unknown } } | undefined)?.t?.c ?? "?"; };
-  const firstType = (v: unknown): unknown => { const bl = blocksOf2(v) as { elems?: unknown[] }; const b0 = bl?.elems?.[0] as { fields?: Map<string, unknown> } | undefined; const ty = b0?.fields?.get("type"); return (ty as { t?: { c?: unknown } } | undefined)?.t?.c ?? String((ty as { kind?: string } | undefined)?.kind); };
-  const secondType = (v: unknown): unknown => { const bl = blocksOf2(v) as { elems?: unknown[] }; const b1 = bl?.elems?.[1] as { fields?: Map<string, unknown> } | undefined; const ty = b1?.fields?.get("type"); return (ty as { t?: { c?: unknown } } | undefined)?.t?.c ?? String((ty as { kind?: string } | undefined)?.kind); };
-  const bl1 = blocksOf2(outArr.elems[1]) as { elems?: unknown[] };
-  const th = (bl1?.elems?.[0] as { fields?: Map<string, unknown> })?.fields?.get("thinking");
-  const tx = (bl1?.elems?.[0] as { fields?: Map<string, unknown> })?.fields?.get("text");
-  console.log("DBG out1.slot0.thinking=", JSON.stringify((th as { kind?: string } | undefined)?.kind), "text=", JSON.stringify((tx as { kind?: string } | undefined)?.kind));
-  { // rebuild out1 structure
-    console.log("DBG rb.out elems=", outArr.elems?.length, [...(outArr.elems ?? []).map((v: unknown, i3: number) => { const o = v as { kind?: string; fields?: Map<string, unknown> }; return i3 + ":" + (o?.fields ? [...o.fields.keys()].join("/") : String(o?.kind)); })].join(" | "));
-    const o1 = (outArr.elems[1] ?? { kind: "undef" }) as { kind?: string; fields?: Map<string, unknown> };
-    console.log("DBG rb.out1 kind=", o1?.kind, "fields=", o1?.fields ? [...o1.fields.keys()].join(",") : "-");
-    const bl2 = o1?.fields?.get("blocks") ?? o1?.fields?.get("content");
-    const blA = bl2 as { elems?: unknown[]; len?: { c?: unknown } };
-    console.log("DBG rb.out1.blocks kind=", (bl2 as { kind?: string })?.kind, "elems=", blA?.elems?.length, "lenC=", blA?.len?.c);
-    const b0 = blA?.elems?.[0] as { kind?: string; fields?: Map<string, unknown> } | undefined;
-    console.log("DBG rb.out1.bl0 kind=", b0?.kind, b0?.fields ? [...b0.fields.keys()].join(",") : "-");
-    const thk = b0?.fields?.get("thinking") as { kind?: string; t?: { c?: unknown } } | undefined;
-    console.log("DBG rb.bl0.thinking kind=", thk?.kind, "c=", thk?.t?.c);
-  }
   const thinkT2 = blocksOf(out1).elems[0] !== undefined ? fld(blocksOf(out1).elems[0]!, "thinking").t : T2;
   const q = solveSmt2(smt2Of(ctx, [...parse.assumptions as never[], ...rebuild.assumptions as never[],
     TYPE1.eq(ctx.String.val("text")).or(TYPE1.eq(ctx.String.val("tool_result")) as never),

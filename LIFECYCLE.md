@@ -27,7 +27,9 @@
 | `BILI_ROLLOUT_`（前缀家族；现成员 `BILI_ROLLOUT_SIMHASH_V2`、`BILI_ROLLOUT_FOLD_GUARD`） | src/rollout.ts 灰度机制 | 每功能灰度 kill-switch：env > config `rollout.features.<name>`（true/false/percent 简写，#3062）> 确定性分桶（sha256(salt\nid)%10000）> off | 单个功能灰度完成并稳定后，从 rollout 表移除该功能，其 env 随之失去意义 | 机制常设；单个成员轮换 |
 | `BILI_FOLD_RECONCILE` | #1921 | fold 对账模式 off/warn/repair（默认 repair；非法值只告警不致命，src/fold-reconcile.ts:384） | 增量车道 #3248 落地后评估 legacy 对账路径去留 | 在用（默认 repair）；与 #3248 联动 |
 | `BILI_RECLAIM_FETCH_PATCH` | #1158 | escape hatch：`=0` 保留经典直装 fetch patch 路径 | fetch-chain patch 成为既定行为后退役 | 默认开（`=0` 回退经典路径） |
+| `BILI_CODEX_STATE_MODE` | #2222 | codex state-db 策略逃生口(auto/shared/legacy;auto=二进制认 CODEX_SQLITE_HOME 就 shared 否则 legacy;shared 遇旧二进制降级并告警) | codex 状态策略稳定后随 #2222 收尾 | 默认 auto |
 | `BILI_CODEX_COMPACT` | #3008 | codex compaction 拦截 kill-switch（intercept/pass）；intercept 覆盖显式与内联 auto-compact（SUMMARIZATION_PROMPT 识别） | intercept-by-default 站稳后评估 pass 模式是否还有人需要 | 默认 intercept |
+| `BILI_CODEX_STATE_MODE` | #2222/#3321 | codex 状态库策略逃生舱：`auto`（默认，二进制支持 CODEX_SQLITE_HOME 则 shared，否则 legacy）/ `legacy`（始终旧拷贝路径）/ `shared`（请求 shared，二进制太旧时降级 legacy 并告警）；非法值告警后按 auto（src/launcher.ts:3674） | shared/auto 策略站稳（#3321 并发车道落地后观察）后评估去留 | 在用（默认 auto） |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | #2833 | sqlite 引擎自下载开关（严格 1/0 > 文件 > 默认 true；被拒时仍用缓存副本） | —（转正为常设安全阀则移 §2） | 在用（默认 true） |
 | `BILI_NATIVE_ATTACH_EXTERNAL` | #1322/#1335 | 外部 attach opt-in：默认拒绝 attach 到会长命于会话的实例（拒绝文案见 launcher.ts:3561） | —（长期安全姿态则移 §2） | opt-in（默认 false） |
 | `BILI_LAUNCHER_DIRECT` | launcher direct-URL 模式 | `=1` 进入直通 URL 模式：LLM 流量不过代理 ⇒ 无压缩（只有 bili MCP 调用可用）；默认 MITM | —（两种模式都是正式入口则移 §2） | opt-in（`=1`） |
@@ -46,7 +48,9 @@
 | `BILI_ALLOW_DSH_COMPACTION` | dsh compaction | dsh compaction opt-in（env 语义同 BILI_PERSIST 家族） | 转正后移 §2 | opt-in（`=1`） |
 | `BILI_SNAPSHOT_SHADOW` | #3756 | snapshot-render 影子观测：每个 armed turn 计算快照视图但**不使用**（出站仍走 legacy 路径），与实际发送对比记 per-session 计数（面板 + `snapshot-shadow` 诊断话题）——render 引擎在 rollout 翻转前用真实流量证明健康（dry-run-then-flip，同存储 #2815 shadow→#3818 full 纪律） | render 车道转正（rollout 100% 且影子计数归稳）后退役 | 默认 on（render lane 本身 rollout 0%，纯观测） |
 | `BILI_DSH_AUTHORED_COMPACTION` | #3733 | dsh 原生 compaction summarize 调用由 #1729 guard 拒绝改为**本地应答折叠快照**（零出账；dsh 记 checkpoint、会话文件收缩） | adoption 后按 #2028 模式转 file/web 开关，env 退役（file 键 `dsh.authoredCompaction` 已镜像） | 0.1.203 dogfood 站稳后默认 on；`=0` 回 #1729 拒绝路径 |
-| `BILI_PI_INLINE` | #3278 | pi inline 模式（默认 off）：不起 proxy 进程，fetch 链在 intercept 之下的一个环节把伪 origin 流量路由进进程内引擎（inline-engine.ts，跑同 startServer 的每请求管线）；file 家 `"pi": {"inline": true}`，`=0` 显式关 | inline 车道 GA（转 §2 常设）或实验放弃后收束 | opt-in（默认 off） |
+| `BILI_PI_INLINE` | #3278（#4669 默认翻转，#4687 收回） | pi inline 模式（需手动开启，默认保持旧行为，owner 禁改默认值）：不起 proxy 进程，fetch 链在 intercept 之下的一个环节把伪 origin 流量路由进进程内引擎（inline-engine.ts，跑同 startServer 的每请求管线）；`=1/on/yes/TRUE` 或 file 家 `"pi": {"inline": true}` 显式开启（显式开启压过 attach 目标）；`bili pi-inline` 一键车道预置该变量 | inline 车道稳定一个版本周期后转 §2 常设 | opt-in（不设置时 attach/spawn 行为与旧版完全一致） |
+| `BILI_OPENCODE_INLINE` | #3278 opencode 移植（#4687） | opencode inline 模式（需手动开启，默认保持旧行为 spawn，owner 决定不改默认）：与 pi 同构——不起 proxy 进程，模型 URL 被 V2 route/intercept 改写成伪 origin 后由进程内引擎接住（bun 宿主已验：引擎 boot/dispatch 全绿）；`=1/on/yes/TRUE` 或 file 家 `"opencode": {"inline": true}` 显式开启（显式开启压过 attach 目标）；`bili opencode-inline` 一键车道 | 同 pi inline 车道节奏 | opt-in（不设置时 attach/spawn 行为与旧版完全一致） |
+| `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
@@ -85,6 +89,7 @@
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | 3600000（0 禁用，垃圾值回落 3600000） |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | unset（不做收缩引导） |
 | `BILI_REPLAY_RETRY_MAX` / `BILI_REPLAY_RETRY_BASE_MS` | 3 / 1500 |
+| `BILI_THROTTLE_429` / `BILI_THROTTLE_429_MAX_CONSECUTIVE` / `BILI_THROTTLE_429_BASE_DELAY_MS` / `BILI_THROTTLE_429_MAX_DELAY_MS` | true / 5 / 2000 / 30000（#4204 出站 429 治理器：同一 origin+凭据连续上游 429 后本地 hold、零出站，退避×抖动、尊重 Retry-After；达上限转终局 424（不在各 SDK 重试集合内），每窗口一次探测自动恢复，任何非 429 响应即清除；`false` 恢复旧的总是转发行为） |
 | `BILI_STREAM_KEEPALIVE_MS` | 15000（0 禁用 hold） |
 | `BILI_PREFLIGHT_HOLD_MS` | 30000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | 300000 |
@@ -99,6 +104,14 @@
 | `BILI_RECEIVE_BODY_BYTES` / `BILI_DECODED_BODY_BYTES` | network.receive/decodedBodyBytes，5 GiB / 10 GiB——单请求入站/解码后内存上限（#3128：曾硬编码 100 MiB，多 GB 单请求被 reset） |
 | `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
 | `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
+| `BILI_HTTP_OUTBOUND_BYTES` | network.httpOutboundBytes，10 MiB——普通/代理/pi 原生 HTTP 中继车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3909：图片密集会话按字节/像素解码 CPU 被上游拒收、token 折叠不触发；仅在无受管传输时生效，受管 HTTP/dsh-inline 从不裁减 #3701 Finding 1；0 关闭） |
+| `BILI_CACHE_KEEPALIVE`（#3376） | unset（false；同 `cacheKeepalive.enabled` 层级 env 覆盖） |
+| `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | unset（从 body cache_control 断点探测） |
+| `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 0.9 |
+| `BILI_CACHE_KEEPALIVE_MAX_DURATION_MS` | 86400000（24h） |
+| `BILI_CACHE_KEEPALIVE_MAX_PINGS` | 4 |
+| `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | unset（false） |
+| `BILI_CACHE_KEEPALIVE_INTERVAL_MS` | unset（按 TTL 层推导） |
 
 ### 2.4 会话池 / GC / 持久化
 
@@ -116,6 +129,7 @@
 | `BILI_PERSIST_ZSTD` | `=1/true` 启用 zstd 压缩持久化（owner 决定 #1080，默认 off） |
 | `BILI_SESSIONS_DIR` | 状态目录重定位 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | storage.archiveAfterDays，默认 365 天——超龄会话由 gc 归档（export + tombstone + CAS 释放；0 关闭年龄清扫，#3901/#3463） |
+| `BILI_STORAGE_QUICK_CHECK` | 默认开——index.db 开库在迁移前跑 PRAGMA quick_check 自检；失败=影子层隔离文件组（.corrupt-<ts>）+重建新库（JSON 信封为恢复源）；=0 跳过（超大库启动时间敏感场景，#4175） |
 | `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | storage.walJournalSizeLimitBytes——SQLite WAL 回收字节上限（#3250；垃圾/非正值落回文件/默认层，不让 typo 崩 boot） |
 | `BILI_MYSQL_DSN` | storage.mysql.dsn——mysql 引擎连接串（env > 文件 > ""；空 = mysql 不可用走 sqlite，#3388/#3931） |
 
@@ -186,6 +200,8 @@
 | `BILI_GUARDRAIL_REPETITION` | guardrails.repetition，默认 on——相同调用循环熔断（warn 3 / abort 5） |
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | guardrails.textRunThreshold，默认 200——输出端同字符连击熔断阈值（proxy 进程侧读，#3406 item 1；0 关闭） |
 | `BILI_AUTO_MODE_FORGE` | autoModeForge.enabled，默认 on——auto-mode 分类判定本地 forge，零出账/计费（`=0` 恢复纯透传，留给付真实判定费的用户，#2740 owner 决定） |
+| `BILI_DSH_CONTEXT_TAB` | dsh.contextTab 的 env 层（#4237）：`=0` 隐藏 DSH 顶栏「上下文」标签页（压缩及其余入口全部不受影响）；其他值强制开并覆盖文件层；缺省按文件层（默认 true）；下次页面加载 / dsh 重启生效 |
+| `BILI_DSH_MAX_TESTED_VERSION` | dsh native lane「高于已测最高版」启动提示的上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读运行中的构建，**严格高于**上限才弹一条启动提示，建议先回滚；默认 0.2.0-rc.2（CI e2e 锚点），新版本验证通过后抬高；空串 = 关闭检查；只提示不拦截 |
 
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 

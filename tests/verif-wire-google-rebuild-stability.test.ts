@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction, type SymVal } from "../verif/symbolic.ts";
@@ -41,7 +42,7 @@ function coreMsg(fields: [string, SymVal][], rawParts: SymVal[]): SymVal {
 /** REAL coreToGoogle over a symbolic core array. */
 function runCoreToGoogle(ctx: KCtx, msgs: SymVal): { ret: SymVal; assumptions: unknown[]; degradations: string[] } {
   const out = translateFunction({
-    file: "/home/dog/tmp/bili-verif2/kernel/src/wire/google.ts",
+    file: fileURLToPath(new URL("../kernel/src/wire/google.ts", import.meta.url)),
     function: "coreToGoogle",
     params: { messages: msgs },
     ctx: ctx as never,

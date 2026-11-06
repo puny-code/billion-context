@@ -4,7 +4,7 @@ import { defineConfig } from "tsup";
 
 export default [
 defineConfig({
-    entry: ["src/index.ts", "src/mcp.ts", "src/claude-mcp-entry.ts", "src/claude-native-bootstrap.ts", "src/agent/pi.ts", "src/agent/pi-native.ts", "src/agent/omp.ts", "src/agent/omp-native.ts", "src/agent/opencode.ts", "src/agent/opencode-native.ts", "src/agent/dsh-acp.ts", "src/agent/dsh-native.ts", "src/kimi/native-mcp.ts", "src/kimi/bootstrap-hook.ts", "src/zcode/mcp-entry.ts", "src/zcode/bootstrap-hook.ts"],
+    entry: ["src/index.ts", "src/mcp.ts", "src/claude-mcp-entry.ts", "src/claude-native-bootstrap.ts", "src/agent/pi.ts", "src/agent/pi-native.ts", "src/agent/omp.ts", "src/agent/omp-native.ts", "src/agent/opencode.ts", "src/agent/opencode-native.ts", "src/agent/dsh-acp.ts", "src/agent/dsh-native.ts", "src/agent/dsh-compaction-gate.ts", "src/kimi/native-mcp.ts", "src/kimi/bootstrap-hook.ts", "src/zcode/mcp-entry.ts", "src/zcode/bootstrap-hook.ts"],
     format: ["esm"],
     target: "node20",
     platform: "node",
@@ -25,7 +25,7 @@ defineConfig({
         // its ONLY runtime host import is a namespace import of
         // @earendil-works/pi-coding-agent (config-dir reads CONFIG_DIR_NAME,
         // falling back to ".pi" when absent — the package's documented
-        // degradation for aliased hosts). Alias it to an empty stub so the
+        // degradation for aliased hosts). Alias it to a minimal stub so the
         // bundle keeps bili's zero-runtime-dependency contract; no bili entry
         // ever imports the real package.
         options.alias = { "@earendil-works/pi-coding-agent": resolve(dirname(fileURLToPath(import.meta.url)), "src/agent/pi-host-stub.ts") };

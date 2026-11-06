@@ -172,6 +172,37 @@ export interface IncrementalWireMessage {
     content: unknown;
 }
 
+/** #4491 host msgids: the host's stable message ids for the NEXT outgoing
+ *  request of a conversation, as (id, role) pairs in session order. Stashed
+ *  by the host-side extension event (it owns the sessionManager) and read
+ *  back by the fetch-layer planner (it owns the actually-sent messages);
+ *  the consumer aligns by count+role against the real wire set and refuses
+ *  the whole field on any mismatch — a misaligned id would pin the wrong
+ *  identity server-side, while a missing field merely falls back to
+ *  content-derived ids. */
+export interface HostMsgIdHintEntry {
+    id: string;
+    role: string;
+}
+
+const HOST_MSGID_HINT_TTL_MS = 30_000;
+const hostMsgIdHints = new Map<string, { entries: HostMsgIdHintEntry[]; at: number }>();
+
+/** Record the branch-entry (id, role) snapshot for a conversation's next
+ *  outgoing request. Overwrites per request — one hint per conversation,
+ *  always the generation of the payload being dispatched. */
+export function noteHostMsgIdHint(conversationId: string, entries: HostMsgIdHintEntry[]): void {
+    sweepStale(hostMsgIdHints, HOST_MSGID_HINT_TTL_MS);
+    hostMsgIdHints.set(conversationId, { entries, at: Date.now() });
+}
+
+/** The stashed hint for a conversation, or undefined when none is fresh. */
+export function hostMsgIdHintFor(conversationId: string): HostMsgIdHintEntry[] | undefined {
+    const entry = hostMsgIdHints.get(conversationId);
+    if (entry === undefined || Date.now() - entry.at >= HOST_MSGID_HINT_TTL_MS) return undefined;
+    return entry.entries;
+}
+
 interface ConvState {
     /** Last server ack (x-bili-applied-seq) — flat message count. */
     sinceSeq: number;
@@ -184,6 +215,53 @@ interface ConvState {
 }
 
 const convs = new Map<string, ConvState>();
+
+// #4491 host msgids: ids this client has already put on an envelope for the
+// conversation — the client-side mirror of the lane's canonical id set. The
+// lane HARD-FAILS a non-resync turn (400) whose msgIds reuse a live canonical
+// id ("msgIds reuse an existing canonical id"), so a delta candidate already
+// in this set degrades to "no field" instead of killing the request: the
+// realistic trigger is a host retry re-planning the same delta after the
+// first attempt may have landed server-side. A resync/seed replaces the set
+// wholesale, exactly like the server replaces the canonical.
+const msgidClaims = new Map<string, Set<string>>();
+
+/** Local mirror of the lane's validateMsgIds reject classes
+ *  (src/msgid-pin.ts — keep in sync; the host bundle must not import server
+ *  modules). The lane hard-fails a turn on a poisoned id array, so the host
+ *  screens candidates BEFORE they ride the envelope: anything the server
+ *  would reject degrades to "no field" here (content-derived ids) instead of
+ *  a 400 that kills the whole request. */
+const MSGID_MAX_LEN = 512;
+const MSGID_RESERVED_PREFIX = "acp_summary_";
+const MSGID_BAD_CHARS = /[\s\p{C}]/u;
+
+function screenMsgIds(ids: unknown): ids is string[] {
+    if (!Array.isArray(ids) || ids.length === 0) return false;
+    const seen = new Set<string>();
+    for (const v of ids) {
+        if (typeof v !== "string" || v.length === 0 || v.length > MSGID_MAX_LEN) return false;
+        if (v.startsWith(MSGID_RESERVED_PREFIX)) return false;
+        if (MSGID_BAD_CHARS.test(v)) return false;
+        if (seen.has(v)) return false;
+        seen.add(v);
+    }
+    return true;
+}
+
+/** Delta-turn claim gate: undefined when any candidate id was already sent
+ *  on an earlier envelope of this conversation (the lane would 400 — see
+ *  msgidClaims); otherwise the ids are claimed and returned. */
+function claimableDeltaMsgIds(conversationId: string, ids: string[]): string[] | undefined {
+    const claims = msgidClaims.get(conversationId);
+    if (claims === undefined) {
+        msgidClaims.set(conversationId, new Set(ids));
+        return ids;
+    }
+    for (const id of ids) if (claims.has(id)) return undefined;
+    for (const id of ids) claims.add(id);
+    return ids;
+}
 
 const PROBE_TTL_MS = 30_000;
 const probeCache = new Map<string, { ok: boolean; at: number }>();
@@ -229,6 +307,47 @@ function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
 
+/** Public twin of the internal wire hash for boundary comparisons. The
+ *  server-side hashWireBoundary (src/incremental-lane.ts) must stay
+ *  byte-identical to this formula. */
+export function incrementalWireHash(m: IncrementalWireMessage): string {
+    return wireHash(m);
+}
+
+/** Receipt served by GET /__bili/plugin/turn?conversation=<id> — the warm
+ *  canonical's appliedSeq plus the wire-hash of its last applied message.
+ *  A null boundary means "cold, cannot vouch" and must never be adopted. */
+interface IncrementalReceipt {
+    appliedSeq: number;
+    boundary: string | null;
+}
+
+/** Fresh (never cached) receipt pull for hosts whose transport hides the
+ *  x-bili-applied-seq response header (#4352: pi's after_provider_response
+ *  exposes headers only for some provider transports — the ack channel
+ *  cannot depend on it). Any failure → null; the caller keeps its pending
+ *  plan and the next turn retries. */
+export async function pullIncrementalReceipt(
+    proxyBase: string,
+    conversationId: string,
+    fetchImpl: typeof fetch = fetch,
+): Promise<IncrementalReceipt | null> {
+    try {
+        const url = `${proxyBase.replace(/\/$/, "")}/__bili/plugin/turn?conversation=${encodeURIComponent(conversationId)}`;
+        const res = await fetchImpl(url, { headers: { "x-bili-plugin": "pi" }, signal: AbortSignal.timeout(3000) });
+        if (res.status !== 200) return null;
+        const body = (await res.json()) as { ok?: unknown; conversation?: { appliedSeq?: unknown; boundary?: unknown } };
+        if (body.ok !== true || typeof body.conversation !== "object" || body.conversation === null) return null;
+        const seq = body.conversation.appliedSeq;
+        const boundary = body.conversation.boundary;
+        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
+        if (boundary !== null && typeof boundary !== "string") return null;
+        return { appliedSeq: seq, boundary: boundary as string | null };
+    } catch {
+        return null;
+    }
+}
+
 type IncrementalPlan =
     | { mode: "seed"; body: string }            // full history, sinceSeq 0 (server may 409 → resync)
     | { mode: "delta"; body: string }           // suffix only, acked sinceSeq
@@ -246,9 +365,18 @@ interface PlanArgs {
     /** Anthropic request params from the original body (model, max_tokens…);
      * optional — missing params ride the lane's defaults. */
     request?: Record<string, unknown>;
+    /** #4491: host-stable message ids aligned 1:1 with `messages` (same
+     *  length), or undefined when the host cannot vouch for every entry.
+     *  Carried onto the envelope as `msgIds` parallel to the messages the
+     *  mode actually sends (seed/resync: the full set; delta: the suffix),
+     *  so the server pins the client's identity instead of content-derived
+     *  hashes. All-or-nothing: a length mismatch, a screen failure, or an
+     *  already-claimed id drops the WHOLE field — never a partial or
+     *  misaligned array. */
+    msgIds?: string[];
 }
 
-function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean): string {
+function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[]): string {
     // `request` is optional at the call sites (a host may plan with only
     // messages+system); missing params simply ride their lane defaults.
     const src = args.request ?? {};
@@ -264,6 +392,9 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
     };
     if (resync) body.resync = true;
     if (includeSystem) body.system = args.system === undefined ? null : args.system;
+    // #4491: only a provably-parallel, non-empty array rides the envelope —
+    // an empty delta (pure sticky-system update) pins nothing and stays off.
+    if (msgIds !== undefined && msgIds.length === messages.length && msgIds.length > 0) body.msgIds = msgIds;
     return JSON.stringify(body);
 }
 
@@ -272,6 +403,9 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
 export function planIncrementalTurn(args: PlanArgs, forceResync = false): IncrementalPlan {
     const state = convs.get(args.conversationId);
     if ((state !== undefined && state.dead) || args.messages.length === 0) return { mode: "skip" };
+    // #4491: vouched ids must be exactly parallel to the outgoing set and
+    // pass the local screen; anything else means "no field" this turn.
+    const fullIds = args.msgIds !== undefined && args.msgIds.length === args.messages.length && screenMsgIds(args.msgIds) ? args.msgIds : undefined;
     const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
     if (state === undefined || forceResync) {
         const includeSystem = state === undefined || systemJson !== state.systemJson;
@@ -281,7 +415,8 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         // empty (fresh conversation) or already live (interop with
         // full-resend traffic: the client's view is authoritative and
         // identical-or-newer). Only DELTA turns can 409.
-        return { mode: forceResync ? "resync" : "seed", body: buildBody(args, 0, args.messages, true, includeSystem) };
+        if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
+        return { mode: forceResync ? "resync" : "seed", body: buildBody(args, 0, args.messages, true, includeSystem, fullIds) };
     }
     const hashes = args.messages.map(wireHash);
     // Prefix alignment: everything previously acked must still lead the list.
@@ -291,7 +426,8 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (state.sent[i] !== hashes[i]) { aligned = false; break; }
     }
     if (!aligned || hashes.length < state.sent.length) {
-        return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson) };
+        if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
+        return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson, fullIds) };
     }
     if (hashes.length === state.sent.length) {
         // Equal message set: normally a retry of the same turn → normal path.
@@ -303,9 +439,10 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         }
         return { mode: "skip" }; // retry of the same turn → normal path
     }
+    const deltaIds = fullIds !== undefined ? claimableDeltaMsgIds(args.conversationId, fullIds.slice(state.sent.length)) : undefined;
     return {
         mode: "delta",
-        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson),
+        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson, deltaIds),
     };
 }
 
@@ -370,4 +507,6 @@ export function __resetIncrementalClientForTests(): void {
     droppedParamWarned.clear();
     droppedParamWarnPairs = 0;
     originalBodies.clear();
+    hostMsgIdHints.clear();
+    msgidClaims.clear();
 }

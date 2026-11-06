@@ -123,16 +123,16 @@ test("#3857: late registration observes an already-proven-live stream immediatel
     const file = path.join(dir, "bili.log");
     configureLogger(file);
     try {
+        let proven = false;
+        onFileLegLive(() => { proven = true; });
         log("info", "seed");
-        // A byte on disk proves delivery; fd visibility alone can lead it.
-        // existsSync first: the file only exists once the async open lands.
-        await waitFor(() => fs.existsSync(file) && fs.statSync(file).size > 0, "delivered write proves the leg");
+        await waitFor(() => proven, "logger has observed the delivered write");
         let fires = 0;
         onFileLegLive(() => { fires++; });
         assert.equal(fires, 1, "registration while live fires immediately");
-        onFileLegLive(null);
     } finally {
-        closeLogger();
+        onFileLegLive(null);
+        await closeLogger();
         rmrf(dir);
     }
 });

@@ -24,6 +24,10 @@ import { resolve } from "node:path";
 import { translateFunction } from "../verif/symbolic.js";
 import { newCtx, smt2Of } from "../verif/terms.js";
 import { solveSmt2 } from "../verif/solve.js";
+
+const haveSolver = (() => {
+  try { void solveSmt2("(check-sat)", []); return true; } catch { return false; }
+})();
 import { applyViewLatch } from "../kernel/src/view-latch.ts";
 import type { CompressionState, CoreMessage, ViewLatchEntry } from "../kernel/src/types.ts";
 import type { NodeIO } from "../kernel/src/pipeline.ts";
@@ -31,7 +35,7 @@ import type { SymVal } from "../verif/symbolic.ts";
 
 const file = resolve(import.meta.dirname, "../kernel/src/view-latch.ts");
 
-test("view-latch discipline: quiet turns replay latched bytes verbatim (arbitrary texts)", { timeout: 240_000 }, () => {
+test("view-latch discipline: quiet turns replay latched bytes verbatim (arbitrary texts)", { timeout: 240_000, skip: !haveSolver }, () => {
   const ctx = newCtx();
   // One already-latched message (id i1 → ref r1, latched text L1 ≠ anything
   // fixed) + one fresh message (id i2 → ref r2, no latch entry). Both the

@@ -9,7 +9,7 @@
  * file linear too.
  */
 
-type Sort = "Real" | "Int" | "Bool" | "String";
+type Sort = "Real" | "Int" | "Bool" | "String" | "RegLan";
 
 /** method surface installed onto Term.prototype by bindMethods() */
 export interface Term {

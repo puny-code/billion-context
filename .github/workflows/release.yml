@@ -34,6 +34,17 @@ jobs:
             echo "is_release=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Check plugin manifest versions (#4449)
+        # Codex/Claude plugin marketplaces detect updates by the declared
+        # manifest version vs the installed cache version, so the four
+        # manifests (.agents/plugins, .claude-plugin x2, plugins/codex) must
+        # match package.json. The release branch carries the synced manifests
+        # as their own commit (reference/release.md step 3.5); drift here
+        # means the branch was prepared without that step — fail fast, before
+        # any CI dispatch, tag, or publish.
+        if: steps.check.outputs.is_release == 'true'
+        run: node scripts/sync-codex-plugin-version.mjs --check
+
       - name: Full CI dispatch (missing lanes, publish sha)
         # Policy (2026-10-10, after the v0.1.192 carve-out): every release
         # channel must run the COMPLETE CI set at the exact publish sha before

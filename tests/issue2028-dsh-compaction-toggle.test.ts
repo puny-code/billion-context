@@ -1,11 +1,5 @@
-// #2028/#3666: the allowDshCompaction escape hatch is REMOVED — dsh native
-// compaction is refused unconditionally by the #1729 wire guard on every lane.
-// This suite pins the removal contract: (a) legacy file keys (nested dsh.* and
-// the bare top-level position) and the stale env var are ignored, each with a
-// one-time deprecation warning; (b) the refusal message states the
-// unconditional contract with no dead opt-in pointers; (c) the web API no
-// longer exposes the field, rejects structured dsh writes loudly, and
-// whole-file saves preserve leftover keys verbatim (still inert).
+// Legacy compaction switches remain inert; live DSH compaction relays natively.
+// Historical refusal-helper coverage remains for compatibility only.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -184,7 +178,7 @@ async function get(port: number, reqPath: string): Promise<{ status: number; bod
     return promise;
 }
 
-test("#3666: web API no longer exposes or accepts the switch; the guard refuses unconditionally", async () => {
+test("#3666: web API rejects the removed switch while native compaction relays", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const root = path.join(tmpdir(), `bili-2028-${process.pid}-${Date.now()}`);
@@ -241,25 +235,25 @@ test("#3666: web API no longer exposes or accepts the switch; the guard refuses 
             { role: "system", content: "sys" },
             { role: "user", content: `${DSH_COMPACTION_INSTRUCTION_PREFIX} Summarize the conversation above.` },
         ],
-    }, { "x-acp-session": "s-2028" });
+    }, { "x-acp-session": "s-2028", "x-bili-plugin": "dsh" });
     const cfgJson = async (): Promise<Record<string, unknown>> => JSON.parse((await get(port, "/__bili/config")).body);
 
     try {
-        // A: GET no longer exposes the field; the default wire refusal stands.
+        // A: the removed config field stays hidden while native relay is available.
         assert.ok(!("allowDshCompaction" in (await cfgJson())), "GET must not expose the removed field");
         let r = await compactionPost();
-        assert.equal(r.status, 422, `default must refuse (got ${r.status}: ${r.body})`);
-        assert.equal(JSON.parse(r.body).error.code, "dsh_compaction_refused");
-        assert.equal(received.length, 0, "refused call never reaches the upstream");
+        assert.equal(r.status, 200, r.body);
+        assert.equal(JSON.parse(r.body).choices[0].message.content, "ok");
+        assert.equal(received.length, 1);
 
-        // B: structured dsh write → loud 400, file untouched, refusal stands.
+        // B: a rejected legacy write leaves the file and native relay unchanged.
         r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: true } });
         assert.equal(r.status, 400, r.body);
         assert.match(r.body, /removed/);
         assert.equal(readFileSync(cfgFile, "utf8"), '{"providers":{}}\n', "rejected write must leave the file untouched");
         r = await compactionPost();
-        assert.equal(r.status, 422, "nothing can lift the guard any more");
-        assert.equal(received.length, 0);
+        assert.equal(r.status, 200);
+        assert.equal(received.length, 2);
 
         // C: whole-file save preserves a leftover dsh key verbatim (no
         // relocation any more) — and the key stays inert.
@@ -267,8 +261,9 @@ test("#3666: web API no longer exposes or accepts the switch; the guard refuses 
         assert.equal(r.status, 200, r.body);
         assert.deepEqual(JSON.parse(readFileSync(cfgFile, "utf8")).dsh, { allowDshCompaction: true }, "leftover key preserved verbatim");
         r = await compactionPost();
-        assert.equal(r.status, 422, "a preserved legacy key must stay inert");
-        assert.equal(received.length, 0);
+        assert.equal(r.status, 200);
+        assert.equal(received.length, 3);
+        assert.ok(received.every((body) => body === received[0]), "native body unchanged across config writes");
 
         // D: empty-body validation survives the surface shrink.
         r = await put(port, "/__bili/config", {});

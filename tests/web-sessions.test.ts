@@ -57,10 +57,12 @@ interface Stats {
     storeBytesSaved: number;
     compressCreditTokens: number;
     rangeRestores: number;
+    wholeBlockRestores?: number;
+    wholeBlockRestoresPreciseAvailable?: number;
 }
 
 function zeroStats(): Stats {
-    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, compressCreditTokens: 0, rangeRestores: 0 };
+    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, compressCreditTokens: 0, rangeRestores: 0, wholeBlockRestores: 0, wholeBlockRestoresPreciseAvailable: 0 };
 }
 
 function makeSession(id: string, meta: Session["meta"] = {}, patch: Partial<Stats> = {}, lastSeen = Date.now()): Session {
@@ -304,6 +306,27 @@ withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#
     assert.equal(d2?.tokensSaved, 9999, "larger legacy stat wins (floor)");
 });
 
+withSessionsDir("session detail exposes decompress usage counters (#3671 direction 4)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const s = makeSession("det-dec", { protocol: "openai", title: "Dec" }, { requests: 5, wholeBlockRestores: 26, wholeBlockRestoresPreciseAvailable: 9, rangeRestores: 3 });
+    await store.writeNow(s);
+    const z = makeSession("det-dec-zero", { protocol: "openai" });
+    await store.writeNow(z);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("det-dec");
+    assert.ok(d);
+    assert.equal(d.wholeBlockRestores, 26);
+    assert.equal(d.wholeBlockRestoresPreciseAvailable, 9);
+    assert.equal(d.rangeRestores, 3);
+    const dz = await buildSessionDetail("det-dec-zero");
+    assert.ok(dz);
+    assert.equal(dz.wholeBlockRestores, 0, "no restores → explicit zero, not absent");
+    assert.equal(dz.wholeBlockRestoresPreciseAvailable, 0);
+    assert.equal(dz.rangeRestores, 0);
+});
+
 withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)", async (dir) => {
     const saved: Array<string | undefined> = [process.env.BILI_STORAGE_UNIFIED, process.env.BILI_ENCRYPTION_KEY];
     const setEnv = (unified: string | undefined, key: string | undefined) => {
@@ -507,6 +530,71 @@ test("web endpoints serve overview, session list and per-session detail", async 
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
         if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
         await close(proxy);
+        _resetDiskCacheForTest();
+        rmrf(root);
+    }
+});
+
+test("/__bili/stats rows carry decompress usage counters (#3671 direction 4)", async () => {
+    const root = path.join(tmpdir(), `bili-web-sess-dec-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    const prevSessions = process.env.BILI_SESSIONS_DIR;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    process.env.BILI_SESSIONS_DIR = root;
+
+    setRegistryForTest({});
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+    try {
+        const s = getSession("dec-live", { protocol: "openai" });
+        s.stats.wholeBlockRestores = 26;
+        s.stats.wholeBlockRestoresPreciseAvailable = 9;
+        s.stats.rangeRestores = 3;
+        s.state.blocks.push({ blockId: "b1", runId: "r1", tier: 1, topic: "T", summary: "S", directMessageIds: [], effectiveMessageIds: [], directBlockIds: [], compressedTokens: 100, createdAt: Date.now(), survivedCount: 1, generation: "young", active: true });
+        const res = await fetch(`http://127.0.0.1:${port}/__bili/stats`);
+        assert.equal(res.status, 200);
+        const body = (await res.json()) as { sessions: Array<{ id: string; wholeBlockRestores?: number; wholeBlockRestoresPreciseAvailable?: number; rangeRestores?: number; blocks?: number }> };
+        const row = body.sessions.find((x) => x.id === "dec-live");
+        assert.ok(row, "live session row present");
+        assert.equal(row!.wholeBlockRestores, 26);
+        assert.equal(row!.wholeBlockRestoresPreciseAvailable, 9);
+        assert.equal(row!.rangeRestores, 3);
+        assert.equal(row!.blocks, 1, "fold-count denominator rides the same row");
+    } finally {
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
+        await close(proxy);
+        _resetSessionsForTest();
         _resetDiskCacheForTest();
         rmrf(root);
     }

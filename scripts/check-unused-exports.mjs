@@ -34,6 +34,7 @@ const ENTRY_FILES = new Set([
     "src/agent/opencode-native.ts",
     "src/agent/dsh-acp.ts",
     "src/agent/dsh-native.ts",
+    "src/agent/dsh-compaction-gate.ts",
     "src/kimi/native-mcp.ts",
     "src/kimi/bootstrap-hook.ts",
     "src/zcode/mcp-entry.ts",
@@ -86,6 +87,11 @@ const WAIVERS = new Map([
     // structurally via Awaited<ReturnType<typeof getLastInstall>>); keep the
     // export so the wire shape stays named at its definition site.
     ["src/update.ts", new Set(["LastInstallRecord"])],
+    // #3962 gate telemetry: the coverage record crosses the gate/dsh-native
+    // BUNDLE boundary on the globalThis channel — consumers use it
+    // structurally through dshCompactionGateTelemetry()'s return type; keep
+    // the export so the channel payload stays named at its definition site.
+    ["src/agent/dsh-compaction-disable.ts", new Set(["DshCompactionGateTelemetry"])],
 ]);
 
 const findings = [];

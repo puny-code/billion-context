@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
-import { maskHostInText, maskUrlForLog } from "./log-mask.js";
+import { maskHostInText, maskHostPortForDisplay, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, hintWithSkippedProxy, isTlsTrustCode, redactProxyUrl, tlsTrustRemediation, type SkippedProxyInfo, type UpstreamFailureDetail } from "./upstream-fail.js";
 import { upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
@@ -138,6 +138,15 @@ function warnUnsupportedScheme(source: string, value: string, scheme: string): v
     if (warnedUnsupportedSchemes.has(key)) return;
     warnedUnsupportedSchemes.add(key);
     loggerLog("warn", `[upstream-proxy] ignoring ${source}=${redactProxyUrl(value)}: scheme "${scheme}" is not supported — only http:// and https:// proxy origins work. For Clash/mihomo, point bili at the same mixed port over http:// (e.g. http://127.0.0.1:7890).`);
+}
+
+const warnedInvalidOrigins = new Set<string>();
+
+function warnInvalidProxyOrigin(value: string): void {
+    const key = redactProxyUrl(value) ?? value;
+    if (warnedInvalidOrigins.has(key)) return;
+    warnedInvalidOrigins.add(key);
+    loggerLog("warn", `[upstream-proxy] ignoring proxy=${key}: not a usable HTTP/HTTPS proxy origin (expected http://host:port).`);
 }
 
 export function validateHttpProxy(proxy: string | undefined, biliPort?: number): void {
@@ -362,6 +371,27 @@ export function proxyKeepAliveMaxMs(): number {
  *  PROXY_KEEPALIVE_MAX_MS. */
 export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number): object | undefined {
     if (!proxyUrl) return undefined;
+    // Callers that hand over a RAW env value (the registry pre-warm at
+    // registry.ts fetchFresh) never pass through autoDetectProxy's scheme
+    // guard, so an unsupported scheme must degrade here instead of reaching
+    // ProxyAgent — its constructor throws synchronously, which turned the
+    // loader's memoized promise into a permanent rejection. Direct is the same
+    // egress autoDetectProxy would have chosen (#346/#357 intact) and the
+    // diagnostic stays identical.
+    const scheme = unsupportedProxyScheme(proxyUrl);
+    if (scheme) {
+        warnUnsupportedScheme("proxy", proxyUrl, scheme);
+        return undefined;
+    }
+    // A raw env value is not necessarily an absolute origin ("127.0.0.1:7890")
+    // and ProxyAgent throws on that too. Normalize/validate the same way the
+    // config and auto-detect paths do, and degrade instead of throwing.
+    const parsed = parseHttpProxy(proxyUrl);
+    if (!parsed) {
+        warnInvalidProxyOrigin(proxyUrl);
+        return undefined;
+    }
+    proxyUrl = parsed.url;
     const t = timeoutMs ?? upstreamTimeoutMs();
     const ka = proxyKeepAliveMaxMs();
     // #3776: include the CA identity in the key so a configured/rotated network.caFile rotates the cached agent.
@@ -540,7 +570,12 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     // Error text from undici/OS layers embeds the endpoint identity
     // ("connect ECONNREFUSED 10.0.0.5:8443", "getaddrinfo ENOTFOUND
     // relay.internal") — swap in the placeholder when the upstream is a
-    // non-public host so the failure log leaks nothing either.
+    // non-public host so the failure log leaks nothing either. The free-text
+    // `message` stays fully masked (#255); #4254 surfaces the actionable endpoint
+    // only through the structured `host` field below (loopback-exempt), so one
+    // free-text message never mixes a raw host next to a masked <private-host>.
+    let targetHostPort = "";
+    try { targetHostPort = new URL(url).host; } catch { /* not a URL — no display host */ }
     const maskHostIn = (s: string): string => {
         try {
             return maskHostInText(s, new URL(url).hostname);
@@ -567,7 +602,7 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
         hint = `${hint}; ${tlsTrustRemediation()}`;
     }
     parts.push(`hint=${hint}`);
-    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), hint } };
+    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), ...(targetHostPort !== "" ? { host: maskHostPortForDisplay(targetHostPort) } : {}), hint } };
 }
 
 export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): string {

@@ -54,6 +54,64 @@ const parseValues = (raw: string): string[] => {
   return out;
 };
 
+interface Attempt {
+  cmd: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  parse: (raw: string) => SolveResult;
+}
+
+const buildAttempts = (file: string): Attempt[] => {
+  const attempts: Attempt[] = [];
+  if (process.env.VERIF_SOLVER_CMD) {
+    const parts = process.env.VERIF_SOLVER_CMD.split(/\s+/);
+    attempts.push({
+      cmd: parts[0]!,
+      args: [...parts.slice(1), file],
+      env: process.env,
+      parse: (raw) => ({ status: /(^|\n)sat/.test(raw) && !/unsat/.test(raw) ? "sat" : /unsat/.test(raw) ? "unsat" : "unknown", values: parseValues(raw), raw }),
+    });
+  }
+  const py = process.env.VERIF_PYTHON ?? "python3";
+  const cvc5Py = `${process.env.CVC5_HOME ?? process.env.HOME + "/tmp/cvc5"}`;
+  const script = [
+    "import sys",
+    "import cvc5",
+    "tm = cvc5.TermManager(); s = cvc5.Solver(tm)",
+    "s.setOption('produce-models','true')",
+    "sm = cvc5.SymbolManager(tm)",
+    "p = cvc5.InputParser(s, sm)",
+    `p.setFileInput(cvc5.InputLanguage.SMT_LIB_2_6, ${JSON.stringify(file)})`,
+    "while True:",
+    "    cmd = p.nextCommand()",
+    "    if cmd.isNull(): break",
+    "    out = cmd.invoke(s, sm)",
+    "    if out: print(out.strip())",
+  ].join("\n");
+  attempts.push({
+    cmd: py,
+    args: ["-c", script],
+    env: { ...process.env, PYTHONPATH: `${cvc5Py}:${process.env.PYTHONPATH ?? ""}` },
+    parse: (raw) => ({ status: /(^|\n)sat\b/.test(raw) && !/unsat/.test(raw) ? "sat" : /unsat/.test(raw) ? "unsat" : "unknown", values: parseValues(raw), raw }),
+  });
+  const z3Bin = process.env.Z3_BIN ?? "z3";
+  attempts.push({
+    cmd: z3Bin,
+    args: [file],
+    env: process.env,
+    parse: (raw) => ({ status: /(^|\n)sat\b/.test(raw) ? "sat" : /unsat/.test(raw) ? "unsat" : "unknown", values: parseValues(raw), raw }),
+  });
+  return attempts;
+};
+
+const runAttempt = (a: Attempt) =>
+  spawnSync(a.cmd, a.args, { encoding: "utf8", timeout: 120_000, maxBuffer: 64 * 1024 * 1024, env: a.env });
+
+// Index of the solver that last gave a decisive verdict this process, or
+// undefined if none yet. Detect-once (#4140 instance 3): guard-probe and body
+// solves share one stable verdict instead of each re-walking the whole ladder.
+let decisiveIndex: number | undefined;
+
 export const solveSmt2 = (input: string | { smt2: string }, getValue: string[]): SolveResult => {
   const smt2 = typeof input === "string" ? input : input.smt2;
   const dir = mkdtempSync(join(tmpdir(), "verif-solve-"));
@@ -65,62 +123,34 @@ export const solveSmt2 = (input: string | { smt2: string }, getValue: string[]):
       : "(check-sat)\n";
     writeFileSync(file, header + smt2.replace(/\(check-sat\)[\s\S]*$/, "") + tail);
 
-    // Try, in order: explicit override, cvc5 via python, z3 binaries.
-    const attempts: { cmd: string; args: string[]; parse: (raw: string) => SolveResult }[] = [];
-    if (process.env.VERIF_SOLVER_CMD) {
-      const parts = process.env.VERIF_SOLVER_CMD.split(/\s+/);
-      attempts.push({
-        cmd: parts[0]!,
-        args: [...parts.slice(1), file],
-        parse: (raw) => ({ status: /(^|\n)sat/.test(raw) && !/unsat/.test(raw) ? "sat" : /unsat/.test(raw) ? "unsat" : "unknown", values: parseValues(raw), raw }),
-      });
+    const attempts = buildAttempts(file);
+
+    // Detect-once fast path: try the already-decisive solver first, rebuilt
+    // against the CURRENT file (index holds no stale temp path); a spawn error
+    // means it died → invalidate and fall through to the full walk below.
+    if (decisiveIndex !== undefined) {
+      const a = attempts[decisiveIndex];
+      if (a) {
+        const r = runAttempt(a);
+        if (r.error) decisiveIndex = undefined;
+        else {
+          const p = a.parse(r.stdout ?? "");
+          if (p.status !== "unknown") return p;
+        }
+      }
     }
-    const py = process.env.VERIF_PYTHON ?? "python3";
-    const cvc5Py = `${process.env.CVC5_HOME ?? process.env.HOME + "/tmp/cvc5"}`;
-    const script = [
-      "import sys",
-      "import cvc5",
-      "tm = cvc5.TermManager(); s = cvc5.Solver(tm)",
-      "s.setOption('produce-models','true')",
-      "sm = cvc5.SymbolManager(tm)",
-      "p = cvc5.InputParser(s, sm)",
-      `p.setFileInput(cvc5.InputLanguage.SMT_LIB_2_6, ${JSON.stringify(file)})`,
-      "while True:",
-      "    cmd = p.nextCommand()",
-      "    if cmd.isNull(): break",
-      "    out = cmd.invoke(s, sm)",
-      "    if out: print(out.strip())",
-    ].join("\n");
-    attempts.push({
-      cmd: py,
-      args: ["-c", script],
-      parse: (raw) => ({ status: /(^|\n)sat\b/.test(raw) && !/unsat/.test(raw) ? "sat" : /unsat/.test(raw) ? "unsat" : "unknown", values: parseValues(raw), raw }),
-      // note: PYTHONPATH handled via env below
-    });
-    const z3Bin = process.env.Z3_BIN ?? "z3";
-    attempts.push({
-      cmd: z3Bin,
-      args: [file],
-      parse: (raw) => ({ status: /(^|\n)sat\b/.test(raw) ? "sat" : /unsat/.test(raw) ? "unsat" : "unknown", values: parseValues(raw), raw }),
-    });
 
     let lastErr = "";
-    for (const a of attempts) {
-      const r = spawnSync(a.cmd, a.args, {
-        encoding: "utf8",
-        timeout: 120_000,
-        maxBuffer: 64 * 1024 * 1024,
-        env: a.cmd === py || a.cmd.endsWith("python3") || a.cmd.includes("python")
-          ? { ...process.env, PYTHONPATH: `${cvc5Py}:${process.env.PYTHONPATH ?? ""}` }
-          : process.env,
-      });
+    for (let i = 0; i < attempts.length; i++) {
+      const a = attempts[i]!;
+      const r = runAttempt(a);
       if (r.error) { lastErr += `${a.cmd}: ${r.error.message}\n`; continue; }
       // A verdict printed to stdout wins over the exit code: native z3
       // prints `unsat` and THEN exits 1 because the trailing (get-value)
       // fails with "model is not available" — discarding stdout there would
       // turn every unsat into "no solver available".
       const parsed = a.parse(r.stdout ?? "");
-      if (parsed.status !== "unknown") return parsed;
+      if (parsed.status !== "unknown") { decisiveIndex = i; return parsed; }
       lastErr += r.status !== 0
         ? `${a.cmd}: exit ${r.status}: ${r.stderr.slice(0, 500)}\n`
         : `${a.cmd}: unknown\n`;

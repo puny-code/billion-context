@@ -77,6 +77,23 @@ test("WC-015 validates message-item IDs without constraining provider namespaces
     assert.match(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "marker-1791393957942-2", content: "x" }] })[0], /WC-015/);
 });
 
+test("WC-022 tool_addition/tool_removal blocks are only valid inside role:system messages", () => {
+    const addition = { type: "tool_addition", tool: { type: "tool_definition", definition: { name: "t", input_schema: { type: "object", properties: {} } } } };
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "user", content: [{ type: "text", text: "u" }] },
+            { role: "system", content: [{ type: "text", text: "tools changed" }, addition] },
+        ],
+    }), []);
+    // The master-b156c02f shape: the system message re-emitted as user.
+    assert.match(VALIDATORS.anthropic({
+        messages: [{ role: "user", content: [{ type: "text", text: "tools changed" }, addition] }],
+    })[0], /WC-022/);
+    assert.match(VALIDATORS.anthropic({
+        messages: [{ role: "user", content: [{ type: "tool_removal", tool_name: "t" }] }],
+    })[0], /WC-022/);
+});
+
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
     // #2648 shape: unmarked tools render ahead of a global system block.
     assert.match(VALIDATORS.anthropic({
@@ -134,7 +151,11 @@ function toolNameOf(wire: Wire, t: ToolShape): string | undefined {
     return typeof t.name === "string" ? t.name : undefined;
 }
 
-const COMPRESS_FORM_PROPS = ["topic", "content", "startId", "endId", "startRef", "endRef", "summary"];
+// #4252, structural since 2026-10-26: exactly one advertised form —
+// content as ONE plain string. Legacy flat-form fields
+// (startId/endId/startRef/endRef/summary/topic) and array content remain
+// functional in parseCompressInput but are deliberately not advertised.
+const COMPRESS_FORM_PROPS = ["content"];
 
 function assertCompressFormsKept(tool: ToolShape | undefined, source: string): void {
     assert.ok(tool, `${source}: compress tool present`);
@@ -167,6 +188,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
                 system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
             },
+            // WC-022: a pi mid-conversation system message re-emitted as user.
+            { messages: [{ role: "user", content: [{ type: "tool_removal", tool_name: "t" }] }] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },

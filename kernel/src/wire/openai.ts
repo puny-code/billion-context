@@ -1,4 +1,5 @@
 import { splitDemotedThinking } from "./demoted-thinking.js";
+import { isSummaryMessageId } from "../prune.js";
 import {
   CANONICAL_IMAGE_TEXT,
   canonicalToolArgs,
@@ -87,6 +88,12 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           systemParts.push(stringContent(m.content));
           break;
         }
+        // #4166 (mirror of #3992 on the anthropic wire): a mid-history
+        // system/developer message is CLIENT DATA — keep the raw wire
+        // message as a verbatim sidecar so coreToOpenai re-emits it
+        // byte-exact (structured parts — DSH tool_addition-style blocks —
+        // survive instead of being stringContent-flattened away). Kernel
+        // text ops (truncation, matching) still ride `text`.
         const base = deriveCanonicalMessageId(
           m.role,
           "text",
@@ -98,7 +105,8 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           contentType: "text",
           text: stringContent(m.content),
           originalRole: m.role,
-        });
+          rawOpenaiMessage: m,
+        } as BiliMessage);
         break;
       }
       case "user": {
@@ -464,10 +472,47 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
         flushUserRun();
       }
       if (m.role === "system") {
-        out.push({
-          role: m.originalRole === "developer" ? "developer" : "system",
-          content: m.text ?? "",
-        });
+        // #4166: a core carrying the raw sidecar re-emits it byte-exact
+        // (client mid-history system data). If kernel ops rewrote the text
+        // (emergency truncation), a plain-text sidecar re-lays out its text;
+        // a structured one is unfoldable-by-protection, so verbatim still.
+        const raw = (m as BiliMessage & { rawOpenaiMessage?: unknown })
+          .rawOpenaiMessage as OpenAIMessage | undefined;
+        if (raw) {
+          const text = m.text ?? "";
+          if (
+            text !== stringContent(raw.content) &&
+            isPlainStringOrTextParts(raw.content)
+          ) {
+            out.push({
+              role: m.originalRole === "developer" ? "developer" : "system",
+              content: typeof raw.content === "string" ? text : [{ type: "text", text }],
+            });
+          } else {
+            out.push(raw);
+          }
+        } else {
+          out.push({
+            role: m.originalRole === "developer" ? "developer" : "system",
+            content: m.text ?? "",
+          });
+        }
+      } else if (
+        m.role === "user" &&
+        isSummaryMessageId(m.id) &&
+        m.contentType === "text"
+      ) {
+        // #4166/#377: a re-voiced summary carrier is bili's own artifact,
+        // not a member of any client wire run — it emits as its OWN message
+        // so the pinned first-user message (#3642/#2733 prefix-cache anchor)
+        // never merges with (and never has its bytes prefixed by) the
+        // carrier text. Ids with the reserved summary prefix can only be
+        // kernel-minted here (client echoes re-hash to raw ids), so the
+        // role-agnostic id+contentType match is exact — isRenderedSummaryMessage
+        // would miss it because the host re-voice already flipped the role.
+        flush();
+        flushUserRun();
+        out.push({ role: "user", content: m.text ?? "" });
       } else if (m.role === "user") {
         // #3642: canonical granularity gives one core per content part, so
         // user cores from ONE wire message are a RUN that rebuilds as ONE
@@ -527,6 +572,25 @@ export function conversationSignalOpenai(
   const firstUser = msgs.find((m) => m?.role === "user");
   const seed = firstUser ? stringContent(firstUser.content) : "default";
   return hashId(seed);
+}
+
+/** #4166: true when content is a plain string or an all-text parts array —
+ *  the shapes whose bytes live entirely in `text`, so a kernel text rewrite
+ *  can re-lay them out without losing anything. */
+function isPlainStringOrTextParts(
+  content: OpenAIMessage["content"],
+): boolean {
+  if (content == null || typeof content === "string") return true;
+  return (
+    Array.isArray(content) &&
+    content.length > 0 &&
+    content.every(
+      (p) =>
+        typeof p === "object" &&
+        p !== null &&
+        (p as { type?: string }).type === "text",
+    )
+  );
 }
 
 function stringContent(content: OpenAIMessage["content"]): string {

@@ -248,8 +248,35 @@ export function classifySameLanePeer(
     for (const e of entries) {
         if (e.port !== port || e.lane !== lane) continue;
         if (!isPidAlive(e.pid)) continue;
+        // #4982: a draining instance stamped portReleasedAt when its listener
+        // closed — its pid still lives but the socket no longer does, so it
+        // cannot be the EADDRINUSE holder even though every other identity cell
+        // matches. This is exactly the stale-twin misclassification that killed
+        // #4982's CI child while a cross-lane instance owned the freed port.
+        if (e.portReleasedAt !== undefined) continue;
         if (e.codeFingerprint !== ownFingerprint) continue;
         return { kind: sameShape(e) ? "twin" : "drifted", entry: e };
+    }
+    return undefined;
+}
+
+/** #4341: a registry twin is safe to adopt before persistence initialization
+ * only after the listener proves the same pid + instance identity. A stale
+ * marker, pid reuse, or foreign listener must fall through to the existing
+ * bind/EADDRINUSE policy instead of causing a false adopt. */
+export async function findVerifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        const health = await healthOf(peer.entry.origin);
+        if (health?.pid === peer.entry.pid && health.instanceId === peer.entry.instanceId) return peer.entry;
     }
     return undefined;
 }
@@ -420,6 +447,29 @@ export function isPidAlive(pid: number): boolean {
     }
 }
 
+export interface PidProbe {
+    alive: boolean;
+    /** Errno code of the failed kill-0 (e.g. "ESRCH"); undefined when the
+     *  probe succeeded or no probe ran at all (invalid pid). */
+    errCode?: string;
+}
+
+/** #3890: kill-0 with errno visibility. On Windows Node maps every
+ *  OpenProcess failure other than ERROR_ACCESS_DENIED to ESRCH, so a LIVE
+ *  process can read dead with no way to tell which Win32 error caused it.
+ *  Callers that act destructively on a dead verdict log errCode on first
+ *  sight so field episodes can be attributed. */
+export function probePid(pid: number): PidProbe {
+    if (!Number.isInteger(pid) || pid <= 0) return { alive: false };
+    try {
+        process.kill(pid, 0);
+        return { alive: true };
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        return { alive: code === "EPERM", errCode: code };
+    }
+}
+
 export interface RegistryEntry {
     instanceId: string;
     pid: number;
@@ -438,6 +488,14 @@ export interface RegistryEntry {
     modelMaxOutputs?: Record<string, number>;
     lane?: string;
     codeFingerprint?: string;
+    /** #4982: set when this instance released its listening socket (graceful
+     *  shutdown start). The process can stay alive for seconds-to-minutes while
+     *  it drains keep-alive connections and flushes state — during that window
+     *  it CANNOT be the EADDRINUSE holder of `port` anymore, so consumers that
+     *  judge PORT OWNERSHIP (classifySameLanePeer) must skip marked entries,
+     *  while consumers that wait for the process to EXIT (findSameLanePredecessor
+     *  → wait-predecessor) keep counting them. */
+    portReleasedAt?: number;
 }
 
 /** Cross-instance liveness registry (#394/#527): one marker file per instance
@@ -505,6 +563,7 @@ function coerceEntry(value: unknown): RegistryEntry | undefined {
         ...(Object.keys(maxOutputs).length > 0 ? { modelMaxOutputs: maxOutputs } : {}),
         ...(typeof o.lane === "string" && o.lane !== "" ? { lane: o.lane } : {}),
         ...(typeof o.codeFingerprint === "string" && o.codeFingerprint !== "" ? { codeFingerprint: o.codeFingerprint } : {}),
+        ...(typeof o.portReleasedAt === "number" && Number.isFinite(o.portReleasedAt) ? { portReleasedAt: o.portReleasedAt } : {}),
     };
 }
 
@@ -658,5 +717,23 @@ export function discoverLiveInstances(): ProxyInstanceFile[] {
 export function unregisterInstance(instanceId: string): void {
     try {
         fs.unlinkSync(registryEntryFile(instanceId));
+    } catch {}
+}
+
+/** #4982: withdraw the port-ownership claim the moment the listening socket
+ *  closes (graceful shutdown start). The drain can outlive the release by
+ *  minutes (keep-alive pins, slow flushes), and during that window a stale
+ *  "I hold port N" marker let a same-lane newcomer misclassify us as its twin
+ *  and die with the adopt signal while a cross-lane instance owned the freed
+ *  socket (#4982). Rewrites ONLY our own marker file with the stamp —
+ *  per-instance files mean no cross-process read-modify-write. Best-effort:
+ *  a failed mark degrades to the pre-#4982 behavior, where the health
+ *  verification in the EADDRINUSE path still catches the stale claim. */
+export function markPortReleased(instanceId: string): void {
+    try {
+        const file = registryEntryFile(instanceId);
+        const entry = coerceEntry(safeReadJson(file));
+        if (!entry || entry.portReleasedAt !== undefined) return;
+        atomicWriteJson({ ...entry, portReleasedAt: Date.now() }, file);
     } catch {}
 }

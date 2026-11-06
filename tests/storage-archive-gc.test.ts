@@ -86,6 +86,59 @@ test("archiveSession: tombstone + CAS release; shared rows survive; restore re-i
     }
 });
 
+test("restore counts every restored media mapping without consuming a shared holder's reference", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-media-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const image = "a".repeat(4096);
+        const imageMsg = (id: string) => ({ ...mkMsg(id, id), imageBase64: image, imageMediaType: "image/png" });
+        store.ingestSession(planIngest(mkSession("archived", [imageMsg("a1"), imageMsg("a2")])));
+        store.ingestSession(planIngest(mkSession("holder", [imageMsg("b1")])));
+        assert.equal(store.mediaRefCount(image), 3);
+        const archiveDir = path.join(dir, "archive");
+        assert.ok(store.archiveSession("archived", { archiveDir }).ok);
+        assert.equal(store.mediaRefCount(image), 1);
+        assert.ok(store.restoreArchived("archived", { archiveDir }).ok);
+        assert.equal(store.mediaRefCount(image), 3);
+        store.deleteSession("archived");
+        assert.equal(store.mediaRefCount(image), 1);
+        assert.equal(JSON.parse(store.getMessages("holder")[0].content).imageBase64, image);
+        store.deleteSession("holder");
+        assert.equal(store.mediaRefCount(image), 0);
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("restore ignores duplicate media mappings and preserves pinned checkpoint ownership", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-conflict-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const image = "b".repeat(4096);
+        const msg = { ...mkMsg("m", "image"), imageBase64: image, imageMediaType: "image/png" };
+        store.ingestSession(planIngest(mkSession("session", [msg])));
+        const stateJson = '{"unique":"pinned checkpoint state"}';
+        store.insertCheckpoint({ cpId: "cp", sessionId: "session", seqAt: 0, blockSetHash: "set", kind: "manual", pinned: true, createdAt: 1, stateJson });
+        const archiveDir = path.join(dir, "archive");
+        const archived = store.archiveSession("session", { archiveDir });
+        assert.ok(archived.ok && archived.exportPath);
+        const dump = JSON.parse(fs.readFileSync(archived.exportPath, "utf8")) as { mediaMaps: unknown[] };
+        dump.mediaMaps.push(dump.mediaMaps[0]);
+        fs.writeFileSync(archived.exportPath, JSON.stringify(dump) + "\n");
+        assert.ok(store.restoreArchived("session", { archiveDir }).ok);
+        assert.equal(store.mediaRefCount(image), 1);
+        assert.equal(store.contentRefCountOfBody("pinned checkpoint state"), 1);
+        assert.equal(store.listCheckpoints("session").length, 1);
+        store.deleteSession("session");
+        assert.equal(store.mediaRefCount(image), 0);
+        assert.equal(store.contentRefCountOfBody("pinned checkpoint state"), 1);
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
 test("archive log: one append-only JSONL, one line per session, no per-session files (#3901 review)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-log-"));
     try {
@@ -142,6 +195,28 @@ test("archive log: a crashed append's truncated line cannot block other restores
     }
 });
 
+test("archive after a truncated line preserves bytes and restores the newly swept session", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-tail-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const archiveDir = path.join(dir, "archive");
+        fs.mkdirSync(archiveDir);
+        const logPath = path.join(archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
+        const tail = '{"version":1,"sessionId":"interrupted"';
+        fs.writeFileSync(logPath, tail);
+        store.ingestSession(planIngest(mkSession("new", [mkMsg("m-new", "recover this body")])));
+        assert.ok(store.archiveSession("new", { archiveDir }).ok);
+        assert.equal(store.getMessages("new").length, 0);
+        const bytes = fs.readFileSync(logPath, "utf8");
+        assert.ok(bytes.startsWith(tail + "\n"), "the partial line is preserved and separated");
+        assert.ok(store.restoreArchived("new", { archiveDir }).ok, "the new archive remains restorable");
+        assert.equal(JSON.parse(store.getMessages("new")[0].content).text, "recover this body");
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
 test("gc(): age sweep archives only past-retention sessions; dormant shared rows collected", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-gc-"));
     try {
@@ -158,7 +233,13 @@ test("gc(): age sweep archives only past-retention sessions; dormant shared rows
         assert.ok(store.getSessionRow("sess-old"));
         assert.equal((store.getSessionRow("sess-old") as unknown as { status?: string }).status, "archived");
         assert.equal((store.getSessionRow("sess-new") as unknown as { status?: string }).status, "active");
-        assert.equal(result.contentRowsDeleted >= 1, true, "released exclusive content collected");
+        // #4242 delete-on-zero: the released row is deleted INLINE by the
+        // release itself, so gc's sweep counter may legitimately be 0 — the
+        // observable contract is that the exclusive content is GONE.
+        const contentLeft = (
+            store as unknown as { db: { prepare: (q: string) => { all: () => { bytes?: unknown }[] } } }
+        ).db.prepare("SELECT bytes FROM content").all().length;
+        assert.ok(contentLeft === 1, `released exclusive content collected inline (left=${contentLeft})`);
         store.close();
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }

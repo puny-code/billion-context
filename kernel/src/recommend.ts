@@ -24,6 +24,7 @@ import { isToolMessage } from "./message-kind.js";
 import { coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
 import { SUMMARY_HEADER } from "./prune.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasUnrecoverableMediaPayload,
@@ -35,7 +36,11 @@ import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  projectUnit,
+  collectCoverage,
+  createProjectionContext,
+} from "./unit-projection.js";
 import { BoundaryNotFoundError } from "./boundaries.js";
 import type { UnitProjection } from "./unit-projection.js";
 
@@ -293,6 +298,10 @@ export function buildCompressibleRanges(
   // Pairing: a tool-result may carry only toolCallId (no toolName). Collect the
   // callIds of protected tool-calls first, then protect matching results too.
   const protectedCallIds = collectProtectedToolCallIds(messages, config);
+  // #4289: failed compress exchanges (zero ranges applied) must be advertised
+  // as compressible like ordinary messages — without this set their call half
+  // stays "protected" here while assignRefs already gave it a foldable ref.
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   // Latest-only protected calls: their results are covered by the pairing
   // union; the calls themselves need the explicit check below (pairing only
   // matches tool-results).
@@ -355,7 +364,12 @@ export function buildCompressibleRanges(
     }
 
     if (
-      isMessageProtectedWithPairing(msg, config, protectedCallIds) ||
+      isMessageProtectedWithPairing(
+        msg,
+        config,
+        protectedCallIds,
+        failedCompressCallIds,
+      ) ||
       isMessageLatestProtected(msg, latest)
     ) {
       protectedMsgs.push({
@@ -416,9 +430,17 @@ export function buildCompressibleRanges(
   // each removed message as a gap so no range spans it.
   // #2663: judge foldability on the same array class apply does (see the
   // `integritySource` parameter) — grouping/pairing are array-dependent.
+  // #5531: ids already covered by an active block are INVISIBLE, not kept —
+  // a covered call cannot strand its turn's reasoning. Without this, every
+  // #564 reverse split (call+result folded into a block, reasoning+text left
+  // visible) manufactures residue that no later fold may ever take: it is
+  // withdrawn here AND rejected at apply, so each growth fold reclaims only
+  // the non-residue and the session grows without bound (billion-context#5531).
   const unfoldedIds = computeIntegrityWithdrawals(
     integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
+    undefined,
+    covered,
   ).withdrawn;
   if (unfoldedIds.size > 0) {
     let gapPending = false;
@@ -642,6 +664,14 @@ export function screenRecommendedUnits(
 ): CompressibleRange[] {
   if (units.length === 0) return units;
   const coverage = collectCoverage(state);
+  // Every unit below is projected against THIS one array, state and config, so
+  // the derived structures projectUnit needs (id index, protected-tool facts,
+  // turn groups, pair maps) are identical for all of them. Build them once
+  // here and hand them down: the per-unit cost was O(messages) per derived
+  // structure before, which made this screen O(units × messages) — the
+  // dominant cost of the whole fold pass at large histories. This is per-CALL
+  // memoization only; nothing survives the turn (messages and state change).
+  const context = createProjectionContext(source, state, config);
   return units.filter((unit) => {
     let projection: UnitProjection | undefined;
     try {
@@ -653,6 +683,7 @@ export function screenRecommendedUnits(
         endRef: unit.endRef,
         preExistingCoverage: coverage,
         protectedMessageIds: protectedRefs,
+        context,
       });
     } catch (err) {
       // Endpoints that cannot resolve on this array class (dead/consumed)

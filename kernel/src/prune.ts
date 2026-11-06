@@ -45,6 +45,53 @@ export function isCovered(id: string, coveredBases: Set<string>): boolean {
 }
 
 /**
+ * #4316 layer 3: seq-interval coverage claims. A block that recorded an exact
+ * ledger interval (startSeq/endSeq) covers ANY message carrying a ledgerSeq
+ * stamp inside that interval — id churn (model switch / re-stamp / re-encode
+ * re-mints every content-hash id) cannot invalidate the positional claim.
+ * Blocks without bounds contribute nothing; messages without stamps are
+ * decided by the id path alone. Both paths run in parallel (union): the id
+ * path stays byte-identical for unstamped traffic.
+ *
+ * The -1/-1 "no claim" sentinel (PR #4725 N1: storage writes it when a
+ * block's covered ids cannot be resolved to transcript rows, e.g. migrated
+ * pre-unified-storage folds) contributes nothing — with the historical
+ * endSeq >= startSeq guard alone it would pass as a REAL interval and, for
+ * the [0,0] placeholder it replaces, suppress the seq-0 message as already
+ * folded. [0,0] itself stays a legitimate claim: a block can genuinely
+ * cover just seq 0.
+ */
+export function coveredSeqIntervals(
+  state: CompressionState,
+): Array<{ start: number; end: number }> {
+  const intervals: Array<{ start: number; end: number }> = [];
+  for (const block of state.blocks) {
+    if (!block.active) continue;
+    if (
+      typeof block.startSeq === "number" &&
+      typeof block.endSeq === "number" &&
+      block.startSeq >= 0 &&
+      block.endSeq >= block.startSeq
+    ) {
+      intervals.push({ start: block.startSeq, end: block.endSeq });
+    }
+  }
+  return intervals;
+}
+
+/** True when `seq` falls inside any active block's exact interval claim. */
+export function isCoveredBySeq(
+  seq: number | undefined,
+  intervals: Array<{ start: number; end: number }>,
+): boolean {
+  if (typeof seq !== "number" || !Number.isInteger(seq)) return false;
+  for (const interval of intervals) {
+    if (seq >= interval.start && seq <= interval.end) return true;
+  }
+  return false;
+}
+
+/**
  * True when a message is a rendered block summary (the exact shape prune
  * emits). The id prefix alone is not sufficient — a host-authored message
  * that happens to carry a reserved id must not be treated as a rendered
@@ -123,6 +170,28 @@ export function prune(
       summaryIndexById.set(message.id, index);
   });
 
+  // #4311: a wire-visible compress call already carries the full summary
+  // draft in its arguments, and the call+receipt pair stays protected —
+  // re-rendering the block summary duplicates that text on the wire. Skip
+  // the anchor for blocks whose ORIGINATING call is visible in THIS view
+  // (the exchange itself is the model-visible recap); blocks whose call is
+  // gone (folded away, gateway-dropped) or that never had one (system folds,
+  // codex/dsh forged-summary lanes) keep their render. The skip must key on
+  // the exact compressCallId — never on range overlap — so a RE-FOLD that
+  // covers similar ground still renders its own summary.
+  const visibleCompressCallIds = new Set<string>();
+  if (inject) {
+    for (const message of messages) {
+      if (
+        message.contentType === "tool-call" &&
+        message.toolCallId &&
+        typeof message.toolName === "string" &&
+        isCompressTool(message.toolName)
+      ) {
+        visibleCompressCallIds.add(message.toolCallId);
+      }
+    }
+  }
   const anchors = inject
     ? collectSummaryAnchors(
         state,
@@ -133,6 +202,7 @@ export function prune(
           : lastUserIndex >= 0
             ? lastUserIndex
             : messages.length,
+        visibleCompressCallIds,
       )
     : [];
   // Summary ids of every block this session has ever created — active or
@@ -153,6 +223,8 @@ export function prune(
         rebuildMessages(
           messages,
           coveredBases,
+          // #4316 layer 3: positional claims, built once per prune pass.
+          coveredSeqIntervals(state),
           firstUserIndex,
           anchors,
           knownSummaryIds,
@@ -184,9 +256,19 @@ function collectSummaryAnchors(
   baseIndexById: Map<string, number>,
   summaryIndexById: Map<string, number>,
   fallbackIndex: number,
+  // #4311: call ids of compress exchanges visible in the current view;
+  // blocks created by one of these skip their anchor render (see the
+  // collection site above for the rationale and the safety conditions).
+  visibleCompressCallIds: Set<string>,
 ): SummaryAnchor[] {
   const anchors: SummaryAnchor[] = [];
   for (const block of activeBlocks(state)) {
+    // #4311: the originating call is on the wire — its arguments carry the
+    // summary text, so injecting the block render would duplicate it. The
+    // stale render (if a previously-pruned view carried one) is dropped by
+    // rebuildMessages via knownSummaryIds and NOT re-injected here.
+    if (block.compressCallId && visibleCompressCallIds.has(block.compressCallId))
+      continue;
     // Prefer the position of an already-rendered summary (hosts may pass a
     // previously-pruned view): keeps the summary stable in place instead of
     // jumping to index 0 when the raw ids are no longer in the input.
@@ -354,6 +436,9 @@ const wireIndexOf = (m: CoreMessage): number | undefined =>
 function rebuildMessages(
   messages: CoreMessage[],
   coveredBases: Set<string>,
+  // #4316 layer 3: exact ledger-interval claims of active blocks (positional
+  // coverage, immune to id churn), threaded from prune().
+  seqIntervals: Array<{ start: number; end: number }>,
   firstUserIndex: number,
   anchors: SummaryAnchor[],
   knownSummaryIds: Set<string>,
@@ -433,6 +518,11 @@ function rebuildMessages(
       continue;
     }
     if (isCovered(messages[index]!.id, coveredBases)) continue;
+    // #4316 layer 3: positional coverage — a stamped message inside any
+    // active block's exact ledger interval is covered even when its id was
+    // re-minted (the id check above just missed it by construction). Runs
+    // after the pin and the id path so unstamped behavior is untouched.
+    if (isCoveredBySeq(messages[index]!.ledgerSeq, seqIntervals)) continue;
     // A stale copy of a block's summary from a previously-pruned view:
     // the freshly rendered one above replaces it. Active blocks re-render
     // at their anchor; consumed blocks (chain re-fold) are covered by their

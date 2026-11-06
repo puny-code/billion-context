@@ -1,6 +1,37 @@
 import { baseIdOf, summaryMessageId } from "./prune.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
+/** #4316 layer 3: true when any visible message's ledgerSeq stamp falls
+ * inside the block's exact interval claim. Unbounded blocks and unstamped
+ * views answer false — the id path decides those. The -1/-1 "no claim"
+ * sentinel (PR #4725 N1) also answers false: it is absence of evidence, not
+ * a positional claim (a [0,0] row IS a real claim over seq 0). */
+function blockSeqPresent(
+  block: { startSeq?: number; endSeq?: number },
+  messages: CoreMessage[],
+): boolean {
+  if (
+    typeof block.startSeq !== "number" ||
+    typeof block.endSeq !== "number" ||
+    block.startSeq < 0 ||
+    block.endSeq < block.startSeq
+  ) {
+    return false;
+  }
+  for (const message of messages) {
+    const seq = message.ledgerSeq;
+    if (
+      typeof seq === "number" &&
+      Number.isInteger(seq) &&
+      seq >= block.startSeq &&
+      seq <= block.endSeq
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export interface SyncResult {
   state: CompressionState;
   deactivated: string[];
@@ -72,6 +103,11 @@ export function syncBlocks(
         )
       : undefined,
     viewLatchConfigDigest: state.viewLatchConfigDigest,
+    // #4797: the one-time ledger-alignment gate MUST survive the sync clone —
+    // dropping it re-arms restampRefsToLedger on every turn, re-populating
+    // the host's superseded map forever (the "one-time" restamp stops being
+    // one-time; reference/ref-keyed-surfaces.md, flag-propagation contract).
+    refLedgerAligned: state.refLedgerAligned,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so
@@ -115,9 +151,15 @@ export function syncBlocks(
     // (pruned view) is still present — the summary IS the block's visible
     // representation. Without this, hosts passing pruned views would lose
     // block activity every turn.
+    // #4316 layer 3: a block with an exact ledger interval is also still
+    // present when ANY visible message carries a ledgerSeq stamp inside the
+    // interval — the host restored/re-stamped the originals (fresh ids, same
+    // positions), and the positional claim survives the id churn that the
+    // id-membership check above just missed.
     const stillPresent =
       block.effectiveMessageIds.some((id) => presentBases.has(baseIdOf(id))) ||
-      presentIds.has(summaryMessageId(block.blockId));
+      presentIds.has(summaryMessageId(block.blockId)) ||
+      blockSeqPresent(block, messages);
     if (!stillPresent) {
       block.active = false;
       deactivated.push(block.blockId);

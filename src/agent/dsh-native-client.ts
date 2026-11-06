@@ -40,11 +40,17 @@
 // per-session Context tab in the official dsh client (conversation.view slot).
 // dsh exposes no API to edit the context stream, so host-side stat plugins
 // anchored on the event log can never observe bili's folds (their bar freezes
-// at the pre-compression caliber, dsh-context#173); the tab instead renders
-// the proxy's OWN live view (GET /__bili/plugin/status `contextView`: the
-// post-fold sent composition recomputed by the kernel + fold/switch trails
-// from the cache ledger). It is native DOM in this bundle, NOT an iframe
-// (owner directive): react stays the single external, no second document.
+// at the pre-compression caliber, dsh-context#173). Instead of a second
+// native re-rendering of the data, the tab EMBEDS the web UI's OWN session
+// page (?embed=1 + #/session/<id>) — compression tree and ledger readouts
+// stay in one place, the frame. The frame is bound to THIS conversation:
+// dsh names it to every conversation.view entry (props.sessionId — the same
+// id the lane stamps on x-bili-plugin-conversation), so the status poll asks
+// for that exact id; a fallback-resolved row belonging to a sibling
+// conversation or an acp_delegate sub-agent is refused at render time
+// instead of hijacking the frame (older hosts pass no props and keep the
+// historical latest-session behaviour); while no session exists yet the tab
+// shows an honest hint instead of an empty frame.
 
 import { createElement, useEffect, useState } from "react";
 
@@ -88,13 +94,19 @@ const SLOW_POLL_INTERVAL_MS = 10000;
 // the web UI's own nav terminology (src/web/i18n.ts) so each tab reads like
 // the title of the page inside the frame. "connect" stays out: it documents
 // how OTHER clients reach this proxy, which makes no sense from inside dsh.
-const PAGE_IDS = ["overview", "sessions", "config", "logs"] as const;
+// #4906 follow-up (owner 2026-10-27): "blog" joins right after "updates" so
+// the master-pulled 博客 sits next to 版本 in the dsh bili设置 tab bar; an
+// older embedded frame without the #/blog route falls back to its own
+// default page inside the iframe (no blank pane).
+const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates", "blog"] as const;
 type PageId = (typeof PAGE_IDS)[number];
 const PAGE_KEYS: Record<PageId, string> = {
     overview: "tab_overview",
     sessions: "tab_sessions",
     config: "tab_config",
     logs: "tab_logs",
+    updates: "tab_updates",
+    blog: "tab_blog",
 };
 
 // #3816: the exact field a remote user adds to enable the #3373 relay. A
@@ -118,130 +130,98 @@ const ACTION_BTN_STYLE = {
     whiteSpace: "nowrap",
 };
 
-// #3862: Context tab data source + cadence. The status URL is the SAME
-// canonical form the dsh lane uses server-side (/acp command), so the tab and
-// the slash command can never read two different sessions. Polling is slow by
-// design: the view only changes on model requests, 10s is imperceptible lag
-// at zero cost.
+// #3862: Context tab data source + cadence. When the host names THIS
+// conversation (slot props.sessionId — the same value the dsh lane stamps on
+// x-bili-plugin-conversation upstream), the poll binds the tab to that exact
+// conversation. `fallback=latest` is kept ONLY so the pre-first-request panel
+// still resolves before our own first request; a fallback-resolved row that
+// belongs to ANOTHER conversation is refused at render time (see the
+// ownership gate below), so a concurrently-active acp_delegate sub-agent can
+// never steal the frame. The literal "dsh" form remains for hosts that pass
+// no identity (older builds: previous behaviour, preserved bit-for-bit).
+// The response's `sessionId` field is what the embedded frame navigates to
+// (#/session/<id>). Polling is slow by design: the id only changes when a
+// conversation re-binds or a new one lands, so 10s is imperceptible lag at
+// zero cost.
 const CTX_STATUS_PATH = "/__bili/plugin/status?conversationId=dsh&fallback=latest";
+const ctxStatusPathFor = (hostSessionId: string | undefined): string =>
+    hostSessionId === undefined
+        ? CTX_STATUS_PATH
+        : `/__bili/plugin/status?conversationId=${encodeURIComponent(hostSessionId)}&fallback=latest`;
 const CTX_POLL_MS = 10000;
-const CTX_EVENT_ROWS = 12;
+// #4254: frame-level upstream-unavailable pill (shell.overlay) — same slow cadence
+// as the per-session Context tab. A dead circuit retries on its own ~60s probe, so
+// 10s keeps the "retry in ~Ns" hint fresh and clears the banner within one tick.
+const UPSTREAM_POLL_MS = 10000;
 
-// Segment palette: GitHub-dark category colors, readable on both host themes
-// (segments sit on a neutral track, not on the page ground).
-const CATEGORY_COLOR: Record<string, string> = {
-    sysprompt: "#6e7781",
-    tool: "#d29922",
-    text: "#58a6ff",
-    code: "#bc8cff",
-    summaries: "#3fb950",
-    system: "#8b949e",
+type CtxStatus = {
+    ok: boolean;
+    phase?: string;
+    panelPresent: boolean;
+    sessionId: string | null;
+    /** Which conversation id the resolved row was recorded under (null when
+     *  the response carries none / predates the field). */
+    conversationId: string | null;
+    /** True when the server resolved the row via the fallback=latest pool
+     *  instead of an exact conversation match. */
+    viaFallback: boolean;
 };
-const CATEGORY_LABEL_KEYS: Record<string, string> = {
-    sysprompt: "cat_sysprompt",
-    tool: "cat_tool",
-    text: "cat_text",
-    code: "cat_code",
-    summaries: "cat_summaries",
-    system: "cat_system",
-};
-const ANCHOR_KIND_KEYS: Record<string, string> = {
-    usage: "ctx_anchor_kind_usage",
-    estimate: "ctx_anchor_kind_estimate",
-    upper: "ctx_anchor_kind_upper",
-};
-const SWITCH_KEYS: Record<string, string> = {
-    model: "ctx_switch_model",
-    key: "ctx_switch_key",
-    prompt: "ctx_switch_prompt",
-    restart: "ctx_switch_restart",
-};
-
-function categoryColor(key: string): string {
-    return CATEGORY_COLOR[key] ?? "#8b949e";
-}
-
-function categoryLabel(key: string, t: (k: string) => string): string {
-    const k = CATEGORY_LABEL_KEYS[key];
-    return k !== undefined ? t(k) : key;
-}
-
-function num(v: unknown): number {
-    return typeof v === "number" && Number.isFinite(v) ? v : 0;
-}
-
-function numOrNull(v: unknown): number | null {
-    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
-}
-
-function arr(v: unknown): unknown[] {
-    return Array.isArray(v) ? v : [];
-}
-
-function rec(v: unknown): Record<string, unknown> | null {
-    return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
-}
-
-function fmtTok(n: number): string {
-    if (!Number.isFinite(n)) return "?";
-    if (n < 1000) return String(Math.round(n));
-    if (n < 1_000_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-    return `${(n / 1_000_000).toFixed(2).replace(/\.?0+$/, "")}M`;
-}
-
-function fmtTime(at: number, lang: "zh" | "en"): string {
-    try {
-        return new Date(at).toLocaleTimeString(lang === "zh" ? "zh-CN" : "en-US", { hour: "2-digit", minute: "2-digit" });
-    } catch {
-        return "";
-    }
-}
-
-type CtxCategory = { key: string; tokens: number; pct: number };
-type CtxFoldEvent = { seq: number; at: number; s: number; sigma: number; reclaimed: number; savedSoFar: number };
-type CtxSwitchEvent = { dim: string; at: number; from: string | null; to: string; attributed: number };
-type CtxAnchor = { tokens: number; kind: string; at: number | null };
-type CtxView = { limit: number | null; sentTotal: number; growth: number; categories: CtxCategory[]; anchor: CtxAnchor | null; folds: CtxFoldEvent[]; switches: CtxSwitchEvent[] };
-type CtxStatus = { ok: boolean; phase?: string; panelPresent: boolean; contextView: CtxView | null };
 
 /** Parse the /__bili/plugin/status body into the tab's render shape. Every
  *  field is guard-wrapped: an older or foreign build answering the URL must
- *  yield `undefined` (→ degraded states), never a crash mid-render. */
+ *  yield `undefined` (→ degraded states), never a crash mid-render. Builds
+ *  that predate the ownership fields simply omit them ⇒ viaFallback false,
+ *  which preserves the historical render for those responses. */
 function parseCtxStatus(raw: unknown): CtxStatus | undefined {
-    const o = rec(raw);
+    const o = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
     if (o === null || typeof o.ok !== "boolean") return undefined;
-    let view: CtxView | null = null;
-    const v = rec(o.contextView);
-    if (v !== null) {
-        const a = rec(v.anchor);
-        view = {
-            limit: numOrNull(v.limit),
-            sentTotal: num(v.sentTotal),
-            growth: num(v.growth),
-            categories: arr(v.categories)
-                .map((c) => {
-                    const r = rec(c);
-                    return r === null || typeof r.key !== "string" || r.key.length === 0 ? undefined : { key: r.key, tokens: num(r.tokens), pct: num(r.pct) };
-                })
-                .filter((c): c is CtxCategory => c !== undefined),
-            anchor: a === null ? null : { tokens: num(a.tokens), kind: typeof a.kind === "string" ? a.kind : "estimate", at: typeof a.at === "number" ? a.at : null },
-            folds: arr(v.folds)
-                .map((f) => {
-                    const r = rec(f);
-                    return r === null ? undefined : { seq: num(r.seq), at: num(r.at), s: num(r.s), sigma: num(r.sigma), reclaimed: num(r.reclaimed), savedSoFar: num(r.savedSoFar) };
-                })
-                .filter((f): f is CtxFoldEvent => f !== undefined),
-            switches: arr(v.switches)
-                .map((s) => {
-                    const r = rec(s);
-                    return r === null || typeof r.dim !== "string" || r.dim.length === 0
-                        ? undefined
-                        : { dim: r.dim, at: num(r.at), from: typeof r.from === "string" ? r.from : null, to: typeof r.to === "string" ? r.to : "?", attributed: num(r.attributed) };
-                })
-                .filter((s): s is CtxSwitchEvent => s !== undefined),
-        };
-    }
-    return { ok: o.ok, phase: typeof o.phase === "string" ? o.phase : undefined, panelPresent: o.panel !== undefined, contextView: view };
+    return {
+        ok: o.ok,
+        phase: typeof o.phase === "string" ? o.phase : undefined,
+        panelPresent: o.panel !== undefined,
+        sessionId: typeof o.sessionId === "string" && o.sessionId.length > 0 ? o.sessionId : null,
+        conversationId: typeof o.conversationId === "string" && o.conversationId.length > 0 ? o.conversationId : null,
+        viaFallback: o.viaFallback === true,
+    };
+}
+
+/** #3816: the unreachable-by-construction notice for remote browsers
+ *  (loopback panel) — shared by the settings panel and the Context tab so the
+ *  fix text, relay snippet and jump target cannot drift between placements.
+ *  The jump button targets the panel's config page (#/config) in a fresh tab;
+ *  for a purely remote browser that address is still unreachable — the
+ *  file-edit text is the primary route, the button serves same-LAN/tunneled
+ *  access where it lands on the exact field to set. #3693: an optional error
+ *  readout rides underneath — the raw probe failure that PROVES the loopback
+ *  address is unreachable from this browser (evidence + copyable for reports). */
+function renderRemoteBlock(t: (key: string) => string, origin: string, errorReadout?: unknown): ReturnType<typeof createElement> {
+    const cfgUrl = `${origin}/__bili/#/config`;
+    return createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" } },
+        createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("remote_blocked")),
+        createElement(
+            "code",
+            {
+                style: {
+                    display: "block",
+                    padding: "6px 10px",
+                    borderRadius: 8,
+                    border: "1px solid rgba(127,127,127,0.4)",
+                    background: "rgba(127,127,127,0.08)",
+                    fontSize: 13,
+                    lineHeight: 1.6,
+                },
+            },
+            REMOTE_RELAY_SNIPPET,
+        ),
+        createElement(
+            "button",
+            { type: "button", title: cfgUrl, onClick: () => openExternal(cfgUrl), style: ACTION_BTN_STYLE },
+            t("remote_open_config"),
+        ),
+        errorReadout ?? null,
+    );
 }
 
 /** Shared open-in-browser action — one builder for the settings-panel footer,
@@ -262,6 +242,123 @@ function openWebButton(origin: string | undefined, t: (key: string) => string, s
         );
 }
 
+// #3693: one self-contained line for a failed probe/status read — the raw
+// engine message plus the URL that failed, so the copied text makes sense in
+// a support report without extra context. Duck-typed on purpose: fetch
+// failures cross realms in test sandboxes, where instanceof fails.
+function describeProbeError(err: unknown, url: string): string {
+    let msg: string;
+    const o = err !== null && typeof err === "object" ? (err as { message?: unknown }) : undefined;
+    if (o !== undefined && typeof o.message === "string" && o.message.length > 0) {
+        msg = o.message;
+    } else if (typeof err === "string" && err.length > 0) {
+        msg = err;
+    } else {
+        try {
+            msg = String(err);
+        } catch {
+            msg = "unknown error";
+        }
+    }
+    return `${msg} (${url})`;
+}
+
+// #3693: clipboard write with a legacy fallback — LAN-http pages (the exact
+// remote-access posture of #3693) are NOT secure contexts, so
+// navigator.clipboard is absent there and the execCommand path is what
+// actually copies. Resolves to whether the text landed on the clipboard.
+function copyText(text: string): Promise<boolean> {
+    const g = globalThis as {
+        navigator?: { clipboard?: { writeText?: (t: string) => Promise<unknown> } };
+        document?: {
+            body?: { appendChild?: (n: unknown) => void; removeChild?: (n: unknown) => void } | null;
+            createElement?: (tag: string) => unknown;
+            execCommand?: (cmd: string) => boolean;
+        };
+    };
+    const legacy = (): boolean => {
+        const doc = g.document;
+        if (!doc || typeof doc.createElement !== "function" || !doc.body || typeof doc.body.appendChild !== "function") return false;
+        const ta = doc.createElement("textarea") as Record<string, unknown> & { select?: () => void };
+        ta.value = text;
+        ta.style = { position: "fixed", opacity: 0 };
+        doc.body.appendChild(ta);
+        try {
+            ta.select?.();
+        } catch {
+            // non-DOM stand-in (test harness): selection is decorative there
+        }
+        const ok = doc.execCommand?.("copy") ?? false;
+        try {
+            doc.body.removeChild?.(ta);
+        } catch {
+            // ditto
+        }
+        return ok;
+    };
+    const clip = g.navigator?.clipboard;
+    if (clip !== undefined && typeof clip.writeText === "function") {
+        return clip.writeText(text).then(
+            () => true,
+            () => legacy(),
+        );
+    }
+    return Promise.resolve(legacy());
+}
+
+// #3693: the failure readout shared by every connecting/degraded face — the
+// raw error line in a selectable block plus an explicit copy action, so no
+// failure state hides its evidence behind a friendly hint. The `copied` flag
+// and the copy kick-off live with the PARENT component: hook order must stay
+// stable across renders, so no hook is called here.
+function renderProbeError(t: (key: string) => string, error: string, copied: boolean, onCopy: () => void): ReturnType<typeof createElement> {
+    return createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" } },
+        createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("probe_error")),
+        createElement(
+            "code",
+            {
+                style: {
+                    display: "block",
+                    padding: "6px 10px",
+                    borderRadius: 8,
+                    border: "1px solid rgba(127,127,127,0.4)",
+                    background: "rgba(127,127,127,0.08)",
+                    fontSize: 13,
+                    lineHeight: 1.6,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                },
+            },
+            error,
+        ),
+        createElement(
+            "button",
+            {
+                type: "button",
+                title: error,
+                onClick: onCopy,
+                style: { ...ACTION_BTN_STYLE, fontSize: 13, lineHeight: "20px", padding: "4px 14px" },
+            },
+            copied ? t("copied") : t("copy"),
+        ),
+    );
+}
+
+// #3693: hint headline with the optional error readout riding beneath it —
+// the hint wording stays untouched, the evidence is additive.
+function hintColumn(hint: unknown, box: unknown): unknown {
+    return box === null
+        ? hint
+        : createElement(
+            "div",
+            { style: { display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" } },
+            hint,
+            box,
+        );
+}
+
 // #3100: pre-flight for the framed face. Auto-update refreshes the profile
 // bundle on DISK while the long-running proxy child keeps serving the code it
 // booted with — and this browser half always runs the freshest disk code — so
@@ -276,7 +373,10 @@ function openWebButton(origin: string | undefined, t: (key: string) => string, s
 // routes mid-session.
 const EMBED_PROBE_PATH = "/__bili/?embed=1";
 type EmbedVerdict = "ok" | "stale";
-type EmbedState = { origin: string; verdict: EmbedVerdict };
+// #3693: verdict undefined + error set means "probe failed with evidence" —
+// transient by definition (never cached; retried on every poll tick), so the
+// face can show WHAT failed instead of spinning on "connecting…" forever.
+type EmbedState = { origin: string; verdict: EmbedVerdict | undefined; error?: string };
 const embedVerdicts = new Map<string, EmbedVerdict>();
 const embedProbesInFlight = new Set<string>();
 
@@ -307,8 +407,12 @@ function probeEmbedRoute(origin: string, onVerdict: (state: EmbedState) => void)
             }
             onVerdict({ origin, verdict });
         })
-        .catch(() => {
-            // unreachable right now: no verdict, the next poll tick retries
+        .catch((err: unknown) => {
+            // #3693: unreachable right now — report the failure verbatim so
+            // the face shows WHAT failed instead of spinning forever. Unlike
+            // ok/stale this is deliberately NOT cached: a network error is
+            // transient, the next poll tick retries and replaces it.
+            onVerdict({ origin, verdict: undefined, error: describeProbeError(err, `${origin}${EMBED_PROBE_PATH}`) });
         })
         .finally(() => {
             embedProbesInFlight.delete(origin);
@@ -391,33 +495,19 @@ const zh: Dict = {
     "tab_sessions": "会话",
     "tab_config": "配置",
     "tab_logs": "日志",
+    "tab_updates": "版本",
+    "tab_blog": "博客",
     "tab_ctx": "上下文",
-    "ctx_sent": "发送到模型（压缩后，估算）",
-    "ctx_anchor": "计费口径",
-    "ctx_anchor_kind_usage": "usage 实测",
-    "ctx_anchor_kind_estimate": "估算（锚定 usage）",
-    "ctx_anchor_kind_upper": "上界估算",
-    "cat_sysprompt": "系统提示与工具定义",
-    "cat_tool": "工具调用与结果",
-    "cat_text": "对话文本",
-    "cat_code": "代码",
-    "cat_summaries": "压缩摘要",
-    "cat_system": "历史系统消息",
-    "ctx_events": "事件",
-    "ctx_fold": "压缩",
-    "ctx_reclaimed": "回收",
-    "ctx_saved": "累计节省",
-    "ctx_switch_model": "模型切换",
-    "ctx_switch_key": "密钥切换",
-    "ctx_switch_prompt": "提示词变化",
-    "ctx_switch_restart": "代理重启",
-    "ctx_empty_events": "本会话暂无压缩或切换事件。",
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
-    "ctx_stale": "运行中的 bili 代理比已安装的配置文件旧：本页面已加载新版界面，但代理进程尚未提供结构化上下文数据（重启后即可）。恢复前可点下方按钮打开 Web UI。",
-    "ctx_stale_data": "数据可能不是最新。",
     "ctx_refresh": "刷新",
-    "ctx_hint": "柱状图为 bili 代理实时重算的估算口径；计费行来自 provider 实测 usage——两者口径不同，不可直接相减。",
+    "upstreams_label": "bili 上游状态",
+    "upstreams_down_one": "1 个上游不可用",
+    "upstreams_down_many": "{n} 个上游不可用",
+    "upstream_retry_hint": "约 {s}s 后重试",
+    "probe_error": "连接 bili 代理失败——最近一次探测报出的错误（可复制，便于反馈）：",
+    "copy": "复制",
+    "copied": "已复制",
 };
 
 const en: Dict = {
@@ -434,33 +524,19 @@ const en: Dict = {
     "tab_sessions": "Sessions",
     "tab_config": "Config",
     "tab_logs": "Logs",
+    "tab_updates": "Versions",
+    "tab_blog": "Blog",
     "tab_ctx": "Context",
-    "ctx_sent": "Sent to model (post-compression, est.)",
-    "ctx_anchor": "Billed reading",
-    "ctx_anchor_kind_usage": "provider-measured usage",
-    "ctx_anchor_kind_estimate": "estimate anchored on usage",
-    "ctx_anchor_kind_upper": "upper-bound estimate",
-    "cat_sysprompt": "System prompt & tool defs",
-    "cat_tool": "Tool calls & results",
-    "cat_text": "Conversation text",
-    "cat_code": "Code",
-    "cat_summaries": "Compression summaries",
-    "cat_system": "Historic system messages",
-    "ctx_events": "Events",
-    "ctx_fold": "Fold",
-    "ctx_reclaimed": "reclaimed",
-    "ctx_saved": "saved so far",
-    "ctx_switch_model": "Model switch",
-    "ctx_switch_key": "Key switch",
-    "ctx_switch_prompt": "Prompt change",
-    "ctx_switch_restart": "Proxy restart",
-    "ctx_empty_events": "No compression or switch events yet.",
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
-    "ctx_stale": "The running bili proxy is older than the installed profile: this page already runs the new face, but the proxy process does not serve structured context data yet (a restart fixes it). Until then, use the button below to open the Web UI directly.",
-    "ctx_stale_data": "Data may be stale.",
     "ctx_refresh": "Refresh",
-    "ctx_hint": "The bar is the proxy's live recompute on the estimate scale; the billed line uses provider-measured usage — different scales, never subtract them.",
+    "upstreams_label": "bili upstream status",
+    "upstreams_down_one": "1 upstream unavailable",
+    "upstreams_down_many": "{n} upstreams unavailable",
+    "upstream_retry_hint": "~{s}s until retry",
+    "probe_error": "Failed to reach the bili proxy — last probe error (copyable for reporting):",
+    "copy": "Copy",
+    "copied": "Copied",
 };
 
 function readOrigin(): string | undefined {
@@ -472,6 +548,21 @@ function readOrigin(): string | undefined {
     if (snap !== undefined && snap.relay === true) return "";
     const origin = snap?.origin;
     return typeof origin === "string" && origin.length > 0 ? origin : undefined;
+}
+
+/** #4237: Context-tab face flags from the __BILI__ snapshot (host half,
+ *  dsh.contextTab / dsh.contextTabLabel): `hidden` drops the conversation.view
+ *  registration entirely (the top-bar entry only — compression is untouched),
+ *  `label` overrides the built-in "上下文"/"Context" for machines where another
+ *  plugin occupies the same name. Both fail open: absent fields (legacy host,
+ *  pre-bootstrap page load) keep today's behavior byte-identical. */
+function readCtxTabFace(): { hidden: boolean; label: string | undefined } {
+    const g = globalThis as { __BILI__?: { contextTab?: unknown; contextTabLabel?: unknown } };
+    const snap = g.__BILI__;
+    const hidden = snap !== undefined && snap.contextTab === false;
+    const raw = snap?.contextTabLabel;
+    const label = typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+    return { hidden, label };
 }
 
 function openExternal(url: string): void {
@@ -519,6 +610,37 @@ function remoteMismatch(origin: string | undefined): boolean {
     const g = globalThis as { location?: { hostname?: unknown } };
     const pageHost = typeof g.location?.hostname === "string" ? g.location.hostname : "";
     return pageHost.length > 0 && !isLoopbackHost(pageHost);
+}
+
+// #4254: one row of GET /__bili/upstreams as consumed by the shell.overlay pill.
+// host already carries the port ("127.0.0.1:7864"); code is the errno token
+// (ECONNREFUSED/...), count the consecutive-failure tally, nextProbeInMs only
+// exists while that host's circuit is OPEN (it is the "retry in ~Ns" ETA).
+type UpstreamRow = { host: string; kind: string; code?: string; count: number; nextProbeInMs?: number };
+
+/** #4254: defensively parse the /__bili/upstreams report into render rows —
+ *  a malformed or partial payload yields fewer rows, never a throw, so a broken
+ *  health report can never break the DSH client. */
+function parseUpstreamHealth(raw: unknown): UpstreamRow[] {
+    if (typeof raw !== "object" || raw === null) return [];
+    const list = (raw as { upstreams?: unknown }).upstreams;
+    if (!Array.isArray(list)) return [];
+    const rows: UpstreamRow[] = [];
+    for (const item of list) {
+        if (typeof item !== "object" || item === null) continue;
+        const o = item as Record<string, unknown>;
+        const host = typeof o.host === "string" && o.host.length > 0 ? o.host : undefined;
+        if (host === undefined) continue;
+        const kind = typeof o.kind === "string" && o.kind.length > 0 ? o.kind : "unknown";
+        const code = typeof o.code === "string" && o.code.length > 0 ? o.code : undefined;
+        const count = typeof o.count === "number" && Number.isFinite(o.count) ? Math.max(0, Math.round(o.count)) : 0;
+        const circuit = (typeof o.circuit === "object" && o.circuit !== null ? o.circuit : undefined) as { state?: unknown; nextProbeInMs?: unknown } | undefined;
+        const probe = circuit !== undefined && circuit.state === "open" && typeof circuit.nextProbeInMs === "number" && Number.isFinite(circuit.nextProbeInMs)
+            ? Math.max(0, circuit.nextProbeInMs)
+            : undefined;
+        rows.push({ host, kind, code, count, ...(probe !== undefined ? { nextProbeInMs: probe } : {}) });
+    }
+    return rows;
 }
 
 // #3373: gateways that mount dsh web under a path prefix re-map every URL
@@ -609,29 +731,76 @@ export function apply(ctx: ClientContext): void {
         "bili: dictionaries",
     );
     const t = ctx.locale.bind(NS);
-    // #3862: per-session Context tab (conversation.view slot). Native DOM card
-    // fed by the proxy's live contextView — see parseCtxStatus for the wire
-    // contract and src/context-view.ts for the scale discipline.
-    const contextPanel = (): ((props: Record<string, unknown>) => unknown) => () => {
+    // #3862: per-session Context tab (conversation.view slot). Embeds the web
+    // UI's OWN session page (?embed=1 + #/session/<id>) — the same framed face
+    // the settings panel drives, so the compression tree and ledger readouts
+    // live in ONE place instead of a second native re-rendering of them. The
+    // session id comes from the status poll above; while it is unknown (no
+    // request yet / chain-advisory) the tab shows an honest hint, never a
+    // stale or empty frame.
+    const contextPanel = (): ((props?: Record<string, unknown>) => unknown) => (props) => {
+        // The host names this conversation to every conversation.view entry
+        // (props.sessionId — the same id the dsh lane stamps on
+        // x-bili-plugin-conversation), so the poll targets OUR session. Old
+        // hosts pass nothing ⇒ the legacy literal path (unchanged).
+        const hostSessionId =
+            props !== undefined && typeof props.sessionId === "string" && props.sessionId.length > 0
+                ? props.sessionId
+                : undefined;
+        const statusPath = ctxStatusPathFor(hostSessionId);
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
+        // #2559: pin the frame palette to the host ground, same discipline as
+        // the settings panel (sampled synchronously for first paint).
+        const [theme, setTheme] = useState<("light" | "dark") | undefined>(detectHostTheme);
+        // #3100: embed pre-flight verdict for the CURRENT origin — a verdict
+        // recorded for a previous origin (mid-session re-bind) is stale by
+        // definition until its own probe lands (shared cache with panel()).
+        const [embed, setEmbed] = useState<EmbedState | undefined>(() => {
+            const o = readOrigin();
+            const v = o !== undefined ? embedVerdicts.get(o) : undefined;
+            return o !== undefined && v !== undefined ? { origin: o, verdict: v } : undefined;
+        });
+        const [sessionId, setSessionId] = useState<string | null>(null);
         const [status, setStatus] = useState<CtxStatus | undefined>(undefined);
         const [fetchFailed, setFetchFailed] = useState(false);
+        // #3693: last status-read failure — surfaced verbatim beneath the
+        // degraded hint instead of being swallowed by it. Declared
+        // unconditionally so hook order stays stable across renders.
+        const [statusError, setStatusError] = useState<string | undefined>(undefined);
+        const [copied, setCopied] = useState(false);
         const [reloadTick, setReloadTick] = useState(0);
-        useEffect(() => probeOrigin(setOrigin), []);
+        // #3100: every resolution probes the new origin's embed route in
+        // flight, and every poll tick re-drives pending origins (snapshot-only
+        // hosts never resolve through onOrigin again after mount).
+        useEffect(() => probeOrigin((o) => { setOrigin(o); probeEmbedRoute(o, setEmbed); }, setTheme, (o) => probeEmbedRoute(o, setEmbed)), []);
+        useEffect(() => {
+            if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
+        }, [origin]);
         useEffect(() => {
             if (origin === undefined) return;
             let cancelled = false;
             const load = (): void => {
-                void fetch(`${origin}${CTX_STATUS_PATH}`)
-                    .then((res) => res.json() as Promise<unknown>)
+                void fetch(`${origin}${statusPath}`)
+                    .then((res) => {
+                        // #3693: a non-ok answer carries no contract body —
+                        // surface its status code instead of parsing it blind.
+                        if (res.ok !== true) throw new Error(`HTTP ${typeof res.status === "number" ? res.status : "?"}`);
+                        return res.json() as Promise<unknown>;
+                    })
                     .then((raw) => {
                         if (cancelled) return;
                         const parsed = parseCtxStatus(raw);
                         setStatus(parsed);
                         setFetchFailed(parsed === undefined);
+                        setStatusError(undefined);
+                        setSessionId(parsed !== undefined && parsed.sessionId !== null ? parsed.sessionId : null);
                     })
-                    .catch(() => {
-                        if (!cancelled) setFetchFailed(true);
+                    .catch((err: unknown) => {
+                        if (!cancelled) {
+                            setStatus(undefined);
+                            setFetchFailed(true);
+                            setStatusError(describeProbeError(err, `${origin}${statusPath}`));
+                        }
                     });
             };
             load();
@@ -640,109 +809,95 @@ export function apply(ctx: ClientContext): void {
                 cancelled = true;
                 clearInterval(timer);
             };
-        }, [origin, reloadTick]);
+        }, [origin, reloadTick, statusPath]);
+        const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3693: the live probe's last network failure (transient — retried
+        // every poll tick until a verdict lands).
+        const liveEmbedError: string | undefined = embed !== undefined && embed.origin === origin ? embed.error : undefined;
+        // #3816: remote page + loopback origin ⇒ unreachable by construction —
+        // ANY resolved verdict outranks the mismatch (a verdict means THIS
+        // browser actually reached the origin).
+        const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        // Ownership gate: a fallback-resolved row describes whatever ran LAST
+        // globally — possibly a sibling conversation or a delegate sub-agent.
+        // With a known host identity such a row is not ours ⇒ fall through to
+        // the not-yet hint instead of framing someone else's session page.
+        // Exact hits are trusted unconditionally; legacy responses (field
+        // absent) behave exactly as before.
+        const sessionOurs =
+            hostSessionId === undefined ||
+            status === undefined ||
+            status.viaFallback !== true ||
+            status.conversationId === hostSessionId;
+        // #4281: framed ⇒ fill the whole conversation view (full-height
+        // column, no outer padding, borderless frame on flex:1, slim top
+        // action row); every hint state keeps its own breathing room.
+        const framed = origin !== undefined && liveEmbed === "ok" && sessionId !== null && sessionOurs;
         const hintP = (key: string): unknown => createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(key));
-        const renderCard = (view: CtxView): unknown => {
-            const pctOfLimit = view.limit !== null && view.limit > 0 ? Math.round((view.sentTotal / view.limit) * 100) : null;
-            const anchorKindKey = view.anchor !== null ? ANCHOR_KIND_KEYS[view.anchor.kind] : undefined;
-            const events: Array<{ at: number; head: string; detail: string }> = [];
-            for (const f of view.folds) {
-                const saved = f.savedSoFar > 0 ? ` · ${t("ctx_saved")} ${fmtTok(f.savedSoFar)}` : "";
-                events.push({ at: f.at, head: `${t("ctx_fold")} #${f.seq}`, detail: `−${fmtTok(f.s)} → σ ${fmtTok(f.sigma)} · ${t("ctx_reclaimed")} ${fmtTok(f.reclaimed)}${saved}` });
-            }
-            for (const s of view.switches) {
-                const key = SWITCH_KEYS[s.dim];
-                if (key === undefined) continue;
-                const attr = s.attributed > 0 ? ` · ~${fmtTok(s.attributed)}` : "";
-                events.push({ at: s.at, head: t(key), detail: `${s.from ?? "?"} → ${s.to}${attr}` });
-            }
-            events.sort((a, b) => b.at - a.at);
-            return createElement(
-                "div",
-                { style: { display: "flex", flexDirection: "column", gap: 10 } },
-                fetchFailed ? createElement("p", { style: { margin: 0, opacity: 0.6, fontSize: 12 } }, t("ctx_stale_data")) : null,
-                createElement(
-                    "div",
-                    { style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, flexWrap: "wrap" } },
-                    createElement(
-                        "div",
-                        null,
-                        createElement("div", { style: { fontSize: 18, fontWeight: 600 } }, `${fmtTok(view.sentTotal)} / ${view.limit !== null ? fmtTok(view.limit) : "—"}${pctOfLimit !== null ? ` (${pctOfLimit}%)` : ""}`),
-                        createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 12 } }, t("ctx_sent")),
-                    ),
-                    view.anchor !== null
-                        ? createElement("span", { style: { opacity: 0.85, fontSize: 13 } }, `${t("ctx_anchor")} ${fmtTok(view.anchor.tokens)} · ${anchorKindKey !== undefined ? t(anchorKindKey) : view.anchor.kind}`)
-                        : null,
-                ),
-                createElement(
-                    "div",
-                    { style: { display: "flex", height: 10, borderRadius: 5, overflow: "hidden", background: "rgba(127,127,127,0.18)" } },
-                    view.categories.map((c) =>
-                        createElement("div", {
-                            key: c.key,
-                            title: `${categoryLabel(c.key, t)}: ${fmtTok(c.tokens)} (${c.pct}%)`,
-                            style: { width: `${c.tokens > 0 ? Math.max(c.pct, 1.5) : 0}%`, height: "100%", background: categoryColor(c.key) },
-                        }),
-                    ),
-                ),
-                createElement(
-                    "div",
-                    { style: { display: "flex", flexDirection: "column", gap: 4 } },
-                    view.categories.map((c) =>
-                        createElement(
-                            "div",
-                            { key: c.key, style: { display: "flex", alignItems: "center", gap: 8, fontSize: 13 } },
-                            createElement("span", { style: { width: 10, height: 10, borderRadius: 2, background: categoryColor(c.key), flexShrink: 0 } }),
-                            createElement("span", { style: { flex: 1 } }, categoryLabel(c.key, t)),
-                            createElement("span", { style: { opacity: 0.85 } }, `${fmtTok(c.tokens)} (${c.pct}%)`),
-                        ),
-                    ),
-                ),
-                createElement(
-                    "div",
-                    { style: { display: "flex", flexDirection: "column", gap: 6 } },
-                    createElement("div", { style: { fontSize: 13, fontWeight: 600, opacity: 0.85 } }, t("ctx_events")),
-                    events.length === 0
-                        ? createElement("p", { style: { margin: 0, opacity: 0.6, fontSize: 13 } }, t("ctx_empty_events"))
-                        : events.slice(0, CTX_EVENT_ROWS).map((e, i) =>
-                            createElement(
-                                "div",
-                                { key: i, style: { display: "flex", justifyContent: "space-between", gap: 12, fontSize: 12, alignItems: "baseline" } },
-                                createElement("span", { style: { opacity: 0.7 } }, `${fmtTime(e.at, lang)}  ${e.head}`),
-                                createElement("span", { style: { opacity: 0.85 } }, e.detail),
-                            ),
-                        ),
-                ),
-                createElement("p", { style: { margin: 0, opacity: 0.55, fontSize: 12, lineHeight: 1.6 } }, t("ctx_hint")),
-            );
+        // #3693: kick off a clipboard write of the readout line; the label
+        // flips to "copied" briefly on success.
+        const startCopy = (target: string): void => {
+            void copyText(target).then((ok) => {
+                if (!ok) return;
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+            });
         };
+        const errorBox = (error: string | undefined): unknown =>
+            error === undefined
+                ? null
+                : renderProbeError(t, error, copied, () => startCopy(error));
         let middle: unknown;
         if (origin === undefined) {
             middle = hintP("degraded");
+        } else if (remoteBlocked) {
+            middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
+        } else if (liveEmbed === "stale") {
+            // Frozen proxy predates the ?embed=1 route: framing is impossible
+            // on any page, including the session one.
+            middle = hintP("stale");
+        } else if (framed) {
+            middle = createElement(
+                "iframe",
+                {
+                    src: `${origin}/__bili/?embed=1&lang=${lang}${theme !== undefined ? `&theme=${theme}` : ""}#/session/${encodeURIComponent(sessionId)}`,
+                    title: t("title"),
+                    style: {
+                        display: "block",
+                        flex: 1,
+                        width: "100%",
+                        height: "100%",
+                        minHeight: 0,
+                        border: "none",
+                        background: "transparent",
+                    },
+                },
+            );
         } else if (status?.ok === true && status.phase === "pre-first-request") {
+            // No session row exists yet: waiting is truthful, framing impossible.
             middle = hintP("ctx_waiting");
-        } else if (status?.ok === true && status.contextView === null) {
-            // chain-advisory (#1357) also answers with a panel string but is NOT
-            // a stale running build — read it as not-yet, never as "restart fixes
-            // it".
-            middle = hintP(status.panelPresent && status.phase !== "chain-advisory" ? "ctx_stale" : "ctx_nodata");
         } else if (status === undefined) {
-            middle = hintP(fetchFailed ? "degraded" : "connecting");
+            middle = hintColumn(hintP(fetchFailed ? "degraded" : "connecting"), errorBox(fetchFailed ? statusError : undefined));
         } else if (!status.ok) {
             middle = hintP("ctx_nodata");
         } else {
-            middle = renderCard(status.contextView!);
+            // Session resolved but the embed verdict has not landed yet (first
+            // probe tick) — or a status build that answers without a session id:
+            // honest connecting / not-yet hints instead of an empty frame.
+            // chain-advisory lands here with liveEmbed "ok" ⇒ ctx_nodata, and
+            // must NEVER read as a stale-build claim. #3693: if the embed
+            // probe itself is failing, its raw error rides beneath the hint.
+            middle = hintColumn(hintP(liveEmbed === "ok" ? "ctx_nodata" : "connecting"), errorBox(liveEmbedError));
         }
         return createElement(
             "div",
-            { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
-            middle,
-            createElement(
-                "div",
-                { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
-                origin !== undefined
-                    ? createElement(
+            { style: { display: "flex", flexDirection: "column", height: "100%", minWidth: 0, minHeight: 0 } },
+            origin !== undefined
+                ? createElement(
+                    "div",
+                    { style: { display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "8px 12px" } },
+                    createElement(
                         "button",
                         {
                             type: "button",
@@ -750,9 +905,14 @@ export function apply(ctx: ClientContext): void {
                             style: { cursor: "pointer", borderRadius: 8, border: "1px solid rgba(127,127,127,0.4)", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 13, lineHeight: "20px", padding: "4px 14px" },
                         },
                         t("ctx_refresh"),
-                    )
-                    : null,
-                openWebButton(origin, t, { fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+                    ),
+                    openWebButton(origin, t, { fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
+                )
+                : null,
+            createElement(
+                "div",
+                { style: framed ? { display: "flex", flex: 1, minHeight: 0 } : { flex: 1, minHeight: 0, padding: 16 } },
+                middle,
             ),
         );
     };
@@ -770,6 +930,9 @@ export function apply(ctx: ClientContext): void {
             const v = o !== undefined ? embedVerdicts.get(o) : undefined;
             return o !== undefined && v !== undefined ? { origin: o, verdict: v } : undefined;
         });
+        // #3693: copy feedback for the probe-error readout — declared
+        // unconditionally so hook order stays stable across renders.
+        const [copied, setCopied] = useState(false);
         // #2288: no guard on the snapshot — the live route is authoritative
         // for the whole mount, so a stale boot value is corrected in place.
         // #3100: each resolution also probes the new origin's embed route in
@@ -793,6 +956,9 @@ export function apply(ctx: ClientContext): void {
             if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3693: the live probe's last network failure (transient — retried
+        // every poll tick until a verdict lands).
+        const liveEmbedError: string | undefined = embed !== undefined && embed.origin === origin ? embed.error : undefined;
         // #3816: remote page + loopback origin ⇒ unreachable by construction —
         // explain the fix instead of spinning on "connecting…". ANY resolved
         // verdict outranks the mismatch: a verdict means THIS browser actually
@@ -801,6 +967,19 @@ export function apply(ctx: ClientContext): void {
         // notice of a reachable-but-frozen proxy.
         const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        // #3693: kick off a clipboard write of the readout line; the label
+        // flips to "copied" briefly on success.
+        const startCopy = (target: string): void => {
+            void copyText(target).then((ok) => {
+                if (!ok) return;
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+            });
+        };
+        const errorBox = (error: string | undefined): unknown =>
+            error === undefined
+                ? null
+                : renderProbeError(t, error, copied, () => startCopy(error));
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
@@ -809,33 +988,9 @@ export function apply(ctx: ClientContext): void {
             // fresh tab. For a purely remote browser that address is still
             // unreachable — the file-edit text above is the primary route;
             // the button serves same-LAN/tunneled access where it lands on
-            // the exact field to set.
-            const cfgUrl = `${origin}/__bili/#/config`;
-            middle = createElement(
-                "div",
-                { style: { display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" } },
-                createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("remote_blocked")),
-                createElement(
-                    "code",
-                    {
-                        style: {
-                            display: "block",
-                            padding: "6px 10px",
-                            borderRadius: 8,
-                            border: "1px solid rgba(127,127,127,0.4)",
-                            background: "rgba(127,127,127,0.08)",
-                            fontSize: 13,
-                            lineHeight: 1.6,
-                        },
-                    },
-                    REMOTE_RELAY_SNIPPET,
-                ),
-                createElement(
-                    "button",
-                    { type: "button", title: cfgUrl, onClick: () => openExternal(cfgUrl), style: ACTION_BTN_STYLE },
-                    t("remote_open_config"),
-                ),
-            );
+            // the exact field to set. #3693: the raw probe failure proving
+            // the unreachability rides underneath, copyable for reports.
+            middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
         } else if (liveEmbed === "stale") {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
         } else if (liveEmbed === "ok") {
@@ -887,7 +1042,12 @@ export function apply(ctx: ClientContext): void {
                 }),
             );
         } else {
-            middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("connecting"));
+            // #3693: "connecting…" alone hid every failure — when the probe is
+            // actually failing, its raw error rides beneath the hint.
+            middle = hintColumn(
+                createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("connecting")),
+                errorBox(liveEmbedError),
+            );
         }
         return createElement(
             "div",
@@ -905,6 +1065,44 @@ export function apply(ctx: ClientContext): void {
             ),
         );
     };
+    // #4254 defect ②: frame-level upstream-unavailable pill (shell.overlay slot).
+    // Polls the loopback-gated GET /__bili/upstreams read surface (#4257) and
+    // renders one row per unreachable upstream; returns null while every upstream
+    // is reachable, so the banner auto-dismisses when circuits close + alerts clear.
+    // Purely additive UI — no request path changes. Display identity is the
+    // forwarded host:port (bili is a transparent pipe); provider/model reverse
+    // lookup stays host-side.
+    const upstreamBanner = (): ((props?: Record<string, unknown>) => unknown) => () => {
+        const [origin, setOrigin] = useState<string | undefined>(readOrigin());
+        const [rows, setRows] = useState<UpstreamRow[]>([]);
+        useEffect(() => probeOrigin((o) => setOrigin(o)), []);
+        useEffect(() => {
+            if (origin === undefined) return;
+            let cancelled = false;
+            const load = (): void => {
+                void fetch(`${origin}/__bili/upstreams`)
+                    .then((res) => res.json() as Promise<unknown>)
+                    .then((raw) => { if (!cancelled) setRows(parseUpstreamHealth(raw)); })
+                    .catch(() => { if (!cancelled) setRows([]); });
+            };
+            load();
+            const timer: ReturnType<typeof setInterval> = setInterval(load, UPSTREAM_POLL_MS);
+            return () => { cancelled = true; clearInterval(timer); };
+        }, [origin]);
+        if (rows.length === 0) return null;
+        const header = rows.length === 1 ? t("upstreams_down_one") : t("upstreams_down_many").replace("{n}", String(rows.length));
+        return createElement(
+            "div",
+            { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "8px 12px", borderRadius: 8, border: "1px solid rgba(217,63,11,0.5)", background: "rgba(217,63,11,0.1)" } },
+            createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, header),
+            ...rows.map((r) => {
+                const code = r.code !== undefined ? ` ${r.code}` : "";
+                const s = r.nextProbeInMs !== undefined ? Math.max(1, Math.ceil(r.nextProbeInMs / 1000)) : undefined;
+                const eta = s !== undefined ? ` · ${t("upstream_retry_hint").replace("{s}", String(s))}` : "";
+                return createElement("div", { key: r.host, style: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.5 } }, `${r.host} · ${r.kind}${code} ×${r.count}${eta}`);
+            }),
+        );
+    };
     ctx.slots.inject(
         "settings.section",
         () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
@@ -916,9 +1114,24 @@ export function apply(ctx: ClientContext): void {
     // #3862: session Context tab. order 30 sits right of the built-in chat (0)
     // and trajectory (10) tabs and right of dsh-context's Context tab (20)
     // when both are installed. Deferred injection is fail-open on hosts whose
-    // build lacks the slot.
+    // build lacks the slot. #4237: dsh.contextTab=false (web settings / config
+    // file / BILI_DSH_CONTEXT_TAB=0) skips this slot entirely — hiding removes
+    // only the top-bar entry; the ledger stays reachable through the settings
+    // section, the plugin bundle config face, the Web UI and /acp. A custom
+    // label (dsh.contextTabLabel) replaces the built-in name where another
+    // plugin occupies it.
+    const ctxGate = readCtxTabFace();
+    if (!ctxGate.hidden) {
+        ctx.slots.inject(
+            "conversation.view",
+            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
+        );
+    }
+    // #4254 defect ②: frame-level upstream-unavailable pill. Deferred injection
+    // is fail-open on hosts whose build lacks the shell.overlay slot (same
+    // discipline as the session Context tab above).
     ctx.slots.inject(
-        "conversation.view",
-        () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => t("tab_ctx"), locale: NS }, contextPanel()),
+        "shell.overlay",
+        () => ctx.slots.register({ name: "shell.overlay", id: "bili-upstreams", order: 100, label: () => t("upstreams_label"), locale: NS }, upstreamBanner()),
     );
 }

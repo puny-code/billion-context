@@ -11,7 +11,7 @@
  *
  *   bili pi     [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili codex  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE
- *   bili claude [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+ *   bili claude [-- client args...]   ANTHROPIC_BASE_URL /bili/ — no proxy env
  *   bili kimi   [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS (cert-MITM)
  *   bili aider  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE (cert-MITM)
  *   bili crush  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE (cert-MITM)
@@ -38,6 +38,7 @@ import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import { isPrivateUpstreamHost } from "./private-host.js";
+import { redactProxyUrl } from "./upstream-fail.js";
 import {
     claimStartingMarker,
     clearStartingMarker,
@@ -54,12 +55,13 @@ import {
     type ProxyStartingMarker,
 } from "./instance.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
+import { stateDir } from "./paths.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
-import { log as teeLog } from "./logger.js";
+import { log as teeLog, logTimestamp } from "./logger.js";
 import { VERSION } from "./version.js";
 import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
@@ -72,7 +74,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
@@ -162,7 +164,7 @@ import { conflictRemediation } from "./conflict-watch.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "pi-test", "pi-inline", "opencode-inline"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
 type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity";
 
@@ -238,6 +240,7 @@ interface LaunchOptions {
      *  wildcard. Without this, pi and codex with identical config shape
      *  silently shared one proxy and cross-wrote each other's state. */
     lane?: string;
+    recoverDegradedDsh?: boolean;
 }
 
 interface ProxyHandle {
@@ -302,7 +305,14 @@ export interface LauncherDeps {
     attachDiag?: (msg: string) => void;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
      *  Default hits the real endpoint; tests stub it. */
-    requestInstanceShutdown?: (origin: string) => Promise<boolean>;
+    requestInstanceShutdown?: (origin: string, expected?: { instanceId: string; pid: number; ownerPid?: number }) => Promise<boolean>;
+    isRecoveryPidAlive?: (pid: number) => boolean;
+    /** Opt-in DSH recovery only: terminate a resident that is provably OUR
+     *  install AND completely unresponsive (health endpoint answers nothing).
+     *  Such a process holds the port and index.db while serving no session, so
+     *  leaving it in place only wedges the lane on DIRECT sends. Never used for
+     *  a resident that still answers health, degraded or not. */
+    terminatePid?: (pid: number) => void;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -332,7 +342,7 @@ export function isLaunchClient(value: string): value is ClientName {
 }
 
 export function baseClientName(client: ClientName): BaseClientName {
-    return client === "pi-test" ? "pi" : client;
+    return client === "pi-test" || client === "pi-inline" ? "pi" : client === "opencode-inline" ? "opencode" : client;
 }
 
 /** `pi-test` injects `--no-extensions` so the billion-context-pi client extension doesn't double-compress alongside the proxy. */
@@ -603,10 +613,13 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
     };
 
     if (client === "claude") {
-        // Claude Code's undici fetch ignores HTTPS_PROXY, so cert MITM cannot
-        // intercept it. Route every upstream — raw HTTP, raw HTTPS, or already
-        // wrapped at a previous proxy origin — through the /bili/ URL form via
-        // ANTHROPIC_BASE_URL instead (claude honors that env var natively).
+        // Route every upstream — raw HTTP, raw HTTPS, or already wrapped at a
+        // previous proxy origin — through the /bili/ URL form via
+        // ANTHROPIC_BASE_URL instead of cert MITM (claude honors that env var
+        // natively). Old builds ignored proxy envs outright; newer builds
+        // (e.g. 2.1.301) honour HTTPS_PROXY, so buildClientEnv merges the
+        // loopback hosts into NO_PROXY/no_proxy to keep the /bili/ leg direct
+        // regardless of which behavior the child has (#3446).
         // Unparseable base URL: leave routes empty (proxy still runs; claude
         // falls back to its own default endpoint).
         relayWrapRoute(acc, config.claude?.anthropicBaseUrl, "https://api.anthropic.com", "ANTHROPIC_BASE_URL");
@@ -949,9 +962,12 @@ export function buildPiEnv(
 }
 
 // --- #1440 P3: one preset table + one builder behind the per-client
-// buildXxxEnv wrappers. Every client shares the same core —
+// buildXxxEnv wrappers. The MITM clients share one core —
 // `{ ...baseEnv, HTTPS_PROXY=<origin>, <CA var(s)>=<caPath>,
-// BILLION_CONTEXT_PROXY=<origin> }` — plus optional static extras (NO_PROXY
+// BILLION_CONTEXT_PROXY=<origin> }`; a `proxy: false` row drops the two
+// TLS-layer vars and routes through a base URL instead, because a plain http
+// loopback URL needs neither a proxy nor an extra root. Either core carries
+// optional static extras (NO_PROXY
 // loopback pairs), an aider-only conditional HTTP_PROXY, and/or the single
 // base-URL override env resolved from discovered rewrites (http upstreams →
 // /bili/-wrapped value, https upstreams → raw value; when both exist the
@@ -1013,7 +1029,18 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #1049: amp is a Go binary like copilot — same cert-MITM contract.
     amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
-    claude: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"] },
+    /** No proxy/CA env: the /bili/ URL in ANTHROPIC_BASE_URL (and
+     *  ANTHROPIC_VERTEX_BASE_URL) is plain http on loopback, so there is no TLS
+     *  hop for a proxy to tunnel and no certificate for NODE_EXTRA_CA_CERTS to
+     *  vouch for. What a bili-owned HTTPS_PROXY did here depended on the client
+     *  build — older ones ignored it, Claude Code >= 2.1.301 honours it and the
+     *  /bili/ leg self-tunnelled (#3446) — and either way every child process
+     *  inherited it, so in-session curl/git/npm issued CONNECT through bili's
+     *  MITM and logged tunnel destinations the token cache never sees. The
+     *  child's own egress now comes from the aux-proxy handoff in the spawn path
+     *  instead. The loopback exclusion that keeps the /bili/ leg direct when the
+     *  child DOES carry a proxy lives in mergeLoopbackNoProxy (#3446). */
+    claude: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"] },
     codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
     /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
      *  override env), so the launcher can only route it via cert MITM: its
@@ -1052,6 +1079,37 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     antigravity: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["CLOUD_CODE_URL"] },
 };
 
+/** #3446: when the base-URL override buildClientEnv writes points back at our
+ *  own loopback origin (the /bili/ form), the child must be able to reach it
+ *  DIRECTLY. Recent client builds honour proxy envs — Claude Code ≥2.1.301
+ *  routes its base-URL traffic through HTTPS_PROXY, so the /bili/ request
+ *  tunnels into this same listener (pre-#3251: 403 self-tunnel denial; with
+ *  it: a wasted forward-proxy hop). Merge the loopback hosts into
+ *  NO_PROXY/no_proxy preserving whatever the user already set in either case
+ *  variant (the claude lane spawns with raw process.env), never overwrite. */
+function mergeLoopbackNoProxy(env: NodeJS.ProcessEnv): void {
+    const parts: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of [env.NO_PROXY, env.no_proxy]) {
+        if (typeof raw !== "string") continue;
+        for (const host of raw.split(",")) {
+            const h = host.trim();
+            if (h.length === 0 || seen.has(h.toLowerCase())) continue;
+            seen.add(h.toLowerCase());
+            parts.push(h);
+        }
+    }
+    for (const host of LAUNCHER_LOOPBACK_NO_PROXY.split(",")) {
+        if (!seen.has(host.toLowerCase())) {
+            seen.add(host.toLowerCase());
+            parts.push(host);
+        }
+    }
+    const value = parts.join(",");
+    env.NO_PROXY = value;
+    env.no_proxy = value;
+}
+
 function buildClientEnv(
     preset: EnvClientPreset,
     origin: string,
@@ -1067,6 +1125,9 @@ function buildClientEnv(
     env.BILLION_CONTEXT_PROXY = origin;
     for (const [k, v] of preset.extras ?? []) env[k] = v;
     const baseUrlKeys = preset.baseUrlKeys ?? [];
+    // #3446: set when any base-URL override written below lands on our own
+    // loopback origin (the /bili/ form); drives the NO_PROXY merge below.
+    let wrappedBaseUrl = false;
     // Each mirror key is resolved against its OWN rewrite first and only falls
     // back to the primary's, so an alias pair (iFlow's IFLOW_BASE_URL /
     // IFLOW_baseUrl, where only the first ever gets an entry) still fans out.
@@ -1078,7 +1139,7 @@ function buildClientEnv(
             const own = { http: rewrites.httpRewrites.find((rw) => rw.key === k), https: rewrites.httpsRewrites.find((rw) => rw.key === k) };
             const pick = own.http !== undefined || own.https !== undefined ? own : { http: rewrites.httpRewrites.find((rw) => rw.key === primary), https: rewrites.httpsRewrites.find((rw) => rw.key === primary) };
             // Same precedence as before: an https rewrite wins over http.
-            if (pick.http) env[k] = wrapUpstream(origin, pick.http.realUpstream, pick.http.protocol);
+            if (pick.http) { env[k] = wrapUpstream(origin, pick.http.realUpstream, pick.http.protocol); wrappedBaseUrl = true; }
             if (pick.https) env[k] = pick.https.realUpstream;
         }
     }
@@ -1087,10 +1148,11 @@ function buildClientEnv(
     // rather than name api.anthropic.com.
     for (const k of preset.ownBaseUrlKeys ?? []) {
         const r = rewrites?.httpRewrites.find((rw) => rw.key === k);
-        if (r) env[k] = wrapUpstream(origin, r.realUpstream, r.protocol);
+        if (r) { env[k] = wrapUpstream(origin, r.realUpstream, r.protocol); wrappedBaseUrl = true; }
         const hr = rewrites?.httpsRewrites.find((rw) => rw.key === k);
         if (hr) env[k] = hr.realUpstream;
     }
+    if (wrappedBaseUrl) mergeLoopbackNoProxy(env);
     return env;
 }
 
@@ -1327,6 +1389,51 @@ export function buildClaudeEnv(
     return buildClientEnv(ENV_CLIENTS.claude, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
+/** Every variable a shell-level proxy configuration can ride, both cases
+ *  (`npm`/`git`/`curl` disagree on which they read, so both counts). */
+const CHILD_PROXY_KEYS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] as const;
+
+/** True when the child carries a proxy of its own, so the launcher must leave
+ *  it alone. A HALF-named configuration (one scheme, or SOCKS in ALL_PROXY)
+ *  counts as named: it is the user's explicit choice, and bili is not in the
+ *  child's path to qualify it the way it judges its own egress. */
+export function childNamesProxy(env: NodeJS.ProcessEnv): boolean {
+    return CHILD_PROXY_KEYS.some((key) => (env[key] ?? "").trim().length > 0);
+}
+
+/** Hand a proxy-less child the egress the user gives every other shell command.
+ *
+ *  The claude lane needs no proxy env to reach bili — its model traffic goes to
+ *  a plain http loopback URL (see the claude preset row), so the two variables
+ *  it used to carry were dead weight that leaked into the child and made
+ *  in-session `curl`/`git`/`npm` tunnel through bili's MITM. Dropping them
+ *  without replacement would strand a child whose only egress came from that
+ *  leak, so: if the child has no proxy of its own, give it the one THIS proxy
+ *  instance resolves for aux (blind-tunnel) requests — config tiers and the
+ *  #1012 inherited tier included, because /__bili/health reports it.
+ *
+ *  Absent `auxProxy` (an instance started by a pre-handoff build, or an
+ *  explicitly direct configuration) hands over nothing. Never falls back to
+ *  `origin`: routing the child's own traffic back through bili is the leak this
+ *  replaces. */
+export async function applyAuxProxyHandoff(
+    env: NodeJS.ProcessEnv,
+    origin: string,
+    fetchHealth: (origin: string) => Promise<HealthInfo | undefined>,
+): Promise<NodeJS.ProcessEnv> {
+    if (childNamesProxy(env)) return env;
+    let info: HealthInfo | undefined;
+    try {
+        info = await fetchHealth(origin);
+    } catch {
+        return env;
+    }
+    const aux = info?.auxProxy;
+    if (!aux) return env;
+    console.error(`bili: child has no proxy env of its own — handing it bili's aux egress ${redactProxyUrl(aux)} (source: ${info?.auxProxySource ?? "unknown"})`);
+    return { ...env, HTTP_PROXY: aux, HTTPS_PROXY: aux };
+}
+
 /** codebuddy budget alignment (#321 pattern, mirrors resolveClaudeBudgetEnv):
  *  inject CODEBUDDY_AUTO_COMPACT_WINDOW so codebuddy's native auto-compact
  *  threshold matches bili's compress budget. Returns {} (no injection) when:
@@ -1542,13 +1649,21 @@ export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: stri
  *  degrades to nothing (wire mode still compresses server-side) with a
  *  warning. OverlayBusyError (#1952: another live launch owns the overlay) is
  *  PROPAGATED, not degraded — runLaunch aborts the launch, because degrading
- *  to the real home would silently drop the MCP tools and the .env protection. */
+ *  to the real home would silently drop the MCP tools and the .env protection.
+ *  #2222 shared state: with sharedSqlite the overlay additionally carries NO
+ *  SQLite sets at all — CODEX_SQLITE_HOME (sqliteHome) keeps every state db in
+ *  the real home where native and bili runs share one live WAL database, so
+ *  there is nothing to copy in or merge back (the legacy copy/adjudication
+ *  path stays available as the version-gated fallback). */
 export function prepareCodexMcpInjection(opts: {
     codexHome: string;
     origin: string;
     caPath: string;
     conversationId?: string;
     manageRouting: boolean;
+    sharedSqlite?: boolean;
+    sqliteHome?: string;
+    sessionSlot?: string;
 }): { clientArgs: string[]; envPatch: Record<string, string>; warning?: string } {
     const overlay = prepareCodexHome({
         codexHome: opts.codexHome,
@@ -1556,6 +1671,8 @@ export function prepareCodexMcpInjection(opts: {
         caPath: opts.caPath,
         conversationId: opts.conversationId,
         manageRouting: opts.manageRouting,
+        sharedSqlite: opts.sharedSqlite,
+        sessionSlot: opts.sessionSlot,
     });
     if (!overlay) {
         const losses = [
@@ -1565,10 +1682,12 @@ export function prepareCodexMcpInjection(opts: {
         return {
             clientArgs: [],
             envPatch: {},
-            warning: `could not prepare the codex overlay (<CODEX_HOME>-bili) — ${losses.join("; ")}; wire-injected compression is still active.`,
+            warning: `could not prepare the codex overlay for this launch — ${losses.join("; ")}; wire-injected compression is still active.`,
         };
     }
-    return { clientArgs: [], envPatch: { CODEX_HOME: overlay } };
+    const envPatch: Record<string, string> = { CODEX_HOME: overlay };
+    if (opts.sharedSqlite && opts.sqliteHome !== undefined) envPatch.CODEX_SQLITE_HOME = opts.sqliteHome;
+    return { clientArgs: [], envPatch };
 }
 
 /**
@@ -1641,11 +1760,11 @@ function livePidHoldsOverlay(overlay: string): number | undefined {
  *  any stuck state): delete `<overlay>/.bili-launch.lock/`. */
 export class OverlayBusyError extends Error {
     readonly code = "BILI_OVERLAY_BUSY";
-    constructor(readonly overlay: string, readonly holderPid?: number) {
+    constructor(readonly overlay: string, readonly holderPid?: number, detail?: string) {
         super(
             (holderPid !== undefined
                 ? `another bili launch (pid ${holderPid}) is using the shared overlay ${overlay} — only one bili launch per home runs at a time; wait for it to exit`
-                : `the shared overlay ${overlay} is held by a launch whose owner record is incomplete or unverifiable — if no bili launch of this home is running, remove ${overlayLeaseDir(overlay)} to unlock`)
+                : detail ?? `the shared overlay ${overlay} is held by a launch whose owner record is incomplete or unverifiable — if no bili launch of this home is running, remove ${overlayLeaseDir(overlay)} to unlock`)
                 + " (this launch made no changes)",
         );
         this.name = "OverlayBusyError";
@@ -2189,7 +2308,21 @@ function mergeSqliteSet(overlay: string, realHome: string, base: string): boolea
     }
 }
 
-export function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string | string[]): boolean {
+/** #2222 shared-state mode: when sharedSqlite is set, codex keeps its state
+ *  dbs in the real home (CODEX_SQLITE_HOME), so the overlay never copies them
+ *  in and never links them — a linked/copy'd main would re-open the two-paths-
+ *  over-one-inode WAL hazard (#381/#1917) the moment this flag flips back.
+ *  Sets LEFT in the overlay from legacy launches are still merged back here
+ *  (the same mergeSqliteSet provenance adjudication) so the upgrade folds
+ *  itself exactly once; afterwards the overlay holds no sqlite files and this
+ *  path is a no-op for them. */
+export function refreshOverlayHome(
+    realHome: string,
+    overlay: string,
+    generatedFile: string | string[],
+    opts?: { sharedSqlite?: boolean },
+): boolean {
+    const sharedSqlite = opts?.sharedSqlite === true;
     const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
     const isGeneratedDraft = (name: string): boolean =>
         [...generatedFiles].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
@@ -2303,6 +2436,11 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         // (#1917, see copySqliteSet). Their sidecars travel with the base: an
         // individually linked/copied sidecar would share state across the two
         // paths again, so sidecars are skipped here entirely.
+        // #2222 shared mode: nothing is copied or linked — the dbs stay in the
+        // real home (CODEX_SQLITE_HOME), and linking them into the overlay
+        // would re-open the two-paths-over-one-inode hazard. They are excluded
+        // from the HOLLOW accounting too, since "not in the overlay" is the
+        // CORRECT steady state here, not a link failure.
         // Regular files only: a DIRECTORY named like a db must be mirrored by
         // the ordinary link path below, not routed into copySqliteSet where it
         // would fail and land in linkFailures.
@@ -2320,22 +2458,29 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         }
         // Merged-in bases are sqlite mains by construction (dbSets came from
         // isSqliteMain) and a successful merge guarantees their main now sits
-        // in the real home — they join the copy inventory even though they were
-        // absent from the pre-merge realEntries snapshot (#1951).
-        for (const base of mergedBases) realDbBases.add(base);
+        // in the real home — legacy mode re-imports them into the overlay even
+        // though they were absent from the pre-merge realEntries snapshot
+        // (#1951); shared mode must NOT (they belong to the real home now).
+        if (!sharedSqlite) {
+            for (const base of mergedBases) realDbBases.add(base);
+        }
+        const exclusionBases = sharedSqlite ? new Set([...realDbBases, ...mergedBases]) : realDbBases;
         const realDbMembers = new Set<string>();
-        for (const base of realDbBases) {
+        for (const base of exclusionBases) {
             for (const m of sqliteSetMembers(base)) realDbMembers.add(m);
         }
         let accessible = 0;
         let total = 0;
         const linkFailures: string[] = [];
         const copyPhaseEntries = [...realEntries];
-        for (const base of mergedBases) {
-            if (!realEntries.has(base)) copyPhaseEntries.push(base);
+        if (!sharedSqlite) {
+            for (const base of mergedBases) {
+                if (!realEntries.has(base)) copyPhaseEntries.push(base);
+            }
         }
         for (const entry of copyPhaseEntries) {
             if (generatedFiles.has(entry)) continue;
+            if (sharedSqlite && realDbMembers.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
             let present = false;
@@ -2380,7 +2525,39 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
     return true;
 }
 
-function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet<string>): boolean {
+/** True when both paths are regular files holding identical bytes (chunked
+ *  compare, nothing buffered whole). Any stat/read failure counts as
+ *  "different" — conservative, keeps the legacy quarantine path intact. */
+function sameRegularFileBytes(a: string, b: string): boolean {
+    let sa: fs.Stats;
+    let sb: fs.Stats;
+    try {
+        sa = fs.statSync(a);
+        sb = fs.statSync(b);
+    } catch {
+        return false;
+    }
+    if (!sa.isFile() || !sb.isFile() || sa.size !== sb.size) return false;
+    const fa = fs.openSync(a, "r");
+    const fb = fs.openSync(b, "r");
+    try {
+        const bufA = Buffer.allocUnsafe(Math.min(65536, sa.size));
+        const bufB = Buffer.allocUnsafe(Math.min(65536, sa.size));
+        let off = 0;
+        while (off < sa.size) {
+            const n = Math.min(bufA.length, sa.size - off);
+            if (fs.readSync(fa, bufA, 0, n, off) !== n || fs.readSync(fb, bufB, 0, n, off) !== n) return false;
+            if (!bufA.subarray(0, n).equals(bufB.subarray(0, n))) return false;
+            off += n;
+        }
+        return true;
+    } finally {
+        try { fs.closeSync(fa); } catch { /* already closed */ }
+        try { fs.closeSync(fb); } catch { /* already closed */ }
+    }
+}
+
+export function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet<string>): boolean {
     let st: fs.Stats;
     try {
         st = fs.lstatSync(src);
@@ -2443,7 +2620,20 @@ function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet
         }
         return true;
     }
+    // #3203: concurrent sessions each grow identical per-home markers in their
+    // own slots (codex's .sandbox_migration "v1"); a byte-identical loser
+    // carries no data, so drop it silently — the same rule mergeSqliteSet
+    // already applies to snapshots — instead of littering .bili-conflict.
+    const identicalFiles = dstStat !== undefined && sameRegularFileBytes(src, dst);
     if (dstStat && dstStat.mtimeMs >= st.mtimeMs) {
+        if (identicalFiles) {
+            try {
+                fs.unlinkSync(src);
+                return true;
+            } catch {
+                return false;
+            }
+        }
         try {
             fs.renameSync(src, freeConflictName(dst));
             return true;
@@ -2452,6 +2642,14 @@ function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet
         }
     }
     if (dstStat) {
+        if (identicalFiles) {
+            try {
+                fs.unlinkSync(src);
+                return true;
+            } catch {
+                return false;
+            }
+        }
         try {
             fs.renameSync(dst, freeConflictName(dst));
         } catch {
@@ -2970,6 +3168,112 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
     return ok;
 }
 
+/** #3203: bounded pool of per-session codex overlays in shared mode
+ *  (`<CODEX_HOME>-bili-s<N>`). Slots are persistent and reused across
+ *  sessions — never deleted: thread records written during a session keep
+ *  absolute rollout paths that resolve through the slot's sessions symlink
+ *  into the real home (#43bf59fc9 relink discipline), so removing a slot
+ *  would dangle them. Bounding the pool keeps the home from accumulating a
+ *  directory per session. */
+const CODEX_SESSION_SLOT_MAX = 16;
+
+/** #3203: claim a free per-session slot for this launch. Each slot is an
+ *  ordinary overlay with its own lease — concurrent claims serialize on the
+ *  atomic lock mkdir, so two launches never share a slot; a slot held by a
+ *  live foreign launch is skipped, not clobbered (#1952 discipline), and a
+ *  stale one is reclaimed by acquireOverlayLease. Exhaustion refuses loudly. */
+function allocateCodexSessionOverlay(codexHome: string): string {
+    for (let n = 1; n <= CODEX_SESSION_SLOT_MAX; n += 1) {
+        const slot = `${codexHome}-bili-s${n}`;
+        try {
+            fs.mkdirSync(slot, { recursive: true });
+        } catch {}
+        try {
+            acquireOverlayLease(slot);
+            return slot;
+        } catch (err) {
+            if (!(err instanceof OverlayBusyError)) throw err;
+        }
+    }
+    throw new OverlayBusyError(
+        `${codexHome}-bili`,
+        undefined,
+        `all ${CODEX_SESSION_SLOT_MAX} per-session codex slots are held by live bili launches — wait for one to exit`,
+    );
+}
+
+/** #3203: one-time fold of the pre-#3203 fixed-name overlay into the real
+ *  home. Shared-mode launches never refresh `<CODEX_HOME>-bili` again (they
+ *  use per-session slots), so anything still private in it — crashed-legacy
+ *  residue: SQLite sets, copy-fallback files — would stay stranded while the
+ *  live db moves to the real home. finalizeCodexHome merges exactly that back
+ *  (provenance adjudication; symlinks and generated files untouched) and is
+ *  a no-op once folded. Serialized through the legacy overlay's own lease: a
+ *  LIVE foreign holder means a legacy-era launch is still writing the logical
+ *  db through its own overlay copy — proceeding would dual-write it, so the
+ *  launch is refused loudly instead (#1952 discipline). Must run before any
+ *  other lease acquisition in this process (single global activeOverlayLease). */
+function migrateLegacyCodexOverlay(codexHome: string): void {
+    const legacy = `${codexHome}-bili`;
+    let st: fs.Stats;
+    try {
+        st = fs.lstatSync(legacy);
+    } catch {
+        return;
+    }
+    if (!st.isDirectory()) return;
+    acquireOverlayLease(legacy);
+    try {
+        finalizeCodexHome(codexHome, legacy, [".env", "config.toml"]);
+    } finally {
+        releaseOverlayLease();
+    }
+}
+
+/** #3203: phase 1 of a shared-mode codex launch — claim THIS launch's
+ *  per-session slot BEFORE the proxy starts, because the proxy's lane
+ *  identity (codexSlotLane) derives from the slot name and concurrent
+ *  sessions must not be #3044 twins of each other. The claimed lease stays
+ *  held for the whole launch (runLaunch releases it in its finally, after
+ *  the exit merge-back — same ordering as the single-phase path). The
+ *  caller passes the returned dir back as prepareCodexHome's sessionSlot so
+ *  phase 2 (refresh + generated files, which need the proxy origin) does not
+ *  re-run migration/allocation: re-acquiring the legacy overlay's lease here
+ *  would clobber activeOverlayLease and strand this slot's lease until the
+ *  stale-reclaim on next launch. */
+function prepareCodexSessionSlot(codexHome: string): string {
+    migrateLegacyCodexOverlay(codexHome);
+    const overlay = allocateCodexSessionOverlay(codexHome);
+    // #3203: codex creates installation_id under CODEX_HOME (= the slot)
+    // on first use; with concurrent sessions each slot would grow its own
+    // UUID and the exit-time merge-back would quarantine one as
+    // .bili-conflict. Seed the real home atomically so every slot links
+    // ONE canonical identity file.
+    try {
+        const fd = fs.openSync(path.join(codexHome, "installation_id"), fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+        try {
+            fs.writeSync(fd, randomUUID());
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    return overlay;
+}
+
+/** #3203: the per-session proxy lane for a slot-backed launch (`codex-s<N>`),
+ *  or undefined for non-slot overlays. A distinct lane per slot keeps
+ *  concurrent sessions' proxies from matching #3044's twin rule (same lane +
+ *  same port + same build ⇒ "the duplicate loses"): different sessions never
+ *  match, while a relaunch onto a still-draining slot's port waits on the
+ *  predecessor like any same-lane upgrade. The bounded slot pool bounds the
+ *  sticky zone-port records these lanes accumulate to CODEX_SESSION_SLOT_MAX. */
+function codexSlotLane(overlay: string): string | undefined {
+    const m = /-bili-s(\d+)$/.exec(path.basename(overlay));
+    return m === null ? undefined : `codex-s${m[1]}`;
+}
+
 /** #681/#1802: persistent <CODEX_HOME>-bili overlay. Carries (a) the bili MCP
  *  server in a merged config.toml when a per-spawn conversationId is given
  *  (inline `-c` args cannot survive cmd.exe on Windows), and (b) whenever the
@@ -2988,6 +3292,16 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
  *  symmetric to .env, #1965). On normal exit the run's data is written back
  *  into the real home by finalizeCodexHome (#1965); generated files stay
  *  overlay-local throughout.
+ *  #2222: with sharedSqlite the overlay additionally holds no SQLite sets —
+ *  codex keeps its state dbs in the real home via CODEX_SQLITE_HOME (set by
+ *  the caller in the spawn env), so refresh neither copies them in nor links
+ *  them, and any leftover legacy sets are merged back as a one-time migration.
+ *  #3203: with sharedSqlite the overlay is a PER-SESSION slot from a bounded
+ *  pool (<CODEX_HOME>-bili-s<N>, CODEX_SESSION_SLOT_MAX) so concurrent
+ *  launches each own their generated files and proxy binding; the pre-#3203
+ *  fixed-name overlay is folded into the real home once (the launch is
+ *  refused while a live legacy-era launch still holds it). Slots persist and
+ *  are reused, never deleted (#43bf59fc9 path discipline).
  *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
  *  be built (caller degrades: wire-injected compression still works, native
  *  MCP tools / the .env protection do not). Throws OverlayBusyError BEFORE any
@@ -2998,6 +3312,11 @@ export function prepareCodexHome(opts: {
     caPath: string;
     conversationId?: string;
     manageRouting: boolean;
+    sharedSqlite?: boolean;
+    /** #3203: slot already claimed by prepareCodexSessionSlot before the proxy
+     *  started (its lease is active in this process). Skips migration +
+     *  allocation; see that function for why the phases must not overlap. */
+    sessionSlot?: string;
 }): string | undefined {
     const { codexHome, origin, caPath, conversationId, manageRouting } = opts;
     let userEnvText: string | undefined;
@@ -3021,8 +3340,20 @@ export function prepareCodexHome(opts: {
     // would merge it back into the real home (#1802 review; config.toml
     // symmetric to .env, #1965).
     const generatedFiles: string[] = [".env", "config.toml"];
-    const overlay = `${codexHome}-bili`;
-    if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
+    let overlay: string;
+    if (opts.sharedSqlite) {
+        // #3203: shared mode runs a PER-SESSION slot from a bounded pool so
+        // concurrent launches each own their generated .env/config.toml and
+        // their proxy binding; the pre-#3203 fixed-name overlay is folded into
+        // the real home once (the launch is refused while a live legacy-era
+        // launch still holds it). Legacy mode below keeps the fixed name + its
+        // exclusive lease: its DB copy/merge-back arbitration is not safe
+        // across concurrent sessions.
+        overlay = opts.sessionSlot ?? prepareCodexSessionSlot(codexHome);
+    } else {
+        overlay = `${codexHome}-bili`;
+    }
+    if (!refreshOverlayHome(codexHome, overlay, generatedFiles, { sharedSqlite: opts.sharedSqlite })) return undefined;
     if (manageDotEnv) {
         try {
             const st = fs.lstatSync(path.join(overlay, ".env"));
@@ -3118,9 +3449,14 @@ const DSH_BARE_ENTRY = "billion-context";
  *  `dsh.client` declaration the scanner reads plus two SYMLINKS into bili's
  *  live dist — an auto-update that moves dist self-heals on the next launch.
  *  Returns false when nothing was written (existing shims stay untouched). */
-export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string): boolean {
+export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string, gateBundle?: string): boolean {
     try {
         if (!fs.existsSync(hostBundle) || !fs.existsSync(clientBundle)) return false;
+        // #3662: the always-on gate entry rides the same shim (a dangling
+        // symlink would break its load, so it joins only when present).
+        const hasGate = gateBundle !== undefined && fs.existsSync(gateBundle);
+        const exportsMap: Record<string, string> = { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" };
+        if (hasGate) exportsMap["./dsh-compaction-gate"] = "./gate.js";
         fs.rmSync(shimDir, { recursive: true, force: true });
         fs.mkdirSync(shimDir, { recursive: true });
         fs.writeFileSync(
@@ -3129,12 +3465,13 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
                 name: "billion-context",
                 version,
                 type: "module",
-                exports: { ".": "./index.js", "./dsh": "./index.js", "./package.json": "./package.json", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
+                exports: exportsMap,
                 dsh: { client: { platform: "web" } },
             })}\n`,
         );
         fs.symlinkSync(hostBundle, path.join(shimDir, "index.js"));
         fs.symlinkSync(clientBundle, path.join(shimDir, "bundle.js"));
+        if (hasGate) fs.symlinkSync(gateBundle, path.join(shimDir, "gate.js"));
         return true;
     } catch {
         return false;
@@ -3152,7 +3489,7 @@ export function writeDshClientShim(dshHome: string): boolean {
     try {
         version = JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")).version ?? version;
     } catch {}
-    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version);
+    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version, selfDistFile("agent/dsh-compaction-gate.js"));
 }
 
 /** #1590: entry name for the launcher's --patch overlay. The BARE package
@@ -3178,6 +3515,11 @@ export function dshPluginEntry(dshHome: string): string {
 
 export function writeDshAcpPatch(dshHome: string, entryName?: string): string | undefined {
     const pluginUrl = entryName ?? pathToFileURL(selfDistFile("agent/dsh-native.js")).href;
+    // #3662: the gate entry mounts alongside bili-native in BOTH lanes (bare
+    // subpath through the shim; file URL otherwise) — dropping it would leave
+    // the preset inject rows below pending forever whenever bili-native does
+    // not run.
+    const gateUrl = pluginUrl === DSH_BARE_ENTRY ? `${DSH_BARE_ENTRY}/dsh-compaction-gate` : pathToFileURL(selfDistFile("agent/dsh-compaction-gate.js")).href;
     const dir = `${dshHome}-bili`;
     try {
         fs.mkdirSync(dir, { recursive: true });
@@ -3187,7 +3529,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the injected plugin registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n    - id: bili-compaction-gate\n      name: ${gateUrl}\n# Native compaction remains host-owned.\n# #3354/#3662: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the always-on bili-compaction-gate entry registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
@@ -3271,6 +3613,82 @@ export function codexSupportsNoDaemon(
     } catch {}
     codexNoDaemonCache.set(key, supported);
     return supported;
+}
+
+/** #2222: `codex --version` prints "codex-cli X.Y.Z" — parse it. */
+export function parseCodexVersion(output: string): [number, number, number] | undefined {
+    const m = /codex-cli[ \t]+(\d+)\.(\d+)\.(\d+)/i.exec(output);
+    if (m === null) return undefined;
+    return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+}
+
+const codexVersionCache = new Map<string, [number, number, number] | undefined>();
+
+/** #2222: version of a Codex CLI binary via `--version` (cached per resolved
+ *  command). Mirrors codexSupportsNoDaemon: spawned exactly like runClient
+ *  will spawn it (planClientSpawn + windowsVerbatimArguments), short timeout,
+ *  any failure → undefined so callers fall back conservatively. */
+function codexBinaryVersion(
+    command: string,
+    prefixArgs: readonly string[],
+    platform: NodeJS.Platform = process.platform,
+): [number, number, number] | undefined {
+    const key = JSON.stringify([command, ...prefixArgs]);
+    const hit = codexVersionCache.get(key);
+    if (hit !== undefined) return hit;
+    let parsed: [number, number, number] | undefined;
+    try {
+        const plan = planClientSpawn(command, [...prefixArgs, "--version"], process.env, platform);
+        const res = spawnSync(plan.command, plan.args, {
+            timeout: 5000,
+            stdio: ["ignore", "pipe", "ignore"],
+            windowsVerbatimArguments: plan.windowsVerbatimArguments,
+            windowsHide: true,
+        });
+        if (res.status === 0 && !res.error) parsed = parseCodexVersion(res.stdout.toString("utf8"));
+    } catch {}
+    codexVersionCache.set(key, parsed);
+    return parsed;
+}
+
+// #2222: oldest codex verified (source + real-binary probe) to honor
+// CODEX_SQLITE_HOME — introduced between 0.100.0 (absent) and 0.120.0 (present),
+// empirically confirmed on the CI-pinned 0.147.0. Gating at the oldest
+// e2e-tested release keeps every older install on the proven legacy path.
+const CODEX_SQLITE_HOME_MIN_VERSION: readonly [number, number, number] = [0, 147, 0];
+
+export function codexSupportsSqliteHome(
+    command: string,
+    prefixArgs: readonly string[],
+    platform: NodeJS.Platform = process.platform,
+): boolean {
+    const v = codexBinaryVersion(command, prefixArgs, platform);
+    if (v === undefined) return false;
+    for (let i = 0; i < 3; i += 1) {
+        if (v[i] !== CODEX_SQLITE_HOME_MIN_VERSION[i]) return v[i] > CODEX_SQLITE_HOME_MIN_VERSION[i];
+    }
+    return true;
+}
+
+type CodexStateMode = "shared" | "legacy";
+
+/** #2222: BILI_CODEX_STATE_MODE escape hatch for the codex state-db strategy.
+ *  auto (default) — shared when the binary honors CODEX_SQLITE_HOME, else
+ *  legacy copy/adjudication; legacy — always the old path; shared — shared,
+ *  degrading to legacy with a warning when the binary is too old to honor
+ *  CODEX_SQLITE_HOME (silently ignoring an explicit request would hide the
+ *  mismatch). Unrecognized values warn and behave as auto. */
+export function resolveCodexStateMode(requested: string | undefined, supported: boolean): CodexStateMode {
+    const r = requested?.trim().toLowerCase();
+    if (r === "legacy") return "legacy";
+    if (r !== undefined && r !== "" && r !== "auto" && r !== "shared") {
+        console.error(`bili: unrecognized BILI_CODEX_STATE_MODE "${requested}" — using auto.`);
+    }
+    if (r === "shared" && !supported) {
+        console.error("bili: codex is too old to honor CODEX_SQLITE_HOME — BILI_CODEX_STATE_MODE=shared degrades to legacy state handling.");
+        return "legacy";
+    }
+    return supported ? "shared" : "legacy";
 }
 
 /**
@@ -3518,6 +3936,8 @@ async function defaultFetchDetail(url: string): Promise<ProbeOutcome> {
 
 interface HealthInfo {
     ok: boolean;
+    storage?: { effective?: string; degraded: boolean };
+    guardedShutdown?: boolean;
     instanceId?: string;
     /** Responder's bundle version from /__bili/health (#3544): the rotation
      *  gate compares it against OUR version — absent on pre-#3544 builds, in
@@ -3527,6 +3947,14 @@ interface HealthInfo {
      *  fallback uses this to verify the healthy responder on the preferred
      *  port is the child WE spawned (and not a foreign proxy squatting it). */
     pid?: number;
+    /** The proxy that instance would use for an AUX request (any host, no
+     *  model route), i.e. what a child process should get as its own egress.
+     *  Absent on builds that predate the aux handoff — the launcher then hands
+     *  over nothing rather than guessing. */
+    auxProxy?: string;
+    /** Which tier produced `auxProxy` (env var name, Windows system proxy,
+     *  config…), for the stderr line only. */
+    auxProxySource?: string;
     /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
      *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed.
      *  #1753 (shutdown side): `watchers` is the live watcher-pid set — the
@@ -3539,10 +3967,13 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown; guardedShutdown?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        info.guardedShutdown = data.guardedShutdown === true;
         if (typeof data.version === "string") info.version = data.version;
         if (typeof data.pid === "number") info.pid = data.pid;
+        if (typeof data.auxProxy === "string" && data.auxProxy.length > 0) info.auxProxy = data.auxProxy;
+        if (typeof data.auxProxySource === "string" && data.auxProxySource.length > 0) info.auxProxySource = data.auxProxySource;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
             const wd = data.watchdog as { armed: boolean; watchers?: unknown };
             const watchers = Array.isArray(wd.watchers) ? wd.watchers.filter((w): w is number => typeof w === "number") : undefined;
@@ -3622,7 +4053,7 @@ function instanceShapeMismatch(inst: ProxyInstanceFile, opts: LaunchOptions, for
     // #2905: a foreign DECLARED lane is attachable only when the operator
     // listed it in native.attachLanePriority — isolation by default (#1225/#1232).
     if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane && !foreignLanes.includes(inst.lane)) return "lane-mismatch";
-    if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return "host-or-passthrough-mismatch";
+    if (inst.host !== opts.host || inst.passthrough !== resolveRecordedPassthrough(opts.passthrough)) return "host-or-passthrough-mismatch";
     // #3436: each cell wants what a spawned child will RECORD, not the raw
     // caller input — the child records loadOptions' gated mitm tier and the
     // parse of the BILI_LAUNCHER_MODEL_* env it receives. Native lanes pass no
@@ -3657,31 +4088,41 @@ async function probeLiveInstances(
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     diag?: (msg: string) => void,
     isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
-): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo }>> {
+): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
     if (isProxyInstanceFile(inst)) seen.set(inst.instanceId || inst.origin, inst);
     for (const live of discoverLiveInstances()) seen.set(live.instanceId || live.origin, live);
     const checked = await Promise.all(
-        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo } | undefined> => {
+        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo | undefined } | undefined> => {
             if (!isPidAlive(c.pid)) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): owner process gone`); return undefined; }
             const health = await fetchHealthInfo(c.origin);
             if (!health || !health.ok) {
                 // #3654: a refused connection and a saturated event loop both
                 // fail this probe — tell them apart in the log: connect-but-
                 // silent is BUSY (alive, loop inside a large fold), not dead.
-                // Still dropped either way (#1335 gate unchanged).
-                const busy = await isConnectable(c.origin);
-                diag?.(busy
-                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654)`
-                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`);
+                // #4811: BUSY candidates are KEPT (health: undefined), not
+                // dropped — dropping them made discovery declare "empty" over a
+                // live same-lane holder, and the spawn that followed raced it
+                // into EADDRINUSE plus a two-writer index.db window before the
+                // twin adoption that finally converged (#3923/#3959). Which
+                // BUSY instances are actually attachable is pickAttachable's
+                // call, on lifecycle evidence. An ANSWERED probe that reports
+                // not-ok (instance draining) stays dropped.
+                if (health === undefined && (await isConnectable(c.origin))) {
+                    diag?.(`native-attach: keep ${c.origin} (pid ${c.pid}): health probe failed but TCP connect succeeded — instance is BUSY (event loop saturated), not dead (#3654/#4811)`);
+                    return { inst: c, health: undefined };
+                }
+                diag?.(health === undefined
+                    ? `native-attach: drop ${c.origin} (pid ${c.pid}): health probe failed`
+                    : `native-attach: drop ${c.origin} (pid ${c.pid}): health probe answered but reports not-ok`);
                 return undefined;
             }
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) { diag?.(`native-attach: drop ${c.origin} (pid ${c.pid}): instance id mismatch (${c.instanceId} vs ${health.instanceId})`); return undefined; }
             return { inst: c, health };
         }),
     );
-    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo } => c !== undefined);
+    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo | undefined } => c !== undefined);
 }
 
 /** #1335: the attach gate — a listener may be attached to only when its
@@ -3690,9 +4131,9 @@ async function probeLiveInstances(
  *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
  *  those are exactly the stale manually-started daemons behind #1322, and
  *  riding them pins every session to possibly-old code that outlives it. */
-function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+function attachGateAllows(health: HealthInfo | undefined, attachExternal: boolean): boolean {
     if (attachExternal) return true;
-    return health.watchdog?.armed === true;
+    return health?.watchdog?.armed === true;
 }
 
 /** #1660: the user-sovereignty zone marker — neither a declared lane nor a
@@ -3743,7 +4184,7 @@ function normalizeOrigin(o: string): string {
  *  lane-less / user-zone daemon), while "global-fallback" keeps the pre-#2877
  *  wildcard fallback. */
 function pickAttachable(
-    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
     opts: LaunchOptions,
     codeFingerprint: string | undefined,
     attachExternal: boolean,
@@ -3778,7 +4219,7 @@ function pickAttachable(
         // target, and attachExternal=true (the pre-existing #1335 permissive
         // opt-in — keeping it fully permissive means existing users of that
         // flag see NO change from this flip).
-        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health.watchdog?.armed !== true) {
+        if (!attachUrl && !attachExternal && attachPolicy === "own-lane" && opts.lane !== undefined && !sameLane && c.health?.watchdog?.armed !== true) {
             diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): not own lane and not an armed shared daemon (attachPolicy=own-lane)`);
             continue;
         }
@@ -3786,7 +4227,22 @@ function pickAttachable(
         // never an attach target by default; log the refusal once per origin.
         // #1660: a user-zone instance (manual `bili start`) is exempt — the
         // missing watchdog is the user's deliberate posture, not drift.
-        if (!attachGateAllows(c.health, attachExternal) && !isUserZoneInstance(c.inst)) {
+        // #4811: a BUSY candidate (health probe silent, TCP alive) cannot prove
+        // its watchdog state, so it is attachable only when its lifecycle is
+        // verifiable another way — its own lane (#1231 same-lane spawn
+        // discipline), the explicit attachExternal opt-in, or the user zone.
+        // Declared foreign lanes stay refused while BUSY (#1335 unchanged).
+        if (c.health === undefined) {
+            if (!sameLane && !attachExternal && !isUserZoneInstance(c.inst)) {
+                if (!refusedLog.has(c.inst.origin)) {
+                    refusedLog.add(c.inst.origin);
+                    const msg = `bili: refusing to attach to ${c.inst.origin} (pid ${c.inst.pid}) — health probe silent but TCP alive (BUSY, event loop saturated #3654) and its lifecycle is unverifiable from this lane. Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
+                    console.error(msg);
+                    diag?.(msg);
+                }
+                continue;
+            }
+        } else if (!attachGateAllows(c.health, attachExternal) && !isUserZoneInstance(c.inst)) {
             if (!refusedLog.has(c.inst.origin)) {
                 refusedLog.add(c.inst.origin);
                 console.error(gateRefusalMessage(c.inst, c.health));
@@ -3825,10 +4281,11 @@ async function waitForStarterInstance(
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
     foreignLanes: readonly string[] = [],
+    isConnectable: (origin: string) => Promise<boolean> = tcpConnectable,
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_BUDGET_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
-        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag, isConnectable), opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, diag, foreignLanes);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -3854,7 +4311,7 @@ async function waitForStarterInstance(
 function defaultAttachDiag(debug: boolean): (msg: string) => void {
     return (msg: string): void => {
         logHostEvent("info", "", msg);
-        if (debug) process.stderr.write(`${new Date().toISOString()} [info] [v=${VERSION}] ${msg}\n`);
+        if (debug) process.stderr.write(`${logTimestamp()} [info] [v=${VERSION}] ${msg}\n`);
     };
 }
 
@@ -3873,7 +4330,7 @@ export async function findLiveAttachableInstance(
     const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
     const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
     const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
     return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), attachDiag, foreignLanes);
 }
 
@@ -3958,6 +4415,24 @@ export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const cleaned: NodeJS.ProcessEnv = { ...env };
     for (const key of INHERITED_PROXY_VARS) delete cleaned[key];
     return stripInternalLauncherChannels(cleaned);
+}
+
+/** Launcher-owned spawn channels. Each one is re-derived from THIS launch's
+ *  own options and re-injected conditionally below, so an inherited copy must
+ *  be dropped first: a stale map from an outer process otherwise lands in the
+ *  child's instance record, and every later launch refuses to attach with
+ *  model-windows-mismatch (#2195). */
+const INHERITED_LAUNCHER_CHANNELS = [
+    "BILI_LAUNCHER_LANE",
+    "BILI_LAUNCHER_MODEL_WINDOWS",
+    "BILI_LAUNCHER_MODEL_MAX_OUTPUTS",
+    "BILI_STRICT_PORT",
+];
+
+function stripInheritedLauncherChannels(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const cleaned: NodeJS.ProcessEnv = { ...env };
+    for (const key of INHERITED_LAUNCHER_CHANNELS) delete cleaned[key];
+    return cleaned;
 }
 
 /** #1012: capture the user's proxy vars BEFORE stripping, so the launcher can
@@ -4193,11 +4668,11 @@ const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
 const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
 
-export async function requestInstanceShutdown(origin: string): Promise<boolean> {
+export async function requestInstanceShutdown(origin: string, expected?: { instanceId: string; pid: number; ownerPid?: number }): Promise<boolean> {
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", ...(expected ? { "x-bili-expected-instance-id": expected.instanceId, "x-bili-expected-pid": String(expected.pid), ...(expected.ownerPid !== undefined ? { "x-bili-expected-owner-pid": String(expected.ownerPid) } : {}) } : {}) },
             body: "{}",
             signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
         });
@@ -4219,7 +4694,7 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
  *  preference resolver is stateful/sticky (#1660) and must not be touched on
  *  bring-ups where nothing rotates. */
 async function rotateStalePredecessor(
-    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
+    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
     resolveTargetPort: () => number | undefined,
     opts: LaunchOptions,
     attachUrl: string | undefined,
@@ -4230,17 +4705,25 @@ async function rotateStalePredecessor(
     requestShutdown: (origin: string) => Promise<boolean>,
 ): Promise<void> {
     if (attachUrl !== undefined) return;
-    const stale = probed.filter((c) =>
-        !isUserZoneInstance(c.inst)
-        && c.health.watchdog?.armed === true
-        && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
-        && c.health.version !== undefined
-        && isVersionNewer(VERSION, c.health.version));
+    // #4811: BUSY candidates carry no health (probe silent) — their version is
+    // unverifiable, so they are never rotation targets; the type guard drops
+    // them here and keeps `stale` narrowed to real HealthInfo below.
+    const stale = probed.filter(
+        (c): c is { inst: ProxyInstanceFile; health: HealthInfo } =>
+            c.health !== undefined
+            && !isUserZoneInstance(c.inst)
+            && c.health.watchdog?.armed === true
+            && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
+            && c.health.version !== undefined
+            && isVersionNewer(VERSION, c.health.version));
     if (stale.length === 0) return;
     const targetPort = resolveTargetPort();
     if (targetPort === undefined) return;
     const candidate = stale.find((c) => c.inst.port === targetPort);
     if (!candidate) return;
+    if (opts.recoverDegradedDsh && opts.lane === "dsh") {
+        throw new Error("bili: DSH stale resident discovered during startup; refusing unguarded rotation");
+    }
     const running = candidate.health.version;
     if (running === undefined || !isVersionNewer(VERSION, running)) return;
     console.error(
@@ -4305,7 +4788,214 @@ export function startOwnerHeartbeat(
     return () => { stopped = true; };
 }
 
-export async function ensureProxyRunning(
+interface DshPendingChild { pid: number; launchToken: string }
+
+function dshPendingPath(): string {
+    return path.join(stateDir(), "proxy-dsh-pending");
+}
+
+function readDshPendingChild(): DshPendingChild | undefined {
+    let raw: string;
+    try { raw = fs.readFileSync(dshPendingPath(), "utf8"); }
+    catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+    }
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object" || !("pid" in value) || !("launchToken" in value)
+        || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0
+        || typeof value.launchToken !== "string" || value.launchToken.length === 0) {
+        throw new Error("bili: DSH pending child record is invalid; refusing uncoordinated startup");
+    }
+    return { pid: value.pid, launchToken: value.launchToken };
+}
+
+function clearDshPendingChild(expected: DshPendingChild): void {
+    const current = readDshPendingChild();
+    if (current?.pid !== expected.pid || current.launchToken !== expected.launchToken) {
+        throw new Error("bili: DSH pending child identity changed; refusing to clear it");
+    }
+    fs.unlinkSync(dshPendingPath());
+}
+
+function persistDshPendingChild(child: SpawnChild, launchToken: string): void {
+    if (!Number.isSafeInteger(child.pid) || child.pid <= 0) throw new Error("bili: DSH child has no valid PID; refusing untracked startup");
+    const fd = fs.openSync(dshPendingPath(), "wx");
+    try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: child.pid, launchToken }));
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+const dshRecoveryFlights = new Map<string, Promise<ProxyHandle>>();
+const DSH_RECOVERY_WAIT_MS = 10_000;
+
+async function fetchDshRecoveryHealth(origin: string): Promise<HealthInfo | undefined> {
+    const before = await fetchHealthInfoDefault(origin);
+    if (!before?.ok || !before.instanceId || !before.pid) return undefined;
+    try {
+        const res = await fetch(`${origin}/__bili/status`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+        if (!res.ok) return undefined;
+        const data = await res.json() as { storage?: { effective?: unknown; degraded?: unknown } };
+        const after = await fetchHealthInfoDefault(origin);
+        if (!after?.ok || after.instanceId !== before.instanceId || after.pid !== before.pid) return undefined;
+        if (typeof data.storage?.degraded !== "boolean") return undefined;
+        return { ...after, storage: { effective: typeof data.storage.effective === "string" ? data.storage.effective : undefined, degraded: data.storage.degraded } };
+    } catch {
+        return undefined;
+    }
+}
+
+function dshReady(info: HealthInfo | undefined): boolean {
+    return info?.ok === true && Boolean(info.instanceId) && typeof info.pid === "number" && info.pid > 0 && info.storage?.effective === "full" && info.storage.degraded === false;
+}
+
+export async function ensureProxyRunning(opts: LaunchOptions, deps: LauncherDeps = {}): Promise<ProxyHandle> {
+    if (!opts.recoverDegradedDsh || opts.lane !== "dsh") return ensureProxyRunningCore(opts, deps);
+    const lockPath = path.join(stateDir(), "proxy-dsh-recovery");
+    const active = dshRecoveryFlights.get(lockPath);
+    if (active) return active;
+    const work = recoverDshProxy(opts, deps, lockPath);
+    dshRecoveryFlights.set(lockPath, work);
+    try {
+        return await work;
+    } finally {
+        if (dshRecoveryFlights.get(lockPath) === work) dshRecoveryFlights.delete(lockPath);
+    }
+}
+
+async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath: string): Promise<ProxyHandle> {
+    const now = deps.now ?? Date.now;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const alive = deps.isRecoveryPidAlive ?? isPidAlive;
+    const health = deps.fetchHealthInfo ?? fetchDshRecoveryHealth;
+    const registry = deps.listRegistryInstances ?? discoverLiveInstances;
+    const read = deps.readInstanceFile ?? readProxyInstanceFile;
+    const owner = randomUUID();
+    const deadline = now() + DSH_RECOVERY_WAIT_MS;
+    let fd: number;
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    for (;;) {
+        try {
+            fd = fs.openSync(lockPath, "wx");
+            break;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "EEXIST" || now() >= deadline) throw new Error("bili: DSH recovery lock unavailable; refusing uncoordinated startup", { cause: err });
+            await sleep(HEALTH_POLL_INTERVAL_MS);
+        }
+    }
+    try {
+        fs.writeFileSync(fd, owner);
+        const records = registry();
+        const pointer = read();
+        const pending = readDshPendingChild();
+        if (pending) {
+            if (!alive(pending.pid)) {
+                clearDshPendingChild(pending);
+            } else {
+                // The registry marker deliberately drops the launcher-private
+                // launchToken (server.ts #1232), so requiring a token match on
+                // the REGISTRY entry could never succeed — every leftover record
+                // with a live PID became a permanent bootstrap wedge (60s
+                // retries forever, model traffic pinned to DIRECT while a wedged
+                // resident held the port). The pointer record still carries the
+                // token: prefer it for ownership, and treat a pointer that names
+                // this PID with a DIFFERENT token as foreign. A PID we know only
+                // from the registry is ours to hand to the candidate loop below,
+                // which attaches a ready resident, reaps one that answers
+                // nothing, and still refuses a foreign PID.
+                const pointed = isProxyInstanceFile(pointer) && pointer.pid === pending.pid ? pointer : undefined;
+                const registered = records.find((inst) => inst.lane === "dsh" && inst.pid === pending.pid);
+                const foreignToken = pointed?.launchToken !== undefined && pointed.launchToken !== pending.launchToken;
+                const owned = pointed?.launchToken === pending.launchToken || (!foreignToken && registered !== undefined);
+                if (!owned) {
+                    throw new Error("bili: DSH pending child PID is alive without proven full-storage identity; refusing another spawn or kill");
+                }
+                clearDshPendingChild(pending);
+            }
+        }
+        const candidates = new Map(records.map((inst) => [inst.instanceId, inst]));
+        if (isProxyInstanceFile(pointer)) candidates.set(pointer.instanceId, pointer);
+        for (const inst of candidates.values()) {
+            if (!alive(inst.pid) || (inst.lane !== "dsh" && inst.port !== opts.port)) continue;
+            const info = await health(inst.origin);
+            if (info === undefined) {
+                // A resident that holds our port (and index.db) but answers
+                // nothing serves no session at all — leaving it alone does not
+                // protect anyone, it just wedges the lane on DIRECT sends for
+                // minutes (#4516 422s). Reap it, but ONLY when it is provably
+                // the same install; a foreign build is left for the operator to
+                // kill (it is the exact pid we log for them).
+                const foreign = inst.lane !== "dsh" || inst.pid <= 1 || inst.pid === process.pid
+                    || instanceCompatible(inst, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), []) !== undefined;
+                if (foreign) throw new Error("bili: DSH resident identity/readiness unknown; refusing replacement");
+                // Confirm the silence is a state, not one blip.
+                await sleep(HEALTH_POLL_INTERVAL_MS);
+                if (await health(inst.origin) !== undefined) throw new Error("bili: DSH resident identity/readiness unknown; refusing replacement");
+                if (!alive(inst.pid)) continue;
+                deps.attachDiag?.(`bili: reaping unresponsive DSH resident ${inst.origin} (pid ${inst.pid}) — it holds the port and index.db but answers no health probe`);
+                try {
+                    (deps.terminatePid ?? ((pid: number) => { process.kill(pid, "SIGTERM"); }))(inst.pid);
+                } catch {
+                    // Already gone between the probe and the signal.
+                }
+                const reapDeadline = now() + DSH_RECOVERY_WAIT_MS;
+                while (alive(inst.pid) && now() < reapDeadline) await sleep(HEALTH_POLL_INTERVAL_MS);
+                if (alive(inst.pid)) throw new Error("bili: unresponsive DSH resident did not exit; refusing a second writer");
+                continue;
+            }
+            const identity = info?.ok === true && info.instanceId === inst.instanceId && info.pid === inst.pid;
+            if (inst.lane !== "dsh" || !identity) throw new Error("bili: DSH resident identity/readiness unknown; refusing replacement");
+            if (dshReady(info)) {
+                if (info?.watchdog?.armed !== true || instanceCompatible(inst, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), []) !== undefined) throw new Error("bili: DSH resident is ready but incompatible; refusing a second writer");
+                continue;
+            }
+            throw new Error("bili: DSH resident is not full-storage ready; refusing replacement without proven exclusivity");
+        }
+        const readyHealth = async (origin: string): Promise<HealthInfo> => {
+            const info = await health(origin);
+            if (!dshReady(info)) throw new Error("bili: DSH proxy is not full-storage ready");
+            return info!;
+        };
+        const handle = await ensureProxyRunningCore(opts, {
+            ...deps,
+            readInstanceFile: () => {
+                const inst = read();
+                if (isProxyInstanceFile(inst)) return inst;
+                return registry().find((entry) => entry.lane === "dsh" && alive(entry.pid));
+            },
+            fetchHealthInfo: async (origin) => {
+                const info = await health(origin);
+                if (info === undefined) return undefined;
+                if (!dshReady(info)) throw new Error("bili: DSH proxy is not full-storage ready");
+                return info;
+            },
+        });
+        const finalHealth = await readyHealth(handle.origin);
+        const expectedResident = registry().find((entry) => entry.origin === handle.origin && entry.lane === "dsh");
+        if (handle.child?.pid !== undefined ? finalHealth.pid !== handle.child.pid : expectedResident === undefined || finalHealth.pid !== expectedResident.pid || finalHealth.instanceId !== expectedResident.instanceId) {
+            throw new Error("bili: DSH final responder identity changed before takeover");
+        }
+        const completed = readDshPendingChild();
+        // Same #1232 consequence as the pre-spawn gate: the registry entry has no
+        // launchToken, so a token comparison here never matched and the record was
+        // left behind on EVERY successful bring-up — the next bootstrap then met a
+        // leftover whose PID was still alive. The final responder's PID+instanceId
+        // is the identity that matters.
+        if (completed && finalHealth.pid === completed.pid
+            && expectedResident?.pid === completed.pid && finalHealth.instanceId === expectedResident.instanceId) {
+            clearDshPendingChild(completed);
+        }
+        return handle;
+    } finally {
+        fs.closeSync(fd);
+        if (fs.readFileSync(lockPath, "utf8") === owner) fs.unlinkSync(lockPath);
+    }
+}
+
+async function ensureProxyRunningCore(
     opts: LaunchOptions,
     deps: LauncherDeps = {},
 ): Promise<ProxyHandle> {
@@ -4342,12 +5032,21 @@ export async function ensureProxyRunning(
     // (#7/#1183). Awaited before returning: a spawner that dies right after a
     // second session attaches must not beat the registration to the grace
     // window.
+    const recoveryReady = async (origin: string, pid: number, instanceId?: string): Promise<boolean> => {
+        if (!opts.recoverDegradedDsh || opts.lane !== "dsh") return true;
+        const info = await fetchHealthInfo(origin);
+        return dshReady(info) && info?.pid === pid && (instanceId === undefined || info.instanceId === instanceId);
+    };
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
+        if (!(await recoveryReady(inst.origin, inst.pid, inst.instanceId))) throw new Error("bili: DSH attach is not full-storage ready");
         // #3404: host-safe channel (#3200) — a raw console.* here lands on the
         // physical screen bypassing an in-host TUI renderer (host-log.ts),
         // e.g. into Pi's input draft after herdr session restore.
         attachDiag(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
         const reg = await registerWatcher(inst.origin, watchPid);
+        if (opts.recoverDegradedDsh && opts.lane === "dsh" && reg !== "ok") {
+            throw new Error(`bili: DSH watcher registration ${reg}; refusing unsafe attach`);
+        }
         // #3544: keep re-asserting our liveness so the proxy's watchdog ages us
         // out by HEARTBEAT expiry, not just kill(pid,0) (identity-blind under
         // Windows pid reuse). No-op unless we own the pid.
@@ -4370,7 +5069,7 @@ export async function ensureProxyRunning(
     // candidates come from every live registry entry, not only the last
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps?.isConnectable ?? tcpConnectable);
     const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
@@ -4426,7 +5125,7 @@ export async function ensureProxyRunning(
         // #3404: same host-safe channel as attachTo above — normal startup
         // progress, not user-actionable.
         attachDiag("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes, deps?.isConnectable ?? tcpConnectable);
         if (waited) {
             return attachTo(waited);
         }
@@ -4474,6 +5173,13 @@ export async function ensureProxyRunning(
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     rotatePortLogIfNeeded(logPath);
     const logFd = fs.openSync(logPath, "a");
+    // #4811: where THIS spawn's output begins. The port log is append-only and
+    // rotates only at PORT_LOG_MAX_BYTES, so byte 0 may hold another (much
+    // older) spawn's bytes — sampling from here keeps failure reports about
+    // this child. If the file shrank between open and stat (rotation under us)
+    // every byte present is ours and the whole file is sampled.
+    let spawnLogOffset = 0;
+    try { spawnLogOffset = fs.fstatSync(logFd).size; } catch { /* keep 0 */ }
     // #707: publish the starting marker BEFORE spawning so concurrent launches
     // wait for this bring-up instead of double-spawning. The O_EXCL claim is
     // the cross-process arbiter: the read above is only a fast path, so a
@@ -4512,6 +5218,14 @@ export async function ensureProxyRunning(
         // guess WHICH program was actually spawned.
         const runtime = deps.nodeRuntime ?? resolveNodeRuntime();
         try {
+            if (opts.recoverDegradedDsh && opts.lane === "dsh") {
+                const current = readInstance();
+                const residents = [...(deps.listRegistryInstances ?? discoverLiveInstances)()];
+                if (isProxyInstanceFile(current)) residents.push(current);
+                if (residents.some((inst) => (inst.lane === "dsh" || inst.port === opts.port) && (deps.isRecoveryPidAlive ?? isPidAlive)(inst.pid))) {
+                    throw new Error("bili: DSH resident appeared during recovery; refusing a second writer");
+                }
+            }
             child = spawnImpl(
                 runtime,
                 [script, ...proxyStartArgs({ ...opts, port })],
@@ -4520,7 +5234,7 @@ export async function ensureProxyRunning(
                     windowsHide: true,
                     stdio: ["ignore", logFd, logFd],
                     env: {
-                        ...stripInheritedProxy(process.env),
+                        ...stripInheritedLauncherChannels(stripInheritedProxy(process.env)),
                         ...captureInheritedProxyEnv(process.env),
                         // #1429: inside an Electron host the resolved runtime may be this
                         // same binary run as Node — force it so the child runs Node instead
@@ -4542,6 +5256,11 @@ export async function ensureProxyRunning(
                     },
                 },
             );
+            // A startup timeout can leave this detached child alive before it
+            // publishes any registry entry. Keep that owned identity beyond the
+            // transient starting marker/lock; the next recovery must not spawn
+            // a second writer merely because the first handshake is ambiguous.
+            if (opts.recoverDegradedDsh && opts.lane === "dsh") persistDshPendingChild(child, launchToken);
         } finally {
             try {
                 fs.closeSync(logFd);
@@ -4585,10 +5304,21 @@ export async function ensureProxyRunning(
         // open a multi-MB file in %TEMP%.
         const logHeadSample = (): string => {
             try {
+                const size = fs.statSync(logPath).size;
+                // #4811: sample THIS spawn's bytes (from spawnLogOffset), not
+                // byte 0 — an append-only port log keeps every earlier spawn's
+                // output until it rotates at PORT_LOG_MAX_BYTES, and a stale
+                // head actively misdirected triage (#4811 field case: a
+                // two-day-old EADDRINUSE from an older build). A shrunken file
+                // means rotation happened under us — everything left is ours.
+                let start = spawnLogOffset;
+                if (size < start) start = Math.max(0, size - 256);
+                const len = Math.min(256, size - start);
+                if (len <= 0) return "";
                 const fd = fs.openSync(logPath, "r");
                 try {
-                    const buf = Buffer.alloc(256);
-                    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
                     if (n === 0) return "";
                     let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
                     if (s.length > 200) s = `${s.slice(0, 200)}…`;
@@ -4606,8 +5336,18 @@ export async function ensureProxyRunning(
                 // "0 bytes" alone cannot tell "child wrote nothing" from "output
                 // rotated away" (rotatePortLogIfNeeded renames to .old before
                 // the fd is opened) — say which when the rotated half exists.
-                const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
-                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}${logHeadSample()}`;
+                // Same honesty when the child appended NOTHING to a non-empty
+                // file: the bytes on disk then belong to an EARLIER spawn, and
+                // quoting them as this child's head is exactly the #4811
+                // misdirection (a shrunken file means rotation under us — the
+                // bytes left ARE ours, so the tail sample stands). The .old
+                // guard keeps that claim honest: if a rotation happened, the
+                // captured offset is untrustworthy and the sample path applies.
+                const rotatedFile = fs.existsSync(`${logPath}.old`);
+                const rotated = rotatedFile ? `; earlier output rotated to ${logPath}.old` : "";
+                if (size === 0) return `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}`;
+                if (size === spawnLogOffset && !rotatedFile) return `, ${size} bytes — this child appended nothing of its own (earlier content stays on disk until rotation)`;
+                return `, ${size} bytes${rotated}${logHeadSample()}`;
             } catch {
                 return "";
             }
@@ -4666,7 +5406,7 @@ export async function ensureProxyRunning(
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
-                if (await probeHealth(inst.origin, fetchImpl)) {
+                if (await probeHealth(inst.origin, fetchImpl) && await recoveryReady(inst.origin, child.pid, inst.instanceId)) {
                     // #1660: settle the lane's sticky record on the port the
                     // child actually bound (preferred or laddered) so every
                     // later launch of this lane tries it first.
@@ -4686,7 +5426,7 @@ export async function ensureProxyRunning(
             // the preferred-port fallback below, minus the port assumption.
             if (child.pid !== undefined) {
                 const mine = listRegistry().find((e) => e.pid === child.pid);
-                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl))) {
+                if (mine && mine.origin !== "" && (await probeHealth(mine.origin, fetchImpl)) && await recoveryReady(mine.origin, child.pid, mine.instanceId)) {
                     settleZonePort(mine.port);
                     startOwnerHeartbeat(mine.origin, watchPid);
                     return { origin: mine.origin, port: mine.port, child, logPath };
@@ -4708,7 +5448,7 @@ export async function ensureProxyRunning(
             if (stale) {
                 const preferredOrigin = proxyOrigin(opts.host, port);
                 const info = await fetchHealthInfo(preferredOrigin);
-                if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
+                if (info?.ok && child.pid !== undefined && info.pid === child.pid && (!(opts.recoverDegradedDsh && opts.lane === "dsh") || dshReady(info))) {
                     settleZonePort(port);
                     startOwnerHeartbeat(preferredOrigin, watchPid);
                     return { origin: preferredOrigin, port, child, logPath };
@@ -4750,7 +5490,7 @@ export async function ensureProxyRunning(
             const rediscoveryDeadline = now() + POST_EXIT_REDISCOVERY_MS;
             while (now() < rediscoveryDeadline) {
                 await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
                 const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
                 if (late) {
                     // #3404: successful-attach announcement on the recovery
@@ -4801,6 +5541,7 @@ export async function ensureProxyRunning(
         // after the kill turns "bound but hung" into a misleading
         // ECONNREFUSED.
         const diagnosis = await diagnosePort(true);
+        if (opts.recoverDegradedDsh && opts.lane === "dsh") throw new Error(`bili: DSH child readiness unknown after ${SPAWN_BUDGET_MS}ms; refusing blind force-kill — ${diagnosis}`);
         killAbandonedChild(child);
         console.error(
             `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (log: ${logPath}${logTail()})`,
@@ -4835,15 +5576,27 @@ function killAbandonedChild(child: SpawnChild | undefined): void {
         // its own helpers, e.g. self-update npm runs, survives the "abandoned"
         // kill). taskkill /T walks the whole tree; the direct kill below stays
         // as the fallback if taskkill itself fails.
+        let tkError: string | undefined;
         try {
-            spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true, stdio: "ignore" });
-        } catch {
-            /* taskkill unavailable — direct kill below */
+            const tk = spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true, stdio: "ignore" });
+            if (tk.error !== undefined) tkError = tk.error.message;
+            else if (tk.status !== 0) tkError = `exit ${tk.status}`;
+        } catch (err) {
+            tkError = err instanceof Error ? err.message : String(err);
+        }
+        // #4125: a failed taskkill used to vanish silently here — exactly how a
+        // "killed" abandoned child could keep holding its listener. Surface it;
+        // a non-zero exit can also mean the pid already left (harmless — the
+        // direct kill below still runs).
+        if (tkError !== undefined) {
+            teeLog("warn", `bili: taskkill of abandoned proxy ${child.pid} reported failure (${tkError}) — its listener may survive the cleanup (#4125)`);
         }
     }
     try {
         child.kill?.("SIGKILL");
-    } catch {}
+    } catch (err) {
+        teeLog("warn", `bili: direct SIGKILL of abandoned proxy ${child.pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+    }
 }
 
 export function stopProxy(handle: ProxyHandle): void {
@@ -4969,7 +5722,12 @@ export function planClientSpawn(
             "Set BILI_CLIENT_BIN to the native executable (e.g. the real codex.exe) or to a script entry run under node, or reword the argument.",
         );
     });
-    const comspec = nonEmpty(env.COMSPEC) ? env.COMSPEC : "cmd.exe";
+    // #4599: Windows env vars are case-insensitive, but sanitized copies
+    // (spread objects, e.g. stripInheritedProxy's inlineEnv) keep the original
+    // key casing — `ComSpec` — where an exact `env.COMSPEC` probe misses it
+    // and silently degrades to the bare-name fallback. Probe every spelling.
+    const comspecRaw = env.COMSPEC ?? env.ComSpec ?? env.comspec;
+    const comspec = nonEmpty(comspecRaw) ? comspecRaw : "cmd.exe";
     return {
         command: comspec,
         args: ["/d", "/s", "/c", buildWindowsCommandLine(cmd, args)],
@@ -5260,6 +6018,39 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
         config.codex = eff.config;
     }
+    // #3203: concurrent `bili codex` sessions each run their own session-scoped
+    // proxy, so they must not read as #3044 twins of each other (same build +
+    // same lane + same preferred port ⇒ the second child exits as a
+    // "duplicate"). Shared-mode overlay-backed launches therefore claim their
+    // per-session slot HERE, before the proxy starts, and run it under the
+    // slot-derived lane (codexSlotLane); legacy mode keeps the single fixed
+    // overlay (exclusive lease ⇒ no concurrency possible) and the plain
+    // "codex" lane. Refusal here happens pre-proxy: nothing was started yet,
+    // so exit 1 leaks no detached child (the post-proxy abort path stays for
+    // legacy mode only).
+    let codexSlot: string | undefined;
+    let codexLane: string | undefined;
+    // Resolved once here (not again in the codex env branch below) so the
+    // #2222 mode-decision warnings fire exactly once per launch.
+    let codexStateMode: CodexStateMode | undefined;
+    let codexSharedSqlite = false;
+    if (base === "codex") {
+        const { command: codexBinPre, prefixArgs: codexPrefixPre } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
+        codexStateMode = resolveCodexStateMode(process.env.BILI_CODEX_STATE_MODE, codexSupportsSqliteHome(codexBinPre, codexPrefixPre, deps.platform ?? process.platform));
+        codexSharedSqlite = codexStateMode === "shared";
+        const needsOverlay = !launcherDirectUrl(process.env) || launcherInjectMcp(process.env, base, codexUpstreamUrl(config.codex));
+        if (codexSharedSqlite && needsOverlay) {
+            try {
+                codexSlot = prepareCodexSessionSlot(resolveCodexHome(process.env));
+            } catch (err) {
+                if (!(err instanceof OverlayBusyError)) throw err;
+                console.error(`bili: ${err.message}`);
+                process.exit(1);
+            }
+            codexLane = codexSlotLane(codexSlot);
+            console.error(`bili: codex session slot ${path.basename(codexSlot)} claimed — this launch's proxy runs on lane ${codexLane} (concurrent sessions stay isolated, #3203).`);
+        }
+    }
     let routes = discoverRoutes(base, config);
     if (base === "aider") {
         // #1048: the CLI channel (--openai-api-base / --set-env) outranks env
@@ -5293,6 +6084,95 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             );
         }
     }
+    // `bili pi-inline` (#3278/#4526): launch pi on the IN-PROCESS engine — no
+    // proxy is spawned at all. BILI_PI_INLINE outranks ambient attach envs in
+    // planNativePi, so the child's own bili extension arms inline mode and
+    // (with the loopback WS bridge) also takes the codex WebSocket lane. The
+    // extension MUST be loadable here: with no proxy there is no wire-mode
+    // fallback, so a missing extension would silently run uncompressed.
+    if (params.client === "pi-inline") {
+        const piExt = selfDistFile("agent/pi.js");
+        const extAvailable = (piExt !== undefined && fs.existsSync(piExt)) || piPluginInstalled(piRealHome);
+        if (!extAvailable) {
+            console.error(
+                "bili: pi-inline needs the bili pi extension — run `bili plugin install pi` or reinstall billion-context " +
+                    "(dist/agent/pi.js missing and the plugin is not installed in " + piRealHome + "/settings.json)",
+            );
+            process.exit(2);
+            return;
+        }
+        // Clean slate for the child: a stale inherited BILLION_CONTEXT_PROXY
+        // would make planNativePi ATTACH instead of arming the in-process
+        // engine, and inherited proxy/MITM env has nothing to do inline (no
+        // TLS is terminated in this lane).
+        const inlineEnv = stripInheritedProxy(process.env);
+        delete inlineEnv.BILLION_CONTEXT_PROXY;
+        delete inlineEnv.BILI_MITM_HOSTS;
+        inlineEnv.BILI_PI_INLINE = "1";
+        let inlineArgs = params.clientArgs;
+        // Same single-load rule as the proxy lane: when settings.json already
+        // loads the plugin, `-e` on top would double-register it.
+        if (piExt && fs.existsSync(piExt) && !piPluginInstalled(piRealHome)) {
+            inlineArgs = ["-e", piExt, ...inlineArgs];
+        }
+        console.error("bili: pi-inline — compression runs inside pi (in-process engine + loopback WS bridge); no proxy is started.");
+        const { command, prefixArgs } = resolveClientCommand("pi", process.env, deps.platform ?? process.platform);
+        let inlineCode = 0;
+        try {
+            inlineCode = await runClient(command, [...prefixArgs, ...inlineArgs], inlineEnv, {
+                spawnImpl: deps.spawnImpl,
+                platform: deps.platform,
+            });
+        } catch (err) {
+            console.error(`bili: failed to launch pi-inline: ${err instanceof Error ? err.message : String(err)}`);
+            inlineCode = 1;
+        }
+        process.exit(inlineCode ?? 0);
+        return;
+    }
+    // `bili opencode-inline` (#4669): launch opencode on the IN-PROCESS engine
+    // — no proxy is spawned at all. BILI_OPENCODE_INLINE outranks ambient
+    // attach envs in planNativeOpencode, so the child's plugin arms inline
+    // mode by itself. The plugin entry rides the SAME OPENCODE_CONFIG clone
+    // the proxy lane uses (plugin injection only — no baseURL rewrites: the
+    // inline intercept catches bare model URLs), so opencode 2.x gets its
+    // required directory wrapper and a missing dist entry fails loud instead
+    // of silently running uncompressed.
+    if (params.client === "opencode-inline") {
+        const ocPlugin = selfDistFile("agent/opencode-native.js");
+        if (ocPlugin === undefined || !fs.existsSync(ocPlugin)) {
+            console.error("bili: opencode-inline needs the bili opencode plugin entry (dist/agent/opencode-native.js missing) — reinstall billion-context.");
+            process.exit(2);
+            return;
+        }
+        // Clean slate for the child: a stale inherited BILLION_CONTEXT_PROXY
+        // would make planNativeOpencode ATTACH instead of arming the
+        // in-process engine, and inherited proxy/MITM env has nothing to do
+        // inline (no TLS is terminated in this lane).
+        const inlineEnv = stripInheritedProxy(process.env);
+        delete inlineEnv.BILLION_CONTEXT_PROXY;
+        delete inlineEnv.BILI_MITM_HOSTS;
+        inlineEnv.BILI_OPENCODE_INLINE = "1";
+        // Plugin injection only: empty rewrite lists mean `origin` is unused;
+        // dir mode mirrors the proxy lane for OpenCode 2.x.
+        const dirMode = opencodeMajorVersion(resolveClientCommand("opencode", process.env).command) >= 2;
+        const ocTmp = prepareOpencodeHttpRewrite(readOpencodeConfigRoot(process.env), "", [], [], ocPlugin, dirMode, inlineEnv);
+        if (ocTmp) inlineEnv.OPENCODE_CONFIG = ocTmp;
+        console.error("bili: opencode-inline — compression runs inside opencode (in-process engine); no proxy is started.");
+        const { command, prefixArgs } = resolveClientCommand("opencode", process.env, deps.platform ?? process.platform);
+        let inlineCode = 0;
+        try {
+            inlineCode = await runClient(command, [...prefixArgs, ...params.clientArgs], inlineEnv, {
+                spawnImpl: deps.spawnImpl,
+                platform: deps.platform,
+            });
+        } catch (err) {
+            console.error(`bili: failed to launch opencode-inline: ${err instanceof Error ? err.message : String(err)}`);
+            inlineCode = 1;
+        }
+        process.exit(inlineCode ?? 0);
+        return;
+    }
     if (base === "omp" && routes.httpRewrites.length > 0) {
         const ompExt = selfDistFile("agent/omp.js");
         const extAvailable = (ompExt !== undefined && fs.existsSync(ompExt)) || ompPluginLoadedFrom(ompRealHome);
@@ -5322,7 +6202,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(childMitmEnv), ...domains, ...discoverMitmDomains(discoveryEnv)])
         : [];
     const extNonHttpProviders = base === "pi" || base === "omp" ? resolveNonHttpProviders(process.env) : [];
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, strictPort: port > 0, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: codexLane ?? base, strictPort: port > 0, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             ((base !== "kimi" && base !== "mcode" && base !== "aider" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -5777,13 +6657,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // self-registration (codex provides no session id of its own).
         const codexConversationId = injectMcp ? randomUUID() : undefined;
         const codexCaPath = resolveCombinedCaPath(process.env);
+        const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
+        // #2222: state-db strategy (resolved pre-proxy above — see codexSlot
+        // claim block). On binaries that honor CODEX_SQLITE_HOME the live state
+        // dbs stay in the REAL home — one physical path per db, so native and
+        // bili runs coordinate through SQLite's own WAL locking instead of bili
+        // copying/adjudicating generations (#381/#1917/#2195 family).
+        // BILI_CODEX_STATE_MODE=legacy keeps the old overlay-copy path.
+        const codexSharedSqlite = (codexStateMode ?? "legacy") === "shared";
         if (directUrl) {
             env = { ...stripInternalLauncherChannels(process.env), BILLION_CONTEXT_PROXY: origin };
         } else {
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             if (!codexRunModePinned(params.clientArgs)) {
-                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
                 if (codexSupportsNoDaemon(codexBin, codexPrefix, deps.platform ?? process.platform)) {
                     clientArgs = ["--no-daemon", ...clientArgs];
                     console.error("bili: codex pinned to embedded mode (--no-daemon) — the launcher proxy is session-scoped; a shared background server would outlive it and bypass compression.");
@@ -5807,6 +6694,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // direct-URL launches only need it to carry the MCP server block.
         if (!directUrl || (injectMcp && codexConversationId !== undefined)) {
             const codexRealHome = resolveCodexHome(process.env);
+            // A user-set CODEX_SQLITE_HOME wins over our default (the real home):
+            // native codex already reads state from there, so bili must share
+            // the SAME location to keep one logical database across both.
+            const userSqliteHome = process.env.CODEX_SQLITE_HOME?.trim() || undefined;
             let inj: ReturnType<typeof prepareCodexMcpInjection>;
             try {
                 inj = prepareCodexMcpInjection({
@@ -5815,6 +6706,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                     caPath: codexCaPath,
                     conversationId: codexConversationId,
                     manageRouting: !directUrl,
+                    sharedSqlite: codexSharedSqlite,
+                    sqliteHome: codexSharedSqlite ? userSqliteHome ?? codexRealHome : undefined,
+                    // #3203: the slot was claimed pre-proxy (its lease is
+                    // active in this process) — phase 2 must not re-run
+                    // migration/allocation (see prepareCodexSessionSlot).
+                    sessionSlot: codexSharedSqlite ? codexSlot : undefined,
                 });
             } catch (err) {
                 if (!(err instanceof OverlayBusyError)) throw err;
@@ -5824,6 +6721,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
             if (inj.warning) console.error(`bili: ${inj.warning}`);
+            if (inj.envPatch.CODEX_SQLITE_HOME !== undefined) {
+                console.error(
+                    `bili: codex state shared — CODEX_SQLITE_HOME=${inj.envPatch.CODEX_SQLITE_HOME}; ` +
+                        "the SQLite state lives in the real home (one live db across native/bili runs), no overlay copies.",
+                );
+            }
             // #1965: remember the exact home pair this launch used so a clean
             // exit can write the run's data back into the REAL home. Only set
             // when the overlay actually became CODEX_HOME — a failed prepare
@@ -5858,6 +6761,14 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             ? buildClaudePluginEnv(origin, true, stripInternalLauncherChannels(process.env), claudeVertex)
             : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInternalLauncherChannels(process.env));
         if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        // The preset sets no proxy/CA env: the /bili/ URL above is plain http on
+        // loopback, so nothing needs trusting or tunnelling. A child that has no
+        // proxy of its own then falls back to the instance's own aux egress
+        // rather than silently losing what the leaked HTTPS_PROXY used to give
+        // it. `process.env` is passed unstripped on this lane on purpose — a
+        // shell proxy here is the user's, not something to strip: model traffic
+        // goes to loopback, so it cannot be hijacked by it.
+        env = await applyAuxProxyHandoff(env, handle.origin, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
         // An unroutable Vertex lane is a warning, not a silent downgrade: the
         // client would call Google directly and bili would see nothing at all.
         if (config.claude?.vertexEnabled && claudeVertex === null) {

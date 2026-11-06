@@ -6,13 +6,20 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight, isLegacyBcpEntry, legacyBcpEntriesIn, planNativePi, armNativePi, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest } from "../src/agent/pi-native.ts";
+import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight, isLegacyBcpEntry, legacyBcpEntriesIn, planNativePi, armNativePi, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } from "../src/agent/pi-native.ts";
 import { INLINE_ORIGIN } from "../src/inline-engine.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
 
 // #1135 wiring tests drive verifyAttachAndRecover against a dead target — cap
 // the routed-evidence grace so the probe fails fast instead of paying the 5s default.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
+
+// #3501: a dev shell running pi through a launcher exports a live attach
+// target; verifyAttachAndRecover reads BILLION_CONTEXT_ATTACH explicitly, so
+// every suite below must start from a clean slate or it silently binds to the
+// real proxy instead of the mock it set up.
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
 
 // #820 coexistence: standalone billion-context-pi checks env at load time, so
 // the marker must be set synchronously during module evaluation (before our
@@ -127,8 +134,14 @@ test("legacyBcpEntriesIn: reads packages[], tolerates missing/broken files", () 
     assert.deepEqual(legacyBcpEntriesIn(path.join(dir, "missing.json")), []);
 });
 
-test("planNativePi: default is spawn; opt-out and /bili/ launches are off", () => {
-    assert.deepEqual(planNativePi({}), { mode: "spawn" });
+test("planNativePi: default is the in-process inline lane (#4571); opt-out and /bili/ launches are off", () => {
+    // plain `pi` with the plugin and no signals plans the spawned proxy —
+    // inline is OPT-IN (#4687 reverts the #4571 default flip; owner rule:
+    // never change defaults). Explicit opt-out paths also plan the server.
+    assert.deepEqual(planNativePi({}), { mode: "spawn" }, "default stays spawn (no default flip)");
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}, false), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}, true), { mode: "inline" });
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILI_NATIVE_PI: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), { mode: "off" });
@@ -149,7 +162,8 @@ test("planNativePi: a preset BILLION_CONTEXT_PROXY is an attach target, not a st
     // kill switches and a /bili/ launch still win over the preset
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
-    // a garbage / blank preset falls back to spawn (self-managed), never dead-off
+    // a garbage / blank preset falls back to self-managed — the spawned
+    // server (historical default), never dead-off
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "spawn" });
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "  " }), { mode: "spawn" });
 });
@@ -180,7 +194,7 @@ test("#3278: BILI_PI_INLINE plans the no-server lane and outranks ambient attach
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
     // unset / off values keep today's postures untouched
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }), { mode: "spawn" });
-    assert.deepEqual(planNativePi({}), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}), { mode: "spawn" }, "default stays spawn (no default flip)");
 });
 
 test("#3278: pi.inline (config file) enables the lane; env resolves over it", () => {
@@ -272,6 +286,107 @@ test("#1135 wiring: a healthy attach target stays attached (no migration, no spa
         server.close();
         if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
+});
+
+// — #3501: an explicit attach endpoint stays authoritative over routed model-origin evidence —
+
+const R3501_UPSTREAM = "https://api.deepseek.com/v1/chat/completions";
+
+async function startGatedModelOrigin(): Promise<{ origin: string; close: () => void; manifestHits: () => number }> {
+    let hits = 0;
+    const server = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") hits++;
+        res.statusCode = 403;
+        res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    return {
+        origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+        close: () => { server.closeAllConnections?.(); void server.close(); },
+        manifestHits: () => hits,
+    };
+}
+
+test("#3501 wiring: pre-planted routed evidence from an admin-gated origin does not displace an explicit attach", async () => {
+    const attach = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ version: "0.1.175", tools: [] }));
+            return;
+        }
+        res.statusCode = 404;
+        res.end();
+    });
+    await new Promise<void>((r) => attach.listen(0, "127.0.0.1", () => r()));
+    const attachOrigin = `http://127.0.0.1:${(attach.address() as AddressInfo).port}`;
+    const model = await startGatedModelOrigin();
+    try {
+        _resetNativeStateForTest();
+        process.env.BILLION_CONTEXT_ATTACH = attachOrigin;
+        _noteRoutedForTest(`${model.origin}/bili/${R3501_UPSTREAM}`);
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7777";
+        });
+        armNativePi({ mode: "attach", attachOrigin });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, attachOrigin, "recovery probes the explicit plugin endpoint, not the model-only origin");
+        assert.equal(spawned, 0, "a second proxy must not be spawned for an API-only model route");
+        assert.equal(model.manifestHits(), 0, "pre-existing model-route evidence must not override explicit attach");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, attachOrigin);
+    } finally {
+        attach.closeAllConnections?.();
+        attach.close();
+        model.close();
+        delete process.env.BILLION_CONTEXT_ATTACH;
+        delete process.env.BILLION_CONTEXT_PROXY;
+        _setSpawnForTest(undefined);
+        _resetNativeStateForTest();
+    }
+});
+
+test("#3501 wiring: late routed evidence from an admin-gated origin does not rebind away from a healthy explicit attach", async () => {
+    const attach = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ version: "0.1.175", tools: [] }));
+            return;
+        }
+        res.statusCode = 404;
+        res.end();
+    });
+    await new Promise<void>((r) => attach.listen(0, "127.0.0.1", () => r()));
+    const attachOrigin = `http://127.0.0.1:${(attach.address() as AddressInfo).port}`;
+    const model = await startGatedModelOrigin();
+    try {
+        _resetNativeStateForTest();
+        process.env.BILLION_CONTEXT_ATTACH = attachOrigin;
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7777";
+        });
+        armNativePi({ mode: "attach", attachOrigin });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, attachOrigin, "healthy explicit target resolves to itself");
+        _noteRoutedForTest(`${model.origin}/bili/${R3501_UPSTREAM}`);
+        const deadline = Date.now() + 5000;
+        while (model.manifestHits() < 1 && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.equal(model.manifestHits(), 1, "the hook liveness-probes the late routed origin exactly once");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, attachOrigin, "a failing probe must not rebind off the healthy explicit endpoint");
+        assert.equal(spawned, 0);
+    } finally {
+        attach.closeAllConnections?.();
+        attach.close();
+        model.close();
+        delete process.env.BILLION_CONTEXT_ATTACH;
+        delete process.env.BILLION_CONTEXT_PROXY;
+        _setSpawnForTest(undefined);
         _resetNativeStateForTest();
     }
 });

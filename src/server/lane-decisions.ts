@@ -25,7 +25,7 @@
 import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
-import { CODE_MODE_OMNIBUS_TOOL_NAMES } from "../compress-tool.js";
+import { CODE_MODE_OMNIBUS_TOOL_NAMES, mcpBiliToolName } from "../compress-tool.js";
 
 type LaneProtocol = "anthropic" | "openai" | "google" | "responses";
 
@@ -114,10 +114,12 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
         matches: (s) => !s.headerNames.has("x-bili-plugin") && (s.headerNames.has("x-codex-turn-metadata") || s.codexUserAgent),
     },
     {
-        // claude over Responses (#970): subagents SHARE the main agent's
-        // session id (the anthropic path splits them via claudeSubagentSplit;
-        // a claude client on the Responses wire only has this fingerprint).
-        profile: { ...ANONYMOUS, identity: "claude-responses", instructionsFingerprintKeyed: true },
+        // claude code (#970/#4352): subagents SHARE the main agent's session
+        // id on every wire. The responses wire separates them via the
+        // instructions fingerprint (instructionsFingerprintKeyed); the
+        // anthropic wire via the order resolver (personaOrderKeyed) when the
+        // two-signal header gate (claudeSubagentAgentId) misses.
+        profile: { ...ANONYMOUS, identity: "claude-responses", instructionsFingerprintKeyed: true, personaOrderKeyed: true },
         matches: (s) => s.conversationSourceName === "x-claude-code-session-id",
     },
 ];
@@ -154,6 +156,12 @@ interface LaneDecisions {
     /** Legacy alias kept for the four prepares' migration: TRUE when the
      * surface must be OFF (the old `dshCompressSurfaceOff` variable). */
     readonly compressSurfaceOff: boolean;
+    /** #4344: this plugin-mode request declares the compress tool ONLY in the
+     * MCP dialect (`mcp__bili__compress`, no bare `compress`) — the standing
+     * prompt must teach the model the name it can actually call (see
+     * withMcpDialectNote). False in proxy mode (bili injects the bare tools
+     * itself, so the bare name is always callable). */
+    readonly mcpDialect: boolean;
     /** #3482 site 1: should this lane's summary side-calls carry the billing
      * attribution block extracted from the client system (#2189)? The dsh
      * profile declares it (subscription-OAuth lanes 429 without it); any
@@ -169,6 +177,15 @@ interface LaneDecisionInput {
     readonly parsed: unknown;
     /** injectTool config (`shouldInject`) — the config-level master switch. */
     readonly shouldInject: boolean;
+    /** TRUE when THIS request carries the plugin lane header (`x-bili-plugin`),
+     * false when a sticky plugin-bound session serves a headerless round.
+     * Undefined = caller could not observe (matrix tests, legacy callers) —
+     * never triggers the zombie clause below. #2155/#4344 boundary: an idle
+     * bridge sends the header but no ACP tools (surface may go silent); a
+     * zombie round sends NO header at all because the plugin is gone (client
+     * uninstalled/crashed) — those rounds must keep the nudge/self-heal
+     * probe alive or degrade-to-proxy can never fire. */
+    readonly pluginHeaderPresent?: boolean;
 }
 // ④ nudgeOn — the ONE nudge-injection gate (#3482 Step 2.5). The four
 // prepares used to carry four hand-copied conjunctions that drifted (#3293:
@@ -232,9 +249,13 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // In PLUGIN mode the host owns the tool table: reach when this request
     // declares `compress` (observed — some dsh profiles DO surface it, #3401)
     // or the host exposes bili tools to the model by design (profile default,
-    // #3177). PTC presets collapse EVERY tool into a single omnibus (SDK
-    // bindings nested inside it), so top-level absence of `compress` is not
-    // evidence of unreachability there — ANY known omnibus name reads as
+    // #3177). #4344: the declaration counts in EITHER dialect — MCP-bridged
+    // hosts (zcode/claude-code) carry `mcp__bili__compress`, and a lane whose
+    // bridge is healthy must not read as unreachable just because the name is
+    // prefixed (session-self-heal's biliToolsDeclaredOnWire docs the same
+    // dual dialect). PTC presets collapse EVERY tool into a single omnibus
+    // (SDK bindings nested inside it), so top-level absence of `compress` is
+    // not evidence of unreachability there — ANY known omnibus name reads as
     // reachable. Known shapes live in CODE_MODE_OMNIBUS_TOOL_NAMES (run_code
     // = dsh-tools built-in, DSH 0.1.x; code_run = dsh-codemode transport,
     // DSH 0.2.x): #3600's miss was released 0.1.198 suppressing the surface
@@ -244,9 +265,19 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // threshold, fully silent).
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
+        || declaredTools.has(mcpBiliToolName("compress"))
         || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
-        || !profile.toolsHostScopedByDefault;
+        || !profile.toolsHostScopedByDefault
+        // #2155: a sticky plugin-bound round with NO lane header is the zombie
+        // shape (plugin gone from the client). The nudge channel doubles as
+        // the self-heal probe — suppressing it here starves zombieStreak and
+        // degrade-to-proxy never fires (#4372's zcode profile did exactly
+        // that). Headerless rounds keep the surface ON so the probe runs;
+        // once degraded, proxy tool injection replaces the lane anyway.
+        // (#4344's silent-bridge case always sends the header — unaffected.)
+        || (input.pluginMode && input.pluginHeaderPresent === false);
     const compressSurfaceOn = input.shouldInject && compressReachable;
+    const mcpDialect = input.pluginMode && declaredTools.has(mcpBiliToolName("compress")) && !declaredTools.has("compress");
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
     const billingBlockWanted = profile.wantsBillingBlock || billingBlockObserved;
     return Object.freeze({
@@ -255,6 +286,7 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         toolsReachable: Object.freeze({ compress: compressReachable }),
         compressSurfaceOn,
         compressSurfaceOff: !compressSurfaceOn,
+        mcpDialect,
         billingBlockWanted,
     });
 }

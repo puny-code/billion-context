@@ -64,6 +64,18 @@ function settle(ms = 120): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
 }
 
+// #4161: windows-latest runner load can starve the event loop past a fixed
+// ms-budget; poll until the condition holds or the budget expires — the
+// verdict is the same either way, only the happy path becomes load-tolerant.
+async function pollFor(cond: () => boolean, budgetMs: number): Promise<boolean> {
+    const t0 = Date.now();
+    while (!cond()) {
+        if (Date.now() - t0 > budgetMs) return false;
+        await settle(50);
+    }
+    return true;
+}
+
 let seq = 0;
 function makeSession(id?: string): Session {
     seq += 1;
@@ -222,12 +234,65 @@ test("#3818 ④ verifyDrift in the wire; drifted session reads the envelope whil
         sh.record = () => {};
         (session.stats as { requests: number }).requests = 99;
         store.scheduleSave(session);
+        // Commit the v2 envelope synchronously: a fixed 120ms settle races a
+        // slow FS (win/node24 runner saw the v1 envelope and served 2).
+        assert.ok(store.flushSync(session), "v2 envelope committed");
         await settle();
         sh.record = realRecord;
 
         const reloaded = store.loadSync("drift-session");
         assert.ok(reloaded, "session loads");
         assert.equal((reloaded.stats as { requests?: number }).requests, 99, "drifted session must serve the envelope (file) view, not the stale index view");
+        store.closeQuietly();
+        rmrf(dir);
+    } finally {
+        delete process.env.BILI_STORAGE_UNIFIED;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// 4b. #4323: when the two sides drift, the RICHER side wins — a stale
+// envelope (older multi-writer generation) must not resurrect an outdated
+// fold state over a newer index generation.
+// ---------------------------------------------------------------------------
+
+test("#4323 4b drifted session serves the richer side — a stale envelope loses to a newer index generation", async () => {
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        const dir = tmpDir("drift-rich");
+        const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+        const session = makeSession("drift-rich-session");
+        const byRef: Record<string, string> = {};
+        const byRaw: Record<string, string> = {};
+        for (let i = 1; i <= 8; i++) {
+            const ref = "m" + String(i).padStart(5, "0");
+            byRef[ref] = "raw-" + i;
+            byRaw["raw-" + i] = ref;
+        }
+        (session.state as { messageRefs: { byRef: Record<string, string>; byRaw: Record<string, string> } }).messageRefs = { byRaw, byRef };
+        store.scheduleSave(session);
+        await settle(300);
+        const sh = (store as unknown as { shadow?: { record(r: unknown): void; driftedSessions?: Set<string> } }).shadow;
+        assert.ok(sh, "full mode opens a sidecar");
+
+        // Freeze the index at the RICH v1, then let a stale writer commit a
+        // SMALLER v2 to the envelope only — the #4323 multi-writer shape.
+        const realRecord = sh.record.bind(sh);
+        sh.record = () => {};
+        if (!sh.driftedSessions) sh.driftedSessions = new Set();
+        sh.driftedSessions.add("drift-rich-session");
+        const stale = makeSession("drift-rich-session");
+        (stale.state as { messageRefs: { byRef: Record<string, string>; byRaw: Record<string, string> } }).messageRefs = { byRaw: { old1: "m00001" }, byRef: { m00001: "old1" } };
+        (stale.stats as { requests: number }).requests = 42;
+        store.scheduleSave(stale);
+        assert.ok(store.flushSync(stale), "smaller (stale envelope) committed");
+        await settle();
+        sh.record = realRecord;
+
+        const reloaded = store.loadSync("drift-rich-session");
+        assert.ok(reloaded, "session loads");
+        const refs = Object.keys((reloaded.state as { messageRefs?: { byRef?: Record<string, string> } }).messageRefs?.byRef ?? {}).length;
+        assert.ok(refs >= 8, "the richer index side must win the drift (want >= 8 refs — the stale envelope had 1), got " + refs);
         store.closeQuietly();
         rmrf(dir);
     } finally {
@@ -287,10 +352,13 @@ test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the sa
             sh.stats.disabled = true;
         };
         store.scheduleSave(session);
-        await settle(400);
+        // windows-latest load can delay the debounce tick + fs visibility past the old fixed 400ms settle (#4161); poll for the envelope within a 15s budget instead —
+        // the same-tick guarantee under test lives in the code path (the disabled-mid-build branch writes JSON synchronously), not in the sleep length, and a
+        // genuinely dead fallback path still fails after the budget.
+        const envelopeLanded = await pollFor(() => findStateFile(dir, "threestrike-session") !== null, 15000);
         sh.record = realRecord;
         assert.ok(calls >= 1, "the writerOff build reached the sidecar");
-        assert.ok(findStateFile(dir, "threestrike-session"), "the disabling tick must land a JSON write — no window where the save exists on neither copy");
+        assert.ok(envelopeLanded, "the disabling tick must land a JSON write — no window where the save exists on neither copy");
         store.closeQuietly();
         rmrf(dir);
     } finally {
@@ -304,7 +372,7 @@ test("#3818 ⑥ writerOff save that disables the sidecar still lands JSON the sa
 //    up on NO copy at all (index skips it, writerOff wrote no file)
 // ---------------------------------------------------------------------------
 
-test("#3818 ⑨ writerOff + reap-shape lands a JSON envelope anyway (no silent data death)", async () => {
+test("#4242 ⑨ writerOff + reap-shape rides the index journal (orphans are representable, #4216)", async () => {
     _resetStorageRuntimeStatusForTest();
     process.env.BILI_STORAGE_UNIFIED = "full";
     process.env.BILI_STORAGE_JSON_WRITER = "0";
@@ -316,15 +384,19 @@ test("#3818 ⑨ writerOff + reap-shape lands a JSON envelope anyway (no silent d
         (session.blockContents as Map<string, unknown>).set("b1", { one: null, full: { text: "retained zombie summary", count: 1 } });
         store.scheduleSave(session);
         await settle(300);
-        assert.ok(countStateFiles(dir) >= 1, "the safety valve lands a JSON envelope even under writerOff");
-        const sh = (store as unknown as { shadow?: { stats: { orphanSkips: number } } }).shadow;
-        assert.ok((sh?.stats.orphanSkips ?? 0) >= 1, "the mirror skipped the unrepresentable record");
+        // writerOff stays off — the record's durability comes from the index
+        // (sessions.orphans_json), no JSON-envelope escape hatch is needed.
         store.closeQuietly();
 
         const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
         const reloaded = store2.loadSync("reap-writereoff-session");
-        assert.equal((reloaded?.blockContents.get("b1") as { full: { text: string } } | undefined)?.full?.text, "retained zombie summary",
-            "the retained content survives the restart via the envelope");
+        assert.ok(reloaded, "record reloads under full mode (index-served)");
+        // The journal must carry the CONTENT, not just the key — pin the exact
+        // bytes so a placeholder/empty entry can't pass as "survived".
+        const reloadedB1 = (reloaded.blockContents as Map<string, unknown>).get("b1") as
+            | { full?: { text?: string } }
+            | undefined;
+        assert.equal(reloadedB1?.full?.text, "retained zombie summary", "orphan content survives via the journal");
         store2.closeQuietly();
         rmrf(dir);
     } finally {
@@ -337,38 +409,75 @@ test("#3818 ⑨ writerOff + reap-shape lands a JSON envelope anyway (no silent d
 // 8. #2695 reap-shape records stay envelope-served, never gutted by the index
 // ---------------------------------------------------------------------------
 
-test("#3818 review: reap-shape records (content kept, block gone) stay envelope-served across restart", async () => {
+test("#4242 review: reap-shape records ride the ingest journal and reload fresh (#4216 freeze fix)", async () => {
     _resetStorageRuntimeStatusForTest();
     process.env.BILI_STORAGE_UNIFIED = "full";
     try {
-        const dir = tmpDir("reap");
+        const dir = tmpDir("reap-representable");
         const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
-        const session = makeSession("reap-session");
-        // reapDestroyedSubstrate (#2695) shape: state.blocks loses the entry,
-        // blockContents keeps the text for the derived-decompress fallback.
-        (session.blockContents as Map<string, unknown>).set("b1", { one: null, full: { text: "retained zombie summary", count: 1 } });
-        store.scheduleSave(session);
-        await settle(300);
-        const sh = (store as unknown as { shadow?: { stats: { orphanSkips: number } } }).shadow;
-        assert.ok(sh, "full mode opens a sidecar");
-        assert.ok((sh.stats.orphanSkips ?? 0) >= 1, "an unrepresentable record is skipped from the mirror, not gutted into it");
-        const reloaded = store.loadSync("reap-session");
-        assert.ok(reloaded, "session loads");
-        assert.equal((reloaded.blockContents.get("b1") as { full: { text: string } }).full.text, "retained zombie summary", "same-process read keeps the retained content");
+        const session = makeSession("reap-representable-session");
+        const base = (session.stats as { requests: number }).requests;
+        (session.blockContents as Map<string, unknown>).set("b9", { one: null, full: { text: "reaped original", count: 2 } });
+        await store.writeNow(session);
+        // A LATER save (requests advanced) with the same orphan still carried.
+        session.stats.requests = base + 5;
+        await store.writeNow(session);
         store.closeQuietly();
 
-        // Restart: nothing was ever ingested, so the cold read import-skips
-        // again and serves the envelope — the index never holds this shape.
         const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
-        const reloaded2 = store2.loadSync("reap-session");
-        assert.ok(reloaded2, "session loads after restart");
-        assert.equal((reloaded2.blockContents.get("b1") as { full: { text: string } }).full.text, "retained zombie summary", "cross-restart read keeps the retained content");
-        const sh2 = (store2 as unknown as { shadow?: { stats: { imports: number; orphanSkips: number } } }).shadow;
-        assert.equal(sh2?.stats.imports, 0, "the unrepresentable record never enters the index");
-        assert.ok((sh2?.stats.orphanSkips ?? 0) >= 1);
+        const reloaded = store2.loadSync("reap-representable-session");
+        assert.ok(reloaded, "reload works");
+        assert.equal((reloaded.stats as { requests?: number }).requests, base + 5, "post-reap saves keep advancing (#4216)");
+        assert.ok((reloaded.blockContents as Map<string, unknown>).has("b9"), "orphan content survives");
         store2.closeQuietly();
         rmrf(dir);
     } finally {
         delete process.env.BILI_STORAGE_UNIFIED;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #4004 (via #4242): full-mode authority over a tampered envelope.
+// The unified index is the load path; a corrupted JSON envelope alone must
+// NOT fail the load while the index holds the record. Corrupt BOTH carriers
+// and the guard finally rejects.
+// ---------------------------------------------------------------------------
+test("#4242 ⑦ full mode serves the index when only the envelope id was tampered (#4004)", async () => {
+    const dir = tmpDir("authority");
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        const { SessionStore } = await import("../src/persist.ts");
+        // #4004/#4242: _setStoreForTest lives on persist.ts; keep the peek-only
+        // discipline (loadSync must find the store the test just built).
+        const setStore = _setStoreForTest as unknown as ((s: unknown) => void) | undefined;
+        const store = new SessionStore({ dir, enabled: true, debounceMs: 0 });
+        if (setStore) setStore(store);
+        const session = makeSession("authority-session");
+        await store.writeNow(session);
+        const found = findStateFile(dir, "authority-session");
+        assert.ok(found, "envelope written");
+
+        // Tamper ONLY the envelope body id — the index still holds the record.
+        const tampered = JSON.parse(JSON.stringify(found.payload)) as Record<string, unknown>;
+        tampered.id = "not-the-real-id";
+        fs.writeFileSync(found.file, JSON.stringify({ version: 1, payload: tampered }));
+
+        const served = store.loadSync("authority-session", { protocol: "openai", upstreamOrigin: "https://api.openai.com" });
+        assert.ok(served, "full mode serves the intact index record despite the tampered envelope");
+
+        // Corrupt BOTH carriers: drop the index row, keep the tampered file.
+        store.closeQuietly();
+        const { UnifiedStore } = await import("../src/storage/store.ts");
+        const uni = UnifiedStore.open(path.join(dir, "index.db"));
+        uni.deleteSession("authority-session");
+        uni.close();
+        const store2 = new SessionStore({ dir, enabled: true, debounceMs: 0 });
+        if (setStore) setStore(store2);
+        const rejected = store2.loadSync("authority-session", { protocol: "openai", upstreamOrigin: "https://api.openai.com" });
+        assert.equal(rejected, null, "with both carriers gone/tampered the load rejects");
+        store2.closeQuietly();
+    } finally {
+        process.env.BILI_STORAGE_UNIFIED = "full";
+        rmrf(dir);
     }
 });

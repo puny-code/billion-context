@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
@@ -23,6 +23,23 @@ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
     assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"), true);
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-2.5-flash:countTokens"), true);
     assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
+});
+
+test("isModelApiUrl: matches Google Cloud Code v1internal wire shapes (#4256)", () => {
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:generateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:countTokens"), true);
+});
+
+test("isModelApiUrl: rejects v1internal control-plane endpoints (#3129)", () => {
+    // Only the three model methods route; Antigravity's non-model control-plane
+    // POSTs keep going direct (mirrors isV1InternalControlPlanePath's lookahead).
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal"), false);
 });
 
 test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
@@ -572,13 +589,25 @@ test("install: failed respawn degrades to a direct send and fires onGiveUp", asy
         assert.equal(state.origin, undefined);
         assert.equal(respawns, 1);
         assert.equal(giveUps, 1);
-        // The degrade is permanent for the session: later model requests go
-        // direct without re-entering the respawn path.
+        // #4516: the degrade is NO LONGER permanent — a later model request
+        // re-enters the owner's bootstrap as a cooldown-gated self-heal retry
+        // (one attempt per window until the proxy comes back). Allow an
+        // immediate retry and pin the positive direction of that gate.
+        _setRespawnCooldownForTest(0);
         const res2 = await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
         assert.equal(res2.status, 200);
         assert.equal(calls[2], "http://127.0.0.1:8199/v1/messages");
         assert.deepEqual(dispatches, ["rewrite", "direct", "direct"]);
-        assert.equal(respawns, 1);
+        assert.equal(respawns, 2);
+        assert.equal(giveUps, 1);
+        // Negative direction (#3617): inside the cooldown window the
+        // self-heal must NOT stack another respawn attempt.
+        _setRespawnCooldownForTest(1_000_000);
+        const res3 = await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
+        assert.equal(res3.status, 200);
+        assert.equal(calls[3], "http://127.0.0.1:8199/v1/messages");
+        assert.deepEqual(dispatches, ["rewrite", "direct", "direct", "direct"]);
+        assert.equal(respawns, 2);
         assert.equal(giveUps, 1);
     } finally {
         globalThis.fetch = saved;

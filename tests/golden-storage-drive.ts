@@ -16,12 +16,69 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
-import { canonicalize, sha256 } from "./golden-canonical.ts";
+import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { stripOneTimeAlignment } from "./corrupt-index-child.ts";
 import { flushAllSessions, _resetSessionsForTest } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
+
+/**
+ * #3325 lesson — the drive renders digests from `node_modules/acp-kernel/dist`
+ * (a BUILD PRODUCT, resolved via package exports) while bili side-by-side runs
+ * from live TS via tsx. A stale kernel dist silently changes persisted state
+ * (e.g. post-#3266 it still stamped metadata.effectiveConfig.imageCompression
+ * + state.stats.image* fields), so a locally regenerated golden bakes digests
+ * no fresh build can reproduce — CI then fails every leg that runs this file.
+ * Fail fast with the rebuild instruction instead of letting a stale workspace
+ * mint bad goldens.
+ */
+export function kernelDistStale(root: string): { stale: boolean; distAt?: number; srcAt?: number; newestSrc?: string } {
+    const distEntry = path.join(root, "node_modules", "acp-kernel", "dist", "index.js");
+    try {
+        const distAt = fs.statSync(distEntry).mtimeMs;
+        let srcAt = 0;
+        let newestSrc = "";
+        const walk = (dir: string) => {
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+                const p = path.join(dir, e.name);
+                if (e.isDirectory()) walk(p);
+                else if (/\.(ts|tsx|mjs)$/.test(e.name)) {
+                    const m = fs.statSync(p).mtimeMs;
+                    if (m > srcAt) { srcAt = m; newestSrc = p; }
+                }
+            }
+        };
+        walk(path.join(root, "kernel", "src"));
+        const tsup = path.join(root, "kernel", "tsup.config.ts");
+        if (fs.existsSync(tsup)) {
+            const m = fs.statSync(tsup).mtimeMs;
+            if (m > srcAt) { srcAt = m; newestSrc = tsup; }
+        }
+        return { stale: srcAt > distAt, distAt, srcAt, newestSrc };
+    } catch {
+        // dist absent or unreadable — tsx will surface the module-not-found; not our error.
+        return { stale: false };
+    }
+}
+const __goldenGuard = (() => {
+    // Call-time (not import-time): the guard's own unit test imports this
+    // module from a possibly-stale workspace; only actual drives must refuse.
+    let armed = false;
+    return () => {
+        if (armed) return;
+        armed = true;
+        const s = kernelDistStale(path.resolve(import.meta.dirname, ".."));
+        if (s.stale) {
+            throw new Error(
+                `golden drive: node_modules/acp-kernel/dist is older than kernel/src (${s.newestSrc}) — ` +
+                `a stale kernel dist produces digests no fresh build can reproduce (#3325). ` +
+                `Rebuild first: npm run build`,
+            );
+        }
+    };
+})();
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { configureLogger, closeLogger } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -54,7 +111,7 @@ const GROW_TURNS = 20; // hard cap for the grow loop
 const SUMMARY_MARKER = "[Compressed conversation section]";
 const EDIT_SENTINEL = "GOLDEN-EDIT-SENTINEL";
 
-interface GoldenTurn { i: number; sha: string; bytes: number }
+interface GoldenTurn { i: number; sha: string; bytes: number; shaCiteNorm: string }
 interface GoldenRecord {
     wire: Wire;
     turns: GoldenTurn[];
@@ -62,6 +119,7 @@ interface GoldenRecord {
     editedAt: number;      // body index after the mid-history edit
     summaryFrom: number;   // first body index carrying the fold summary
     stateDigest: string;   // sha256 of the canonicalized persisted session
+    stateDigestAligned: string; // #4316 PR3/3: same, modulo the one-time ledger alignment
     sectionDigests: Record<string, string>; // drift localization (same normalization)
     stateKeyDigests: Record<string, string>; // per-top-level-state-key digests
     stateShape: {          // human-readable facts baked into the snapshot
@@ -111,6 +169,18 @@ function canonicalBody(body: string): string {
         .replace(/msg-proxy-\d+(?:-\d+)?/g, "msg-proxy-<MINT>")
         .replace(/marker-\d+(?:-\d+)?/g, "marker-<MINT>")
         .replace(/msg-fix-[0-9a-f]+/g, "msg-fix-<MINT>");
+}
+
+// #4316 PR3/3 (380ef4dac): a full-mode cold load re-homes citation numbers
+// once (one-time ledger alignment) — that renumbering is the ONLY permitted
+// wire delta vs the legacy restart. Wire-parity proofs therefore pin a second
+// digest per turn with every citation number masked to <REF>: equality says
+// "only the citation numbers may differ", everything else stays byte-exact.
+// All m\d{5} tokens are masked (not just tag payloads) because summaries cite
+// numbers in prose too; user content is identical across legs, so the wider
+// mask cannot hide a real divergence.
+function citeNormBody(body: string): string {
+    return body.replace(/\bm\d{5}\b/g, "<REF>");
 }
 
 /** Timestamps (ms-epoch magnitude) and UUIDs become placeholders; everything
@@ -407,6 +477,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
     storageUnified?: "shadow" | "full";
     reloadAfterEdit?: "keepFile" | "dropFile";
 } = {}): Promise<GoldenRecord> {
+    __goldenGuard();
     fs.mkdirSync(SCRATCH_ROOT, { recursive: true });
     const tmp = fs.mkdtempSync(path.join(SCRATCH_ROOT, `${wire}-`));
     const sessionsDir = path.join(tmp, "sessions");
@@ -528,15 +599,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         // order, so a harmless field-reorder commit (#3093) red all four
         // goldens. Deep-sort object keys harness-side only; array order is
         // preserved (foldAnchorOrder & co are ordered contracts).
-        const sortObjectKeys = (v: unknown): unknown => {
-            if (Array.isArray(v)) return v.map(sortObjectKeys);
-            if (v && typeof v === "object") {
-                const o: Record<string, unknown> = {};
-                for (const k of Object.keys(v as Record<string, unknown>).sort()) o[k] = sortObjectKeys((v as Record<string, unknown>)[k]);
-                return o;
-            }
-            return v;
-        };
+
         const lastView = JSON.stringify(canonicalize(sortObjectKeys({
             state: session.state,
             blockContents: [...session.blockContents.entries()],
@@ -549,6 +612,18 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
             .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<PORT>")
             .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>");
         const stateDigest = sha256(lastView);
+        // #4316 PR3/3: parallel digest modulo the one-time ledger alignment —
+        // cross-mode proofs compare states that may differ only in ref numbering.
+        const stateDigestAligned = sha256(
+            JSON.stringify(canonicalize(sortObjectKeys(stripOneTimeAlignment({
+                state: session.state,
+                blockContents: [...session.blockContents.entries()],
+                stats: session.stats,
+                metadata: session.metadata,
+            }))))
+                .replace(/127\.0\.0\.1:\d+/g, "127.0.0\.1:<PORT>")
+                .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>"),
+        );
         // Localization aid for cross-machine digest drift: per-section and
         // per-top-level-state-key digests under the SAME normalization, so a
         // CI failure message pinpoints the divergent subtree without needing
@@ -572,11 +647,15 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         const active = st.blocks?.filter((b) => b.active) ?? [];
         return {
             wire,
-            turns: bodies.map((b, i) => ({ i, sha: sha256(canonicalBody(b)), bytes: Buffer.byteLength(b, "utf8") })),
+            turns: bodies.map((b, i) => {
+                const cb = canonicalBody(b);
+                return { i, sha: sha256(cb), bytes: Buffer.byteLength(b, "utf8"), shaCiteNorm: sha256(canonicalBody(citeNormBody(b))) };
+            }),
             foldAt,
             editedAt,
             summaryFrom: bodies.findIndex((b) => b.includes(SUMMARY_MARKER)),
             stateDigest,
+            stateDigestAligned,
             sectionDigests,
             stateKeyDigests,
             stateShape: {
