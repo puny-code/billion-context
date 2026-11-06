@@ -116,6 +116,81 @@ export interface IntegrityWithdrawals {
 }
 
 /**
+ * Turn-invariant structures the withdrawal fixed point reads. Built once per
+ * unchanged message array (`buildIntegrityIndex`) so a per-range screen does
+ * not rebuild them for every candidate range. Only `remaining`/`withdrawn`
+ * vary between calls; everything in here is a pure function of `messages`.
+ */
+export interface IntegrityIndex {
+  reasoningIds: Set<string>;
+  callIds: Set<string>;
+  callIdByMessageId: Map<string, string>;
+  resultIdByCallId: Map<string, string>;
+  groups: string[][];
+  /** member id → indices of the turn groups containing it (groups are
+   *  normally disjoint; duplicate toolCallIds can pull one id into two). */
+  groupIndexByMemberId: Map<string, number[]>;
+  /** message id → first position in `messages` (stable ordering proxy). */
+  messageIndexById: Map<string, number>;
+  /** toolCallId → assistant tool-call message ids carrying it, in message order. */
+  callMessageIdsByCallId: Map<string, string[]>;
+  /** tool-result message id → its toolCallId. */
+  toolCallIdByResultMessageId: Map<string, string>;
+}
+
+/** Build the turn-invariant index for `messages`. O(messages). */
+export function buildIntegrityIndex(messages: CoreMessage[]): IntegrityIndex {
+  const reasoningIds = new Set<string>();
+  const callIds = new Set<string>();
+  const callIdByMessageId = new Map<string, string>();
+  const resultIdByCallId = new Map<string, string>();
+  const messageIndexById = new Map<string, number>();
+  const callMessageIdsByCallId = new Map<string, string[]>();
+  const toolCallIdByResultMessageId = new Map<string, string>();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]!;
+    if (!m.id) continue;
+    if (!messageIndexById.has(m.id)) messageIndexById.set(m.id, i);
+    if (m.contentType === "reasoning") reasoningIds.add(m.id);
+    if (m.role === "assistant" && m.contentType === "tool-call") {
+      callIds.add(m.id);
+      if (typeof m.toolCallId === "string") {
+        callIdByMessageId.set(m.id, m.toolCallId);
+        const list = callMessageIdsByCallId.get(m.toolCallId);
+        if (list) list.push(m.id);
+        else callMessageIdsByCallId.set(m.toolCallId, [m.id]);
+      }
+    }
+    if (m.contentType === "tool-result" && typeof m.toolCallId === "string") {
+      if (!resultIdByCallId.has(m.toolCallId)) {
+        resultIdByCallId.set(m.toolCallId, m.id);
+      }
+      toolCallIdByResultMessageId.set(m.id, m.toolCallId);
+    }
+  }
+  const groups = computeTurnGroups(messages);
+  const groupIndexByMemberId = new Map<string, number[]>();
+  groups.forEach((group, index) => {
+    for (const id of group) {
+      const list = groupIndexByMemberId.get(id);
+      if (list) list.push(index);
+      else groupIndexByMemberId.set(id, [index]);
+    }
+  });
+  return {
+    reasoningIds,
+    callIds,
+    callIdByMessageId,
+    resultIdByCallId,
+    groups,
+    groupIndexByMemberId,
+    messageIndexById,
+    callMessageIdsByCallId,
+    toolCallIdByResultMessageId,
+  };
+}
+
+/**
  * Fold-integrity gate (#684): given the ids a fold removes from the visible
  * stream, return the ids that must stay visible instead.
  *
@@ -134,11 +209,20 @@ export interface IntegrityWithdrawals {
  *
  * The reverse direction stays allowed (#564): reasoning and text may stay
  * visible while the call and its result fold, since that leaves a valid stream.
+ *
+ * `index` is an optional caller-owned `buildIntegrityIndex(messages)` for the
+ * same array: pass it when screening many ranges against one unchanged array
+ * and the fixed point only has to visit the turns/pairs the fold actually
+ * touches. Omitting it runs the historical full scan — identical results.
  */
 export function computeIntegrityWithdrawals(
   messages: CoreMessage[],
   foldedIds: ReadonlySet<string>,
+  index?: IntegrityIndex,
 ): IntegrityWithdrawals {
+  if (index !== undefined) {
+    return computeWithdrawalsIndexed(index, foldedIds);
+  }
   const remaining = new Set(foldedIds);
   const withdrawn = new Set<string>();
   const handledTurns = new Set<number>();
@@ -199,6 +283,102 @@ export function computeIntegrityWithdrawals(
       remaining.delete(m.id);
       remaining.delete(resultId);
       withdrawn.add(m.id);
+      withdrawn.add(resultId);
+      changed = true;
+    }
+  }
+
+  return {
+    withdrawn,
+    splitTurnCount: handledTurns.size,
+    splitPairCount: handledPairs.size,
+  };
+}
+
+/**
+ * Same fixed point as the full scan above, driven from a prebuilt
+ * `IntegrityIndex` and visiting ONLY the turns/pairs this fold can touch.
+ *
+ * Why the restriction is exact (not a heuristic): both passes only ever
+ * DELETE from `remaining`, so `remaining ⊆ foldedIds` holds for the whole run.
+ * A turn is withdrawn only when `foldHasReasoning` — some member is in
+ * `remaining` — and a pair only when exactly one of its two halves is in
+ * `remaining`. Both therefore need a member of the ORIGINAL `foldedIds`. Every
+ * other turn/pair can only ever hit a `continue`, mutating nothing, and a pass
+ * that mutates nothing cannot change the order in which the surviving ones
+ * mutate `remaining` — so the visited subset converges to the same fixed
+ * point, with the same `splitTurnCount` / `splitPairCount`.
+ */
+function computeWithdrawalsIndexed(
+  index: IntegrityIndex,
+  foldedIds: ReadonlySet<string>,
+): IntegrityWithdrawals {
+  const remaining = new Set(foldedIds);
+  const withdrawn = new Set<string>();
+  const handledTurns = new Set<number>();
+  const handledPairs = new Set<string>();
+
+  // Candidate turns: groups holding a folded id. Candidate call messages: a
+  // tool-call message that is itself folded, or every call message sharing the
+  // callId of a folded tool-result (the pair pass is keyed by callId but walks
+  // call MESSAGES in array order, so a duplicate call id must keep its place).
+  const candidateGroups = new Set<number>();
+  const candidateCallMessageIds = new Set<string>();
+  for (const id of foldedIds) {
+    for (const groupIndex of index.groupIndexByMemberId.get(id) ?? []) {
+      candidateGroups.add(groupIndex);
+    }
+    if (index.callIdByMessageId.has(id)) candidateCallMessageIds.add(id);
+    const resultCallId = index.toolCallIdByResultMessageId.get(id);
+    if (resultCallId !== undefined) {
+      for (const callMessageId of index.callMessageIdsByCallId.get(
+        resultCallId,
+      ) ?? []) {
+        candidateCallMessageIds.add(callMessageId);
+      }
+    }
+  }
+  const groupOrder = [...candidateGroups].sort((a, b) => a - b);
+  const callOrder = [...candidateCallMessageIds]
+    .map((messageId) => ({
+      messageId,
+      at: index.messageIndexById.get(messageId) ?? Number.MAX_SAFE_INTEGER,
+    }))
+    .sort((a, b) => a.at - b.at);
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+
+    for (const g of groupOrder) {
+      if (handledTurns.has(g)) continue;
+      const group = index.groups[g]!;
+      const foldHasReasoning = group.some(
+        (id) => remaining.has(id) && index.reasoningIds.has(id),
+      );
+      if (!foldHasReasoning) continue;
+      const keptHasCall = group.some(
+        (id) => !remaining.has(id) && index.callIds.has(id),
+      );
+      if (!keptHasCall) continue;
+      handledTurns.add(g);
+      for (const id of group) {
+        remaining.delete(id);
+        withdrawn.add(id);
+      }
+      changed = true;
+    }
+
+    for (const { messageId } of callOrder) {
+      const callId = index.callIdByMessageId.get(messageId);
+      if (callId === undefined || handledPairs.has(callId)) continue;
+      const resultId = index.resultIdByCallId.get(callId);
+      if (resultId === undefined) continue;
+      if (remaining.has(messageId) === remaining.has(resultId)) continue;
+      handledPairs.add(callId);
+      remaining.delete(messageId);
+      remaining.delete(resultId);
+      withdrawn.add(messageId);
       withdrawn.add(resultId);
       changed = true;
     }

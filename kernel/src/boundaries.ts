@@ -67,6 +67,13 @@ export interface ResolveBoundariesInput {
   endRef: string;
   messages: CoreMessage[];
   state: CompressionState;
+  /** Optional caller-owned id→index map for `messages`, built by the same
+   *  rule this function uses (`forEach` → last index wins for duplicate ids).
+   *  Per-range screening resolves thousands of boundaries against one
+   *  unchanged array per turn, so rebuilding an O(n) map each time dominated
+   *  that path. Callers that cannot prove the map matches `messages` omit it
+   *  and get the historical rebuild — behavior is identical either way. */
+  indexByMessageId?: Map<string, number>;
 }
 
 export interface ResolvedRange {
@@ -80,6 +87,18 @@ export interface ResolvedRange {
   reversedNote?: string;
 }
 
+/** The id→index map every boundary resolution needs. ONE definition so a
+ *  caller passing a precomputed map (see ResolveBoundariesInput) cannot drift
+ *  from the rebuild below. `forEach` order (last index wins on duplicate ids)
+ *  is the historical contract — keep it. */
+export function buildIndexByMessageId(
+  messages: readonly CoreMessage[],
+): Map<string, number> {
+  const indexByMessageId = new Map<string, number>();
+  messages.forEach((message, index) => indexByMessageId.set(message.id, index));
+  return indexByMessageId;
+}
+
 export function resolveBoundaries(
   input: ResolveBoundariesInput,
 ): ResolvedRange {
@@ -91,10 +110,8 @@ export function resolveBoundaries(
     );
   }
 
-  const indexByMessageId = new Map<string, number>();
-  input.messages.forEach((message, index) =>
-    indexByMessageId.set(message.id, index),
-  );
+  const indexByMessageId =
+    input.indexByMessageId ?? buildIndexByMessageId(input.messages);
 
   let snappedBoundaries: string[] = [];
   const startAnchor = resolveAnchorIndex(

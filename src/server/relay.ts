@@ -7,12 +7,13 @@ import { maybeRunInvariantJudge } from "../invariant-judge.js";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -64,6 +65,7 @@ import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
+import { yieldToEventLoop } from "../yield-loop.js";
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, stampOpenCodeSessionHeader, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
@@ -248,6 +250,83 @@ export function armFirstByteWatchdog(o: {
     timer.unref();
     o.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
     return timer;
+}
+
+// 2026-11-06 forward-stall forensics: two places between prepare's `local=…ms`
+// cost line and the client's last byte used to run long synchronous stretches
+// with neither a meter nor a yield:
+//   [send-chokepoint] — the pre-fetch seam block below (whole-body re-read: one
+//     JSON.parse, the cache-ledger full-body sha256, the judge's own re-parse).
+//   [compress-loop]   — one refold per compress tool-call the model emits: a
+//     full core.processTurn over the WHOLE original history plus the per-wire
+//     post-processing, repeated for every round of the loop.
+// Measured on the real incident log the seam block is cheap (`.441 → .506` =
+// 65ms over a 1.6MiB outbound), so it is measured but NOT yielded. The refold
+// over an 8650-message history is the prime suspect for the 20-minute stall
+// whose last line was `invariant-judge`.
+// 200ms is the bar where a listener stall becomes visible to health probes, so a
+// healthy round stays at debug (no per-turn spam) and a real stall is a warn.
+const RELAY_STALL_WARN_MS = 200;
+
+// Both probes read time ONLY through this seam so tests can force the slow/fast
+// branch without depending on real elapsed time (_setRelayCostClockForTest).
+let relayCostNow: () => number = () => performance.now();
+
+/** Test-only clock seam shared by the [send-chokepoint] and [compress-loop]
+ *  probes (null/undefined restores the real monotonic clock). */
+export function _setRelayCostClockForTest(now?: () => number): void {
+    relayCostNow = now ?? ((): number => performance.now());
+}
+
+interface SendChokepointFacts {
+    /** Wall time across the whole seam block (body read → parse → notes → judge). */
+    elapsedMs: number;
+    /** The invariant judge's own synchronous share of that wall time. */
+    judgeMs: number;
+    /** Outbound message count; null when the wire body did not parse to a list. */
+    msgs: number | null;
+    /** Byte size of the body the block re-read (reused from the seam slot — the
+     *  ledger already encoded those bytes, so this adds no second scan). */
+    bytes: number | null;
+}
+
+function logSendChokepoint(log: (level: string, msg: string) => void, facts: SendChokepointFacts): void {
+    const level = facts.elapsedMs >= RELAY_STALL_WARN_MS ? "warn" : "debug";
+    log(level, `[send-chokepoint] ${Math.round(facts.elapsedMs)}ms msgs=${facts.msgs ?? "?"} inbound=${facts.bytes ?? "?"} judge=${Math.round(facts.judgeMs)}ms`);
+}
+
+/** Test-only: the exact emitter the forward seam block calls, exposed so the
+ *  warn/debug threshold and the line shape are assertable without a live
+ *  request (the body of forwardCaptured cannot run without a real session). */
+export function _logSendChokepointForTest(
+    log: (level: string, msg: string) => void,
+    elapsedMs: number,
+    msgs: number | null,
+    bytes: number | null,
+    judgeMs: number,
+): void {
+    logSendChokepoint(log, { elapsedMs, judgeMs, msgs, bytes });
+}
+
+/** One compress-loop refold round (see the block comment above). `msgs` is the
+ *  size of the history processTurn re-folded — the cost driver — not the
+ *  outbound body. */
+function logCompressLoopRound(
+    log: (level: string, msg: string) => void,
+    facts: { round: number; refoldMs: number; msgs: number },
+): void {
+    const level = facts.refoldMs >= RELAY_STALL_WARN_MS ? "warn" : "debug";
+    log(level, `[compress-loop] round=${facts.round} refold=${Math.round(facts.refoldMs)}ms msgs=${facts.msgs}`);
+}
+
+/** Test-only: the exact emitter each compress-loop refold round calls. */
+export function _logCompressLoopRoundForTest(
+    log: (level: string, msg: string) => void,
+    round: number,
+    refoldMs: number,
+    msgs: number,
+): void {
+    logCompressLoopRound(log, { round, refoldMs, msgs });
 }
 
 export function forward(...args: Parameters<typeof forwardCaptured>): Promise<void> {
@@ -749,6 +828,10 @@ async function forwardCaptured(
     // (loop/core.ts fetchUpstream); side requests never settle usage and must
     // not clobber the slot.
     if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
+        // Meter (no yield — see the probe notes above): this block owns the whole-body
+        // re-read between prepare's cost line and the fetch, so its wall clock is
+        // the first thing an incident needs.
+        const chokepointStartedAt = relayCostNow();
         const sentBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         // #2078: ONE parse of the outbound body for the whole seam block — the
         // estimate's projection, its wire-overhead term, and the image reserve
@@ -760,6 +843,10 @@ async function forwardCaptured(
         } catch {
             sentParsed = null;
         }
+        // Probe only — no yield here. Measured on the real 2026-11-06 log this
+        // block is cheap (`.441 → .506` = 65ms over a 1.6MiB outbound), so it is
+        // NOT where the 20-minute stall lived; the line below exists to keep
+        // that claim measurable instead of argued.
         // Publish this send, not a historical usage baseline with a fresh timestamp.
         const est = outboundContextEstimates(prepared, sentBody, opts, upstreamUrl, sentParsed);
         // The char-count upper bound stays the published context value: it is
@@ -784,10 +871,11 @@ async function forwardCaptured(
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
+        const sentMsgCount = Array.isArray(sentArr) ? (sentArr as unknown[]).length : null;
         // #3803: the generation-parameter fingerprint rides the SAME full parse as the message count —
         // it is extracted from sentParsed (the complete object), never from the capped body head, so a
         // trailing-field flip is seen even when the body exceeds SEAM_BODY_CAP.
-        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed));
+        noteForwardedBody(prepared.session, sentBody, sentMsgCount, credentialFingerprint(headers), generationParamFp(sentParsed));
         // #3023: the client's own resent view — the protocol conversion of the
         // inbound bytes BEFORE processTurn folded/replaced anything, captured
         // with the exact same pairing semantics so detectSeam can attribute a
@@ -806,6 +894,7 @@ async function forwardCaptured(
         const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
             ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
             : undefined;
+        const judgeStartedAt = relayCostNow();
         maybeRunInvariantJudge({
             // #4241: a render-lane turn's outbound is built from the SERVER
             // transcript (summary anchors + store rows), so its ground truth
@@ -819,6 +908,16 @@ async function forwardCaptured(
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
+        });
+        const chokepointEndedAt = relayCostNow();
+        // The probe line (warn ≥200ms, else debug) — `judge=` separates the O(n^2)
+        // advisory pass from the parse/hash/projection passes. If this line never
+        // appears at all, the stall was inside the judge call itself.
+        logSendChokepoint(log, {
+            elapsedMs: chokepointEndedAt - chokepointStartedAt,
+            judgeMs: chokepointEndedAt - judgeStartedAt,
+            msgs: sentMsgCount,
+            bytes: lastForwardedBody(prepared.session)?.bytes ?? null,
         });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
@@ -2159,8 +2258,24 @@ async function forwardCaptured(
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
             const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            // 2026-11-06 stall: ONE refold per compress/absorb tool-call the model
+            // emits, and each refold re-runs core.processTurn over the WHOLE
+            // original history (8650 messages in the incident) plus the per-wire
+            // post-processing below. Nothing here yielded, so N folds ran back to
+            // back as N unbroken synchronous sweeps: no timer (health probe, the
+            // 30s first-byte watchdog, res 'close') could run between them. Round
+            // numbers are per request — the loop itself owns the round, this is
+            // the nth refold inside THIS request.
+            let foldRounds = 0;
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
-                return withSessionLock(prepared.session, async () => {
+                const foldRound = ++foldRounds;
+                const foldStartedAt = relayCostNow();
+                // YIELD (round boundary, BEFORE the lock): releases the main thread
+                // between two folds. Safe by construction — no lock is held yet and
+                // the only shared state this function reads is taken inside the
+                // critical section below.
+                await yieldToEventLoop();
+                const folded = await withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
                     // the re-request shows the compression the model just performed.
                     // Records from this loop round (acp_loop_* namespace) ride on top
@@ -2194,6 +2309,19 @@ async function forwardCaptured(
                     // and broke the prefix cache on every fold while the
                     // threshold was being straddled (probe: cache-seam-probes).
                     const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, effectiveTokenCount(prepared.session, turn.messages).tokens);
+                    // YIELD (inside the lock, after EVERY session read of this fold):
+                    // processTurn + adoptContentStore + the token count are done and
+                    // `turn`/`viewed` are locals, so nothing below reads shared state
+                    // and nothing above can be observed half-applied (the lock is a
+                    // strict promise chain and excludes every other processTurn, and
+                    // session.state writes are lock-guarded elsewhere). Placing it
+                    // here — not earlier — is deliberate: a concurrent, unlocked
+                    // settleUsageReport could otherwise move effectiveTokenCount's
+                    // input mid-fold and flip the absorb view. The rest of the fold
+                    // (strip / drop / run-repair) is a second synchronous sweep, so
+                    // timers can run between the two; the only cost is one queued
+                    // tick for a same-session waiter.
+                    await yieldToEventLoop();
                     const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
                     // #1548: strip only when the compress call rides INBOUND history (client persists
                     // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
@@ -2212,6 +2340,16 @@ async function forwardCaptured(
                     const ordered = prepared.protocol === "responses" ? repairResponsesAssistantOrdering(dropped, prepared.originalMessages) : dropped;
                     return ordered;
                 });
+                // Meter per refold round (warn ≥200ms, else debug): `msgs` is the
+                // history this round re-folded, `refold` its whole wall clock
+                // including the yields. In the 20-minute incident this is the number
+                // that should have been the first thing visible.
+                logCompressLoopRound(log, {
+                    round: foldRound,
+                    refoldMs: relayCostNow() - foldStartedAt,
+                    msgs: prepared.originalMessages.length,
+                });
+                return folded;
             };
             // #1455: loop-originated upstream responses (re-request/retries) are NOT covered by the outer tee above — they were invisible to ACP_DUMP_SSE until now.
             const loopDumpDir = opts.dumpSse;

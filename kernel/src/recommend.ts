@@ -36,7 +36,11 @@ import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  projectUnit,
+  collectCoverage,
+  createProjectionContext,
+} from "./unit-projection.js";
 import { BoundaryNotFoundError } from "./boundaries.js";
 import type { UnitProjection } from "./unit-projection.js";
 
@@ -652,6 +656,14 @@ export function screenRecommendedUnits(
 ): CompressibleRange[] {
   if (units.length === 0) return units;
   const coverage = collectCoverage(state);
+  // Every unit below is projected against THIS one array, state and config, so
+  // the derived structures projectUnit needs (id index, protected-tool facts,
+  // turn groups, pair maps) are identical for all of them. Build them once
+  // here and hand them down: the per-unit cost was O(messages) per derived
+  // structure before, which made this screen O(units × messages) — the
+  // dominant cost of the whole fold pass at large histories. This is per-CALL
+  // memoization only; nothing survives the turn (messages and state change).
+  const context = createProjectionContext(source, state, config);
   return units.filter((unit) => {
     let projection: UnitProjection | undefined;
     try {
@@ -663,6 +675,7 @@ export function screenRecommendedUnits(
         endRef: unit.endRef,
         preExistingCoverage: coverage,
         protectedMessageIds: protectedRefs,
+        context,
       });
     } catch (err) {
       // Endpoints that cannot resolve on this array class (dead/consumed)
