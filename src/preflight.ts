@@ -23,7 +23,7 @@ import { proxyDispatcher } from "./upstream-proxy.js";
 import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
-import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
+import { deadSkipKeys, deadSpanRanges, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
@@ -188,6 +188,24 @@ const DETERMINISTIC_EMPTY_STICKY_LIMIT = 3;
 // skip a doomed round only when the shortfall survives this slack — when
 // unsure, walk exactly as before.
 const FUTILITY_SLACK = 1.2;
+// #5630: how many summarization calls ONE preflight invocation should need to
+// close its deficit. Depth budgets were sized as if one round removes
+// CHUNK_FRACTION x window, but a round can only remove the largest ADVERTISED
+// range — and the kernel splits ranges at every user turn, so a long session
+// advertises ~500 small ones (largest 19.7k tok = 2.5% of the window on the
+// incident session). The loop saved ~1% per round against a ~1.1M-token
+// deficit, burned five minutes of upstream calls, then failed with the
+// doomed-payload 413.
+//
+// The fix coalesces adjacent advertised ranges into fold units sized
+// deficit/FOLD_UNIT_ROUNDS, so closing the gap needs ~this many calls. 4 is a
+// WALL-CLOCK budget, not a coverage fudge: these calls each produce up to
+// compress.maxSummaryLength of output (~20k chars) which dominates their
+// latency at roughly a minute apiece, and the host client disconnects near
+// ~300s — so ~4 calls per request is what actually fits. The
+// CHUNK_FRACTION x window ceiling still bounds each unit, so a payload barely
+// over the window keeps a small cap and behaves exactly as before.
+const FOLD_UNIT_ROUNDS = 4;
 // #2383: entry overshoot (entryTokens / window) above which the LLM fold path
 // is PROVABLY unable to converge in this invocation — it exceeds the raised
 // budget's maximum coverage (MAX_PREFLIGHT_ROUNDS * 2 rounds x CHUNK_FRACTION
@@ -748,6 +766,114 @@ function splitChunks(
         cur = last + 1;
     }
     return chunks;
+}
+
+// #5630: coalesce adjacent advertised ranges into fold-sized units.
+//
+// The kernel advertises compressible ranges split at every user turn
+// (segmentGroups), so a long session advertises hundreds of small ranges: on
+// the incident session 19 ranges covering 9377 messages rendered as
+// "m01259–m03222 412.2K", yet the largest SINGLE advertised range was 19,721
+// tok. preflight folds ONE range per round (maxFoldsPerRound = 1 in the LLM
+// lane), so a 1.1M-token deficit needed ~90 rounds against a 32-round cap and
+// the pass could never converge — it burned 5 minutes of upstream summary
+// calls, saved ~10k tok per round, then failed with the doomed-payload 413.
+//
+// nudge-text.formatRanges already merges positionally adjacent ranges for
+// DISPLAY ("m01259–m03222 412.2K"); the fold walk never did. Coalesce here on
+// the same rule nudge uses — positional adjacency, no slot gap, honoring
+// noMergeBefore — and honor the dead-range memory too: those entries were
+// FILTERED OUT of the candidate list, so a merged unit would otherwise bridge
+// straight over a span whose preview always returns the structural-empty
+// verdict, paying one rejected preview per round forever (#2638). Merging only
+// widens a foldable span: applyCompression accepts any span whose members are
+// foldable, and the preview gate still rejects a unit the kernel refuses.
+//
+// Size discipline: stop a unit at `budget` countText units — the per-call
+// chunk budget (CHUNK_FRACTION x window) that splitChunks and
+// splitSummaryContent already use. That is EXACTLY the coverage model the
+// depth budgets were always sized against ("each fold removes at most
+// CHUNK_FRACTION x window tokens, so MAX_PREFLIGHT_ROUNDS rounds cover up to
+// ~9.6x the window"), which is the invariant that was silently violated: a
+// fold was capped at the largest ADVERTISED range (~19.7k tok = 2.5% of the
+// window) instead of at CHUNK_FRACTION x window, so the documented coverage
+// was never reachable.
+export function coalesceFoldRanges<T extends {
+    startRef: string;
+    endRef: string;
+    tokens: number;
+    chars?: number;
+    count: number;
+    startIndex?: number;
+    endIndex?: number;
+    noMergeBefore?: boolean;
+    dangerous?: boolean;
+    userMsgs?: number;
+    toolPct?: number;
+    textPct?: number;
+}>(ranges: readonly T[], budget: number, deadSpans: ReadonlyArray<{ lo: number; hi: number }> = []): T[] {
+    if (ranges.length < 2) return [...ranges];
+    const refNum = (ref: string): number => {
+        const m = /\d+/.exec(ref);
+        return m === null ? 0 : Number(m[0]);
+    };
+    // A remembered-dead span strictly inside the gap a merge would cross makes
+    // the merged unit preview-rejectable every round — split there instead.
+    const crossesDead = (fromRef: string, toRef: string): boolean => {
+        if (deadSpans.length === 0) return false;
+        const lo = refNum(fromRef);
+        const hi = refNum(toRef);
+        return deadSpans.some((d) => d.lo > lo && d.hi < hi);
+    };
+    const cap = budget;
+    const out: T[] = [];
+    let cur: T | undefined;
+    for (const r of ranges) {
+        if (cur === undefined) { cur = { ...r }; continue; }
+        const prevEnd = cur.endIndex;
+        const nextStart = r.startIndex;
+        // Merge only when the two ranges are contiguous on the wire AND their
+        // refs ascend with that position. Refs are NOT monotonic against array
+        // order on hosts that rewrite history (subagent interleaving, mid-array
+        // summary nodes — #887/#1001), and merging such a pair would emit an
+        // INVERTED range (startRef whose position is AFTER endRef's), which the
+        // walk then drops as "position resolution inverted the range". Leaving
+        // that pair unmerged keeps those sessions on the legacy path exactly.
+        const ascends = refNum(cur.startRef) <= refNum(cur.endRef)
+            && refNum(cur.endRef) < refNum(r.startRef)
+            && refNum(r.startRef) <= refNum(r.endRef);
+        // A physical array-index gap is a block/protected/pruned boundary
+        // (buildCompressibleRanges leaves the slot hole) — never bridge it, and
+        // never bridge a dead-ref hole (noMergeBefore, #3192/#3205).
+        const bridged = !ascends
+            || r.noMergeBefore === true
+            || (prevEnd !== undefined && nextStart !== undefined && nextStart > prevEnd + 1)
+            || crossesDead(cur.endRef, r.startRef);
+        const mergedTokens = cur.tokens + r.tokens;
+        if (bridged || mergedTokens > cap) {
+            out.push(cur);
+            cur = { ...r };
+            continue;
+        }
+        const count = cur.count + r.count;
+        const toolPct = count > 0
+            ? Math.round(((cur.toolPct ?? 0) * cur.count + (r.toolPct ?? 0) * r.count) / count)
+            : (cur.toolPct ?? 0);
+        cur = {
+            ...cur,
+            endRef: r.endRef,
+            endIndex: r.endIndex ?? cur.endIndex,
+            count,
+            tokens: mergedTokens,
+            chars: (cur.chars ?? cur.tokens * 4) + (r.chars ?? r.tokens * 4),
+            toolPct,
+            textPct: 100 - toolPct,
+            userMsgs: (cur.userMsgs ?? 0) + (r.userMsgs ?? 0),
+            dangerous: cur.dangerous === true || r.dangerous === true,
+        } as T;
+    }
+    if (cur !== undefined) out.push(cur);
+    return out;
 }
 
 // #853: the summary max_tokens for a model — the 32k default, clamped down to
@@ -1910,6 +2036,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
     }
     let foldOrderLogged = false;
+    // #5630: the deficit this invocation opened with, measured on the same
+    // floorless payloadEstimate the fit gates use. The fold-unit cap derives
+    // from it (see the coalesce site in the round loop).
+    const entryDeficit = Math.max(0, result.payloadEstimate - limit);
     // #2952 Design A: bounded tier-distillation recovery (caps + rationale in
     // the constant comments above). The gates below DEFER their terminal verdict
     // here when raw-range folding cannot close the gap but merging existing
@@ -2262,6 +2392,27 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // contains a dead chunk keeps its live members.
         let ranges = filterDeadRanges(deps.session, aboveMin);
         const deadDropped = aboveMin.length - ranges.length;
+        // #5630: one fold per round in the LLM lane, so a long session's
+        // per-turn range split caps the round's possible saving at the largest
+        // SINGLE range (~19.7k tok on the incident session) while the deficit
+        // was ~1.1M — structurally unreachable within the round cap. Coalesce
+        // adjacent advertised ranges (the same positional rule nudge's display
+        // already merges on) into fold units sized from the ENTRY deficit:
+        // a unit must remove entryDeficit / FOLD_UNIT_ROUNDS, so the ~4 rounds
+        // below actually close the gap instead of shrinking it by a fraction
+        // of the remainder each time. Constant across rounds on purpose —
+        // recomputing from the live deficit gives geometric decay that never
+        // reaches zero.
+        const advertisedCount = ranges.length;
+        const unitCap = entryDeficit > 0
+            ? Math.max(MIN_CHUNK_TOKENS, Math.min(budget, Math.ceil(entryDeficit / FOLD_UNIT_ROUNDS)))
+            : budget;
+        ranges = coalesceFoldRanges(ranges, unitCap, deadSpanRanges(deps.session));
+        if (ranges.length < advertisedCount) {
+            const largest = ranges.reduce((max, r) => Math.max(max, r.tokens), 0);
+            const liveDeficit = Math.max(0, result.payloadEstimate - limit);
+            deps.log("info", `[preflight] coalesced ${advertisedCount} advertised range(s) into ${ranges.length} fold unit(s) capped at ~${unitCap} tok (entry deficit ~${entryDeficit}, now ~${liveDeficit}); largest unit ~${largest} tok (#5630)`);
+        }
         if (deadDropped > 0) {
             deadDroppedTotal += deadDropped;
             if (!deadNoted) {

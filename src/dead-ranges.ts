@@ -94,3 +94,25 @@ export function filterDeadRanges<T extends { startRef: string; endRef: string }>
     const dead = deadSkipKeys(session);
     return ranges.filter((r) => !dead.has(`${r.startRef}:${r.endRef}`));
 }
+
+/** The still-dead spans as ref-number intervals, for callers that MERGE ranges and must not
+ *  bridge one (#5630). filterDeadRanges drops dead entries from the candidate list, so a
+ *  merger working on what REMAINS would silently span across a dead hole — building exactly
+ *  the wide range whose preview returns the structural-empty verdict, one rejected preview
+ *  per round, forever. Invalidation semantics are identical (same live-entry filter). */
+export function deadSpanRanges(session: Session): Array<{ lo: number; hi: number }> {
+    const current = new Set(activeBlockIds(session));
+    const out: Array<{ lo: number; hi: number }> = [];
+    for (const e of readStore(session)) {
+        if (!e.activeSnapshot.every((id) => current.has(id))) continue;
+        const num = (ref: string): number | undefined => {
+            const m = /\d+/.exec(ref);
+            return m === null ? undefined : Number(m[0]);
+        };
+        const lo = num(e.startRef);
+        const hi = num(e.endRef);
+        if (lo === undefined || hi === undefined) continue;
+        out.push({ lo: Math.min(lo, hi), hi: Math.max(lo, hi) });
+    }
+    return out;
+}
