@@ -1,0 +1,32 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- The Plugins page reads this file through `package.json.icon`; the canvas is
+       36x36 (the size the harness and the official artwork use) so the consumer's
+       `size` attribute keeps authority over display width.
+
+       Layout follows the DSH card glyph: a 28-unit rounded tile inset 4 from the
+       canvas, a vertical gradient on it, and an outer group that shrinks the
+       finished drawing to 26/28 of the canvas around its centre.
+
+       The mark is two bracket frames closing on a compact solid core — pressure
+       from both sides, and what is left is one tight, heavy block: a billion
+       tokens of context reduced to something you can hold. Three elements only,
+       all thick (2.1-unit brackets, an 8x8 core with a 2.4 radius), so the
+       silhouette still holds at the 20-24 px a list row renders. Ink box
+       (8.95,11.15)-(27.05,24.85), centred on the tile centre (18,18).
+       Hue: deep teal, cool enough to read as its own thing next to the blue of
+       the sibling rewind plugin. -->
+  <g transform="translate(18 18) scale(0.9286) translate(-18 -18)">
+    <rect x="4" y="4" width="28" height="28" rx="8" fill="url(#bc_tile)" />
+    <rect x="14" y="14" width="8" height="8" rx="2.4" fill="#FFFFFF" />
+    <g stroke="#FFFFFF" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M11.9 12.2H10V23.8H11.9" />
+      <path d="M24.1 12.2H26V23.8H24.1" />
+    </g>
+  </g>
+  <defs>
+    <linearGradient id="bc_tile" x1="18" y1="4" x2="18" y2="32" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#17C3A2" />
+      <stop offset="1" stop-color="#0B5E63" />
+    </linearGradient>
+  </defs>
+</svg>
