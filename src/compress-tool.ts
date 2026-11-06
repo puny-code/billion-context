@@ -437,6 +437,35 @@ export const READ_ORIGINAL_IMAGE_TOOL_OPENAI = { type: "function" as const, func
 export const READ_ORIGINAL_IMAGE_TOOL_RESPONSES = { type: "function" as const, name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
 export const READ_ORIGINAL_IMAGE_TOOL_GOOGLE = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
 
+// acp_history (#4738 follow-through): read STORED history that is no longer
+// visible. Folding preserves originals (decompress), and compressed ranges
+// stay searchable (search_context), but neither reaches a message the HOST
+// removed from the view when its native compaction ran — no block covers it
+// and no summary describes it. Storage still has every body, so this tool is
+// the third read side: bodies by keyword, or full text by mNNNNN range.
+// Read-only, and bounded on BOTH axes (hit count / scan depth on search, byte
+// budget / continuation cursor on range) so one call can never flood context.
+export const HISTORY_TOOL_NAME = "acp_history";
+const HISTORY_TOOL_DESCRIPTION = "Read conversation history that is stored but no longer visible in your context — folded ranges, or earlier messages the host dropped when its own compaction replaced them. Two modes. A) {query} keyword-searches the STORED message bodies (case-insensitive; every term must appear in one message) and returns bounded snippets with their mNNNNN refs plus how much of the history it actually scanned. B) {from,to} returns the full original text of an mNNNNN range. Read-only. Both modes are byte-capped: range mode stops at maxBytes and hands back the ref to continue from, so fetch only the span you need.";
+const HISTORY_PARAM_SCHEMA = {
+    type: "object" as const,
+    properties: {
+        query: { type: "string", description: "Search mode: keywords to find in stored message bodies. Prefer 1-3 distinctive terms." },
+        from: { type: "string", description: "Range mode: first ref, e.g. \"m00423\"." },
+        to: { type: "string", description: "Range mode: last ref (inclusive). Defaults to from." },
+        session: { type: "string", description: "Optional session id; defaults to the current conversation." },
+        limit: { type: "integer", description: "Search mode: max hits (default 8, max 20)." },
+        scan: { type: "integer", description: "Search mode: max stored messages to scan, newest first (default 4000, max 20000)." },
+        before: { type: "integer", description: "Search mode: continue backward from this seq (taken from a previous receipt that said \"continue with before:\")." },
+        maxBytes: { type: "integer", description: "Range mode: inline byte budget (default 24000, max 200000)." },
+    },
+    additionalProperties: false,
+};
+export const HISTORY_TOOL = { name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, input_schema: HISTORY_PARAM_SCHEMA };
+export const HISTORY_TOOL_OPENAI = { type: "function" as const, function: { name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, parameters: HISTORY_PARAM_SCHEMA } };
+export const HISTORY_TOOL_RESPONSES = { type: "function" as const, name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, parameters: HISTORY_PARAM_SCHEMA };
+export const HISTORY_TOOL_GOOGLE = { name: HISTORY_TOOL_NAME, description: HISTORY_TOOL_DESCRIPTION, parameters: HISTORY_PARAM_SCHEMA };
+
 // #1097: acp_retrieve — resolve a stored ID-referenced message back to its full
 // original. Kernel-owned tool (RETRIEVE_TOOL_NAME); synthesized in all four
 // wire shapes here so every injection point (wire helpers, plugin manifest)

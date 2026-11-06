@@ -4,7 +4,7 @@ import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
-import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
+import { HISTORY_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -249,6 +249,7 @@ export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     RULE_TOOL_NAME,
     RETRIEVE_TOOL_NAME,
     READ_ORIGINAL_IMAGE_TOOL_NAME,
+    HISTORY_TOOL_NAME,
 ]);
 
 /** Tool names declared by `parsed.tools`, proto-agnostically. null when the

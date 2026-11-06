@@ -1915,6 +1915,19 @@ export class SessionStore {
         }
     }
 
+    /** #4738 follow-through: bounded keyword search over stored message
+     *  bodies — the read side of "the host's native compaction removed it
+     *  from the view, storage still has it". Null when the unified store is
+     *  unavailable; callers report that instead of guessing. */
+    unifiedSearchMessageText(sessionId: string, needles: readonly string[], opts: { limit: number; scanLimit: number; beforeSeq?: number }): import("./storage/store.js").MessageTextSearchResult | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.searchMessageText(sessionId, needles, opts);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
     /** #D5-5 render windowing: identity-only rows (seq + msg_id). Null when
      *  the unified store is unavailable — the render lane degrades, never
      *  guesses. */

@@ -118,6 +118,19 @@ export interface MessageRow {
  *  hydration row, served when the resident window no longer carries the bytes. */
 export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
 
+/** One keyword-search hit over STORED bodies (acp_history search mode): the
+ *  ref it belongs to, the seq that orders it, and the full stored content the
+ *  formatter snippets from. */
+export type MessageTextHit = MessageRefContentRow & { seq: number };
+
+/** Bounded search receipt. `scanned` and `total` let the caller say "searched
+ *  the newest K of N" instead of implying the whole history was covered;
+ *  `capped` is true when the scan budget ran out before the result set did;
+ *  `scannedTo` is the oldest seq actually examined, which is the cursor a
+ *  caller resumes from (it matters most when NOTHING matched — otherwise
+ *  "no hits" would be silent about how little ground it covered). */
+export type MessageTextSearchResult = { hits: MessageTextHit[]; scanned: number; total: number; capped: boolean; scannedTo: number | null };
+
 export interface BlockRow {
     blockId: string;
     ord: number;
@@ -1462,6 +1475,60 @@ export class UnifiedStore {
             }
         }
         return out.sort((a, b) => a.refNum - b.refNum);
+    }
+
+    /** #4738 follow-through: keyword search over STORED message bodies, newest
+     *  first. The same premise as messageContentByRefNums — the resident view
+     *  only holds what the host still sends, and host-side native compaction
+     *  prunes that client-side, so "no longer in the view" must never read as
+     *  "never said". Bounded by construction: one page of rows at a time, stop
+     *  at `limit` hits or `scanLimit` rows scanned. A 27 MiB session therefore
+     *  costs one bounded pass, never a whole-table scan, and the receipt
+     *  reports how much was actually covered so the caller can page backward
+     *  instead of implying completeness. Read-only. */
+    searchMessageText(
+        sessionId: string,
+        needles: readonly string[],
+        opts: { limit: number; scanLimit: number; beforeSeq?: number },
+    ): MessageTextSearchResult {
+        const total = ((this.db
+            .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL")
+            .get(sessionId) as { n: number }).n) ?? 0;
+        const lower = needles.map((n) => n.toLowerCase()).filter((n) => n.length > 0);
+        if (lower.length === 0) return { hits: [], scanned: 0, total, capped: false, scannedTo: null };
+        const limit = Math.max(1, Math.min(opts.limit, 50));
+        const scanLimit = Math.max(1, Math.min(opts.scanLimit, 50_000));
+        const PAGE = 200;
+        const hits: MessageTextHit[] = [];
+        let cursor = typeof opts.beforeSeq === "number" && Number.isFinite(opts.beforeSeq) ? opts.beforeSeq : Number.MAX_SAFE_INTEGER;
+        let scanned = 0;
+        const stmt = this.db.prepare(
+            "SELECT seq, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND seq < ? ORDER BY seq DESC LIMIT ?",
+        );
+        while (scanned < scanLimit && hits.length < limit) {
+            const pageSize = Math.min(PAGE, scanLimit - scanned);
+            const rows = stmt.all(sessionId, cursor, pageSize) as { seq: number; ref_num: number | null; role: string; kind: string; content_hash: string }[];
+            if (rows.length === 0) break;
+            for (const r of rows) {
+                cursor = r.seq;
+                scanned += 1;
+                const base = this.getContent(r.content_hash);
+                if (base === null) continue;
+                const hay = base.toLowerCase();
+                let match = true;
+                for (const n of lower) {
+                    if (!hay.includes(n)) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match) continue;
+                hits.push({ seq: r.seq, refNum: r.ref_num ?? 0, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+                if (hits.length >= limit) break;
+            }
+            if (rows.length < pageSize) break;
+        }
+        return { hits, scanned, total, capped: scanned >= scanLimit && hits.length < limit, scannedTo: scanned > 0 ? cursor : null };
     }
 
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —

@@ -30,7 +30,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow, MessageRefContentRow } from "./store.js";
+import type { MessageRow, MessageRefContentRow, MessageTextSearchResult } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -745,6 +745,15 @@ export class UnifiedShadow {
         if (this.sync === null || refNums.length === 0) return [];
         this.assertLive();
         return this.sync.messageContentByRefNums(sessionId, refNums);
+    }
+
+    /** #4738 follow-through: bounded keyword search over stored message
+     *  bodies (the read side of "the host compacted it, storage still has
+     *  it"). Sync store only, same posture as messageContentByRefNums. */
+    searchMessageText(sessionId: string, needles: readonly string[], opts: { limit: number; scanLimit: number; beforeSeq?: number }): MessageTextSearchResult {
+        if (this.sync === null) return { hits: [], scanned: 0, total: 0, capped: false, scannedTo: null };
+        this.assertLive();
+        return this.sync.searchMessageText(sessionId, needles, opts);
     }
 
     sessionSummaries(): SessionSummaryRow[] {

@@ -20,9 +20,11 @@ import {
     parseCompressInput,
     ABSORB_TOOL_NAME,
     COMPRESS_TOOL_NAME,
+    HISTORY_TOOL_NAME,
     READ_ORIGINAL_IMAGE_TOOL_NAME,
     RULE_TOOL_NAME,
 } from "../compress-tool.js";
+import { executeHistoryLookup } from "../history-retrieval.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, imageRescaleToolArmed, retrieveToolName } from "../store.js";
@@ -386,6 +388,13 @@ export function executeProxyTool(
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
+    }
+    // acp_history: server-side read of STORED bodies (storage outlives the
+    // view after the host's native compaction). Synchronous: the storage read
+    // is a bounded synchronous scan by construction (searchMessageText caps
+    // both the row count and the pages it touches).
+    if (toolName === HISTORY_TOOL_NAME) {
+        return executeHistoryLookup(args, ctx.session.id);
     }
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
