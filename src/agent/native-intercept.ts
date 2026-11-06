@@ -444,6 +444,53 @@ function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): R
     }
 }
 
+/** OpenCode Go's required per-conversation routing header. The relay stamps it
+ *  on every PROXIED request (server/headers.ts), but the handback lanes below
+ *  leave bili's relay: host-owned compaction (`nativeCompactionPassthrough`,
+ *  dsh-native.ts keeps DSH's compaction native in every health state) and the
+ *  owner's `nativeBypass` hand-back go straight to the provider. opencode.ai
+ *  rejects those with `400 MissingSessionID`, so the whole compaction channel
+ *  silently dies while the conversation keeps growing — one live session lost
+ *  213 of 218 compactions over three days, which is how its resent history
+ *  reached 8650 messages and eventually saturated the resident. Same value the
+ *  host-side header plugin uses when it has no conversation context. */
+const DIRECT_OPENCODE_SESSION_FALLBACK = "dsh-default";
+
+/** Stamp the OpenCode routing header on a handback (direct) dispatch. Only
+ *  opencode.ai egress is touched, and a caller-provided value always wins —
+ *  this can never overwrite the host's own attribution. */
+function stampOpenCodeSessionOnDirect(headers: Headers, target: string): void {
+    let host: string;
+    try {
+        host = new URL(target).hostname.toLowerCase();
+    } catch {
+        return;
+    }
+    if (host !== "opencode.ai") return;
+    if ([...headers.keys()].some((name) => name.toLowerCase() === "x-opencode-session")) return;
+    headers.set("x-opencode-session", DIRECT_OPENCODE_SESSION_FALLBACK);
+}
+
+/** Same stamp as a `withHeaders` extra record, for the hand-back sites that
+ *  rebuild the dispatch through that helper instead of a Headers instance.
+ *  Undefined = leave the request untouched. */
+function openCodeSessionHandbackHeaders(
+    input: string | URL | Request,
+    init: RequestInit | undefined,
+    target: string,
+): Record<string, string> | undefined {
+    let host: string;
+    try {
+        host = new URL(target).hostname.toLowerCase();
+    } catch {
+        return undefined;
+    }
+    if (host !== "opencode.ai") return undefined;
+    const existing = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    if ([...existing.keys()].some((name) => name.toLowerCase() === "x-opencode-session")) return undefined;
+    return { "x-opencode-session": DIRECT_OPENCODE_SESSION_FALLBACK };
+}
+
 /** #2592/#2709: client-side mirror of the passthrough lane's cheap ASCII
  *  prefilter — true when the dispatch body contains DSH_COMPACTION_MARKER_SNIFF
  *  (the exact bytes the server sniffs; imported, not re-derived). A hit is NOT
@@ -1146,6 +1193,11 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 for (const name of [...directHeaders.keys()]) {
                     if (name.toLowerCase().startsWith("x-bili-")) directHeaders.delete(name);
                 }
+                // ...but the provider's own routing header must still go out:
+                // a hand-back is still an inference call at opencode.ai, and
+                // dropping this one header is what killed DSH's compaction
+                // channel for days (see stampOpenCodeSessionOnDirect).
+                stampOpenCodeSessionOnDirect(directHeaders, target);
                 const directInit = { ...init, headers: directHeaders };
                 state.onDispatch?.(target, "direct");
                 if (prep.outcome === "restored") {
@@ -1268,13 +1320,19 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             }
             if (prep.outcome === "as-is") {
                 state.onDispatch?.(dispatchUrl, "direct");
-                const resp = await send(defaultInput, init);
+                // Degraded hand-back (bootstrap failed / proxy died / respawn
+                // failed): the provider still needs its routing header, or the
+                // turn fails with 400 MissingSessionID instead of merely going
+                // uncompressed.
+                const handed = withHeaders(defaultInput, init, openCodeSessionHandbackHeaders(defaultInput, init, dispatchUrl));
+                const resp = await send(handed.input, handed.init);
                 if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
                 return resp;
             }
             const restored = withRestoredBody(defaultInput, init, prep.body);
             state.onDispatch?.(dispatchUrl, "direct");
-            const resp = await send(restored.input, restored.init);
+            const handedRestored = withHeaders(restored.input, restored.init, openCodeSessionHandbackHeaders(restored.input, restored.init, dispatchUrl));
+            const resp = await send(handedRestored.input, handedRestored.init);
             if (degradeLog !== undefined) noteDispatchMode("direct", `bili-native: ${degradeLog}: ${dispatchUrl}`);
             return resp;
         };

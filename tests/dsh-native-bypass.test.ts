@@ -51,3 +51,53 @@ test("DSH native posture bypasses takeover and oversized refusals on raw and rou
         assert.equal(seen.at(-1), "http://127.0.0.1:9999/bili/https://provider.test/v1/chat/completions", "healthy posture still routes through bili");
     } finally { _resetForTest(); globalThis.fetch = saved; }
 });
+
+// A hand-back is still an inference call at the provider. opencode.ai rejects
+// any request without x-opencode-session (400 MissingSessionID); the relay
+// stamps it for PROXIED traffic, so the handback lanes must stamp it too or the
+// host's whole compaction channel dies silently (213/218 compaction calls failed
+// this way over three days in one live session, whose history then grew to 8650
+// messages and eventually saturated the resident).
+test("handback lanes stamp x-opencode-session for opencode.ai egress only", async () => {
+    const saved = globalThis.fetch;
+    const sent: { url: string; headers: Headers }[] = [];
+    _resetForTest();
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        sent.push({
+            url: typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+            headers: new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)),
+        });
+        return new Response("native", { status: 200 });
+    }) as typeof fetch;
+    try {
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:9999", ready: Promise.resolve("http://127.0.0.1:9999"),
+            nativeBypass: () => true,
+            takeoverGate: () => true,
+            declaredWindowForDirect: () => 1,
+        };
+        installNativeFetchIntercept(state);
+        await fetch("https://opencode.ai/zen/go/v1/chat/completions", {
+            method: "POST",
+            headers: { authorization: "Bearer secret" },
+            body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(sent.at(-1)!.headers.get("x-opencode-session"), "dsh-default");
+        assert.equal(sent.at(-1)!.headers.get("authorization"), "Bearer secret");
+
+        // A caller-provided routing id is the host's own business — never overwrite it.
+        await fetch("https://opencode.ai/zen/go/v1/chat/completions", {
+            method: "POST",
+            headers: { "x-opencode-session": "caller-conversation" },
+            body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(sent.at(-1)!.headers.get("x-opencode-session"), "caller-conversation");
+
+        // Unrelated providers stay byte-identical.
+        await fetch("https://proxy.example.test/v1/chat/completions", {
+            method: "POST",
+            body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(sent.at(-1)!.headers.get("x-opencode-session"), null);
+    } finally { _resetForTest(); globalThis.fetch = saved; }
+});
