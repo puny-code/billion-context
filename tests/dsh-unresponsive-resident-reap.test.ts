@@ -92,3 +92,36 @@ test("degraded but still-answering resident is never killed", async () => {
     await assert.rejects(ensureProxyRunning(f.opts, f.deps), /refusing replacement without proven exclusivity/);
     assert.deepEqual(f.counts(), { spawns: 0, terminated: [] });
 });
+
+// The registry marker drops the launcher-private launchToken (server.ts #1232),
+// so the pre-spawn gate that required `registryEntry.launchToken === pending.launchToken`
+// could never match: every leftover pending record with a live PID wedged bootstrap
+// forever (60s retries, model traffic pinned to DIRECT). Ownership must be proven by
+// PID + lane, and the outcome decided by the candidate loop.
+function pendingRecord(pid: number, launchToken = "managed-token"): void {
+    fs.writeFileSync(path.join(stateDir(), "proxy-dsh-pending"), JSON.stringify({ pid, launchToken }));
+}
+
+test("leftover pending record no longer wedges bootstrap; a degraded resident still fails closed", async () => {
+    pendingRecord(999_998);
+    const f = fixture({ responsive: true, degraded: true });
+    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /refusing replacement without proven exclusivity/);
+    assert.deepEqual(f.counts(), { spawns: 0, terminated: [] });
+    assert.equal(fs.existsSync(path.join(stateDir(), "proxy-dsh-pending")), false);
+});
+
+test("leftover pending record for an unresponsive own resident is reaped, not fatal", async () => {
+    pendingRecord(999_998);
+    const f = fixture({ responsive: false });
+    const handle = await ensureProxyRunning(f.opts, f.deps);
+    assert.equal(handle.child?.pid, 42471);
+    assert.deepEqual(f.counts(), { spawns: 1, terminated: [999_998] });
+    assert.equal(fs.existsSync(path.join(stateDir(), "proxy-dsh-pending")), false);
+});
+
+test("leftover pending record for an unidentifiable live PID still refuses", async () => {
+    pendingRecord(777_777);
+    const f = fixture({ responsive: true });
+    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /pending child PID is alive without proven full-storage identity/);
+    assert.deepEqual(f.counts(), { spawns: 0, terminated: [] });
+});

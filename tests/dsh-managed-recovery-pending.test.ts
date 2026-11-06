@@ -67,7 +67,12 @@ test("two sequential unknown-live cold starts spawn only once and never kill", a
     const f = fixture();
     await assert.rejects(ensureProxyRunning(f.opts, f.deps), /readiness unknown after 60000ms/);
     assert.ok(fs.existsSync(pendingPath), "timeout must preserve owned child identity");
-    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /pending.*alive/);
+    // The leftover record is now proven OWNED (pointer PID+token) and resolved, so
+    // this bring-up is refused by the resident loop instead of the pending gate —
+    // in production that resident is either adopted or reaped. What must not change:
+    // no second spawn, no kill of a PID this process cannot prove it owns (this
+    // fixture's pointer names the test process itself).
+    await assert.rejects(ensureProxyRunning(f.opts, f.deps), /refusing replacement/);
     assert.deepEqual(f.counts(), { spawns: 1, kills: 0 });
 });
 

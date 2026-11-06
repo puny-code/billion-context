@@ -4889,20 +4889,33 @@ async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath
     try {
         fs.writeFileSync(fd, owner);
         const records = registry();
+        const pointer = read();
         const pending = readDshPendingChild();
         if (pending) {
             if (!alive(pending.pid)) {
                 clearDshPendingChild(pending);
             } else {
-                const registered = records.find((inst) => inst.lane === "dsh" && inst.pid === pending.pid && inst.launchToken === pending.launchToken);
-                const info = registered ? await health(registered.origin) : undefined;
-                if (!registered || !dshReady(info) || info?.pid !== registered.pid || info.instanceId !== registered.instanceId) {
+                // The registry marker deliberately drops the launcher-private
+                // launchToken (server.ts #1232), so requiring a token match on
+                // the REGISTRY entry could never succeed — every leftover record
+                // with a live PID became a permanent bootstrap wedge (60s
+                // retries forever, model traffic pinned to DIRECT while a wedged
+                // resident held the port). The pointer record still carries the
+                // token: prefer it for ownership, and treat a pointer that names
+                // this PID with a DIFFERENT token as foreign. A PID we know only
+                // from the registry is ours to hand to the candidate loop below,
+                // which attaches a ready resident, reaps one that answers
+                // nothing, and still refuses a foreign PID.
+                const pointed = isProxyInstanceFile(pointer) && pointer.pid === pending.pid ? pointer : undefined;
+                const registered = records.find((inst) => inst.lane === "dsh" && inst.pid === pending.pid);
+                const foreignToken = pointed?.launchToken !== undefined && pointed.launchToken !== pending.launchToken;
+                const owned = pointed?.launchToken === pending.launchToken || (!foreignToken && registered !== undefined);
+                if (!owned) {
                     throw new Error("bili: DSH pending child PID is alive without proven full-storage identity; refusing another spawn or kill");
                 }
                 clearDshPendingChild(pending);
             }
         }
-        const pointer = read();
         const candidates = new Map(records.map((inst) => [inst.instanceId, inst]));
         if (isProxyInstanceFile(pointer)) candidates.set(pointer.instanceId, pointer);
         for (const inst of candidates.values()) {
@@ -4966,8 +4979,13 @@ async function recoverDshProxy(opts: LaunchOptions, deps: LauncherDeps, lockPath
             throw new Error("bili: DSH final responder identity changed before takeover");
         }
         const completed = readDshPendingChild();
-        if (completed && expectedResident?.pid === completed.pid && expectedResident.launchToken === completed.launchToken
-            && finalHealth.pid === expectedResident.pid && finalHealth.instanceId === expectedResident.instanceId) {
+        // Same #1232 consequence as the pre-spawn gate: the registry entry has no
+        // launchToken, so a token comparison here never matched and the record was
+        // left behind on EVERY successful bring-up — the next bootstrap then met a
+        // leftover whose PID was still alive. The final responder's PID+instanceId
+        // is the identity that matters.
+        if (completed && finalHealth.pid === completed.pid
+            && expectedResident?.pid === completed.pid && finalHealth.instanceId === expectedResident.instanceId) {
             clearDshPendingChild(completed);
         }
         return handle;
