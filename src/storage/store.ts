@@ -120,8 +120,11 @@ export type MessageRefContentRow = { refNum: number; role: string; kind: string;
 
 /** One keyword-search hit over STORED bodies (acp_history search mode): the
  *  ref it belongs to, the seq that orders it, and the full stored content the
- *  formatter snippets from. */
-export type MessageTextHit = MessageRefContentRow & { seq: number };
+ *  formatter snippets from. `retired` marks a tombstoned row — history the
+ *  client stopped sending (host compaction, rewind/undo). It is EXACTLY what
+ *  this search exists to reach, so it is included and labelled rather than
+ *  filtered out like the view lanes do. */
+export type MessageTextHit = MessageRefContentRow & { seq: number; retired: boolean };
 
 /** Bounded search receipt. `scanned` and `total` let the caller say "searched
  *  the newest K of N" instead of implying the whole history was covered;
@@ -1459,8 +1462,12 @@ export class UnifiedStore {
      *  so "gone from the window" must not read as "gone". Unknown refs simply
      *  come back absent; retired rows (rewound/undo history) stay excluded,
      *  matching every other view-lane reader. */
-    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+    messageContentByRefNums(sessionId: string, refNums: readonly number[], opts?: { includeRetired?: boolean }): MessageRefContentRow[] {
         if (refNums.length === 0) return [];
+        // #4390: retired rows are history the client stopped sending — the view
+        // lanes exclude them by default, but a history reader must be able to
+        // ask for them (that is the whole point of acp_history's range mode).
+        const retiredFilter = opts?.includeRetired === true ? "" : " AND retired_at IS NULL";
         const nums = [...new Set(refNums)];
         const CHUNK = 500;
         const out: MessageRefContentRow[] = [];
@@ -1468,7 +1475,7 @@ export class UnifiedStore {
             const chunk = nums.slice(i, i + CHUNK);
             const ph = chunk.map(() => "?").join(",");
             for (const r of this.db
-                .prepare(`SELECT ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND ref_num IN (${ph})`)
+                .prepare(`SELECT ref_num, role, kind, content_hash FROM messages WHERE session_id = ?${retiredFilter} AND ref_num IN (${ph})`)
                 .all(sessionId, ...chunk) as { ref_num: number; role: string; kind: string; content_hash: string }[]) {
                 const base = this.getContent(r.content_hash);
                 if (base !== null) out.push({ refNum: r.ref_num, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
@@ -1481,18 +1488,22 @@ export class UnifiedStore {
      *  first. The same premise as messageContentByRefNums — the resident view
      *  only holds what the host still sends, and host-side native compaction
      *  prunes that client-side, so "no longer in the view" must never read as
-     *  "never said". Bounded by construction: one page of rows at a time, stop
-     *  at `limit` hits or `scanLimit` rows scanned. A 27 MiB session therefore
-     *  costs one bounded pass, never a whole-table scan, and the receipt
-     *  reports how much was actually covered so the caller can page backward
-     *  instead of implying completeness. Read-only. */
+     *  "never said". Unlike the view lanes this search does NOT filter
+     *  `retired_at`: absence from the authoritative set is exactly how this
+     *  store tombstones content the client dropped (#4390 historian sweep), so
+     *  filtering it would hide the one thing the caller came for. Tombstoned
+     *  hits come back labelled. Bounded by construction: one page of rows at a
+     *  time, stop at `limit` hits or `scanLimit` rows scanned. A 27 MiB session
+     *  therefore costs one bounded pass, never a whole-table scan, and the
+     *  receipt reports how much was actually covered so the caller can page
+     *  backward instead of implying completeness. Read-only. */
     searchMessageText(
         sessionId: string,
         needles: readonly string[],
         opts: { limit: number; scanLimit: number; beforeSeq?: number },
     ): MessageTextSearchResult {
         const total = ((this.db
-            .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL")
+            .prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ?")
             .get(sessionId) as { n: number }).n) ?? 0;
         const lower = needles.map((n) => n.toLowerCase()).filter((n) => n.length > 0);
         if (lower.length === 0) return { hits: [], scanned: 0, total, capped: false, scannedTo: null };
@@ -1503,11 +1514,11 @@ export class UnifiedStore {
         let cursor = typeof opts.beforeSeq === "number" && Number.isFinite(opts.beforeSeq) ? opts.beforeSeq : Number.MAX_SAFE_INTEGER;
         let scanned = 0;
         const stmt = this.db.prepare(
-            "SELECT seq, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND seq < ? ORDER BY seq DESC LIMIT ?",
+            "SELECT seq, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?",
         );
         while (scanned < scanLimit && hits.length < limit) {
             const pageSize = Math.min(PAGE, scanLimit - scanned);
-            const rows = stmt.all(sessionId, cursor, pageSize) as { seq: number; ref_num: number | null; role: string; kind: string; content_hash: string }[];
+            const rows = stmt.all(sessionId, cursor, pageSize) as { seq: number; ref_num: number | null; role: string; kind: string; content_hash: string; retired_at: number | null }[];
             if (rows.length === 0) break;
             for (const r of rows) {
                 cursor = r.seq;
@@ -1523,7 +1534,7 @@ export class UnifiedStore {
                     }
                 }
                 if (!match) continue;
-                hits.push({ seq: r.seq, refNum: r.ref_num ?? 0, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+                hits.push({ seq: r.seq, refNum: r.ref_num ?? 0, role: r.role, kind: r.kind, content: this.hydrateMedia(base), retired: r.retired_at !== null });
                 if (hits.length >= limit) break;
             }
             if (rows.length < pageSize) break;

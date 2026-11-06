@@ -100,3 +100,33 @@ test("an unknown session is an empty result, never a throw", () => {
         cleanup();
     }
 });
+
+test("content the client stopped sending is retired, still searchable, and labelled", () => {
+    // The real trigger: the host compacts and its next request no longer carries
+    // the early messages. Ingest tombstones them (#4390 historian sweep) — the
+    // view drops them, the bytes stay. This is the case acp_history exists for,
+    // so a search that filtered retired rows would return nothing exactly when
+    // it is needed.
+    const dir = mkdtempSync(join(tmpdir(), "hs-retired-"));
+    try {
+        const store = UnifiedStore.open(join(dir, "index.db"));
+        store.ingestSession(
+            planIngest(histLike("hs", 1, [wmsg("a", "alpha the old plan", 0), wmsg("b", "bravo context", 1), wmsg("c", "charlie latest", 2)])),
+            undefined,
+            { completeLog: true },
+        );
+        // Compaction dropped a and b from the request.
+        store.ingestSession(planIngest(histLike("hs", 2, [wmsg("c", "charlie latest", 0)])), undefined, { completeLog: true });
+
+        const gone = store.searchMessageText("hs", ["alpha"], { limit: 5, scanLimit: 50 });
+        assert.equal(gone.hits.length, 1, "compacted-away content is still found");
+        assert.equal(gone.hits[0].retired, true, "and reported as retired");
+        assert.equal(gone.total, 3, "total counts stored history, not just the live view");
+
+        const live = store.searchMessageText("hs", ["charlie"], { limit: 5, scanLimit: 50 });
+        assert.equal(live.hits.length, 1);
+        assert.equal(live.hits[0].retired, false, "live content is not labelled retired");
+    } finally {
+        try { rmSync(dir, { recursive: true, force: true }); } catch { /* Windows may still hold the file */ }
+    }
+});

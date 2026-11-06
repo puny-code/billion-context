@@ -46,7 +46,7 @@ export type HistoryLookupDeps = {
 function defaultDeps(): HistoryLookupDeps {
     const store = getStore();
     return {
-        refRows: (sessionId, refNums) => store.unifiedMessageContentByRefs(sessionId, refNums),
+        refRows: (sessionId, refNums) => store.unifiedMessageContentByRefs(sessionId, refNums, true),
         search: (sessionId, needles, opts) => store.unifiedSearchMessageText(sessionId, needles, opts),
     };
 }
@@ -131,8 +131,8 @@ export function snippetOf(text: string, needles: readonly string[]): string {
     return (start0 > 0 ? "\u2026" : "") + marked + (end0 < text.length ? "\u2026" : "");
 }
 
-function header(role: string, kind: string, chars: number): string {
-    return `(${role}${kind && kind !== "message" ? ` · ${kind}` : ""} · ${chars.toLocaleString("en-US")} chars)`;
+function header(role: string, kind: string, chars: number, retired = false): string {
+    return `(${role}${kind && kind !== "message" ? ` · ${kind}` : ""}${retired ? " · retired" : ""} · ${chars.toLocaleString("en-US")} chars)`;
 }
 
 type RangePlan = { from: number; to: number; cappedAt: number | null };
@@ -211,7 +211,7 @@ function runSearch(args: Record<string, unknown>, sessionId: string, deps: Histo
     }
     const lines = found.hits.map((h) => {
         const body = readableMessageText(h.content);
-        return `${refOf(h.refNum)} ${header(h.role, h.kind, body.length)}\n  ${snippetOf(body, needles).replace(/\n/g, "\n  ")}`;
+        return `${refOf(h.refNum)} ${header(h.role, h.kind, body.length, h.retired)}\n  ${snippetOf(body, needles).replace(/\n/g, "\n  ")}`;
     });
     const oldest = found.hits[found.hits.length - 1];
     const more = found.capped
@@ -221,7 +221,7 @@ function runSearch(args: Record<string, unknown>, sessionId: string, deps: Histo
           : "";
     return toolOk(
         `[acp_history search "${query}": ${found.hits.length} hit(s) in ${found.scanned.toLocaleString("en-US")} of ${found.total.toLocaleString("en-US")} stored message(s)]\n\n` +
-            `${lines.join("\n\n")}${more}\n\n` +
+            `${lines.join("\n\n")}${more}${found.hits.some((h) => h.retired) ? "\n\n[\u00b7 retired marks a message the client no longer sends (host compaction, rewind or undo) \u2014 storage kept the body, so it is still readable here.]" : ""}\n\n` +
             "[Snippets only — fetch full text with acp_history({from,to}) on the refs you need: {from:\"" +
             refOf(oldest.refNum) +
             '", to:"' +

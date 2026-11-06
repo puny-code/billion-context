@@ -8,7 +8,7 @@ import { executeHistoryLookup, parseRefNum, readableMessageText, renderRange, sn
 import type { MessageRefContentRow, MessageTextSearchResult } from "../src/storage/store.ts";
 
 const row = (refNum: number, content: string, role = "user", kind = "message"): MessageRefContentRow => ({ refNum, role, kind, content });
-const hit = (seq: number, refNum: number, content: string, role = "assistant") => ({ seq, refNum, role, kind: "message", content });
+const hit = (seq: number, refNum: number, content: string, role = "assistant") => ({ seq, refNum, role, kind: "message", content, retired: false });
 const found = (over: Partial<MessageTextSearchResult>): MessageTextSearchResult => ({ hits: [], scanned: 0, total: 0, capped: false, scannedTo: null, ...over });
 
 const noRefs = () => null;
@@ -137,6 +137,16 @@ test("snippets centre on the first match and stay surrogate-safe", () => {
         const c = s.charCodeAt(i);
         if (c >= 0xd800 && c <= 0xdbff) assert.ok(i + 1 < s.length && s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff, "no lone high surrogate");
     }
+});
+
+test("a hit the client stopped sending is included and labelled, not hidden", () => {
+    const res = executeHistoryLookup({ query: "alpha" }, "s1", {
+        search: () => found({ hits: [{ ...hit(9, 9, "alpha and the old plan"), retired: true }], scanned: 20, total: 20, scannedTo: 1 }),
+        refRows: noRefs,
+    });
+    assert.equal(res.outcome, "success");
+    assert.match(res.text, /m00009 \(assistant \u00b7 retired/);
+    assert.match(res.text, /retired marks a message the client no longer sends/);
 });
 
 test("renderRange reports shown/next honestly when the budget cuts mid-list", () => {

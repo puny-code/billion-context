@@ -741,10 +741,10 @@ export class UnifiedShadow {
     /** #4738: per-ref stored message bodies (sync store only, like
      *  tailViewRows) — the web preview fallback when host-side native
      *  compaction pruned the resident window. */
-    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+    messageContentByRefNums(sessionId: string, refNums: readonly number[], opts?: { includeRetired?: boolean }): MessageRefContentRow[] {
         if (this.sync === null || refNums.length === 0) return [];
         this.assertLive();
-        return this.sync.messageContentByRefNums(sessionId, refNums);
+        return this.sync.messageContentByRefNums(sessionId, refNums, opts);
     }
 
     /** #4738 follow-through: bounded keyword search over stored message

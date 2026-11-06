@@ -1906,10 +1906,10 @@ export class SessionStore {
      *  for hosts whose native compaction pruned the resident window. Null when
      *  the unified store is unavailable — callers keep their legacy "missing"
      *  posture and never guess. */
-    unifiedMessageContentByRefs(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] | null {
+    unifiedMessageContentByRefs(sessionId: string, refNums: readonly number[], includeRetired?: boolean): MessageRefContentRow[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
-            return this.shadow.messageContentByRefNums(sessionId, refNums);
+            return this.shadow.messageContentByRefNums(sessionId, refNums, includeRetired === true ? { includeRetired: true } : undefined);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
         }
