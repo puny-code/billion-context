@@ -1277,7 +1277,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             compactionFitCache = { source, plan };
             if (plan !== undefined && !compactionFitLogged) {
                 compactionFitLogged = true;
-                logHostEvent("warn", "[native-client]", `[compaction-fit] host compaction request ~${plan.originalTokens.toLocaleString("en-US")} tok (${plan.originalBytes.toLocaleString("en-US")} B) provably exceeds the ${plan.window.toLocaleString("en-US")} tok window — replacing ${plan.droppedMessages.toLocaleString("en-US")} earlier message(s) with one marked placeholder before the direct send (~${plan.fittedTokens.toLocaleString("en-US")} tok, compaction-fit-oversize)`);
+                logHostEvent("warn", "[native-client]", `[compaction-fit] host compaction request ~${plan.originalTokens.toLocaleString("en-US")} tok (${plan.originalBytes.toLocaleString("en-US")} B) provably exceeds the ${plan.budget.toLocaleString("en-US")} tok input budget (${plan.window.toLocaleString("en-US")} window − ${(plan.window - plan.budget).toLocaleString("en-US")} reply reserve) — replacing ${plan.droppedMessages.toLocaleString("en-US")} earlier message(s) with one marked placeholder before the direct send (~${plan.fittedTokens.toLocaleString("en-US")} tok, compaction-fit-oversize)`);
             }
             return plan;
         };

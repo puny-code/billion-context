@@ -54,6 +54,12 @@ export const COMPACTION_FIT_TRIGGER_RATIO = 0.9;
  *  `bytes / 4` estimate. */
 export const COMPACTION_FIT_TARGET_RATIO = 0.8;
 
+/** Share of the window held back for the summarizer's own reply. Providers cap
+ *  input+output together, so the input ceiling is `window - reply allowance`,
+ *  never `window`. This mirrors the headroom policy the proxy already applies
+ *  on every other lane (reserve `min(max output, 25% of window)`). */
+export const COMPACTION_FIT_OUTPUT_RESERVE_PCT = 0.25;
+
 export type CompactionWireProtocol = "anthropic" | "openai" | "responses";
 
 /** The replacement body plus the numbers the caller logs (and tests pin). */
@@ -73,6 +79,8 @@ export interface CompactionFitPlan {
     originalTokens: number;
     fittedTokens: number;
     window: number;
+    /** Input ceiling actually used: `window` minus the reply allowance. */
+    budget: number;
     /** The marker text (also the placeholder message's content). */
     placeholder: string;
 }
@@ -85,6 +93,17 @@ function isRec(value: unknown): value is Rec {
 
 function roleOf(item: unknown): string | undefined {
     return isRec(item) && typeof item.role === "string" ? item.role : undefined;
+}
+
+/** The reply allowance the request itself asks for, when it asks for one.
+ *  `max_tokens` on the Anthropic and classic OpenAI wires, plus the two names
+ *  the newer shapes use. */
+function declaredOutputTokens(parsed: Rec): number | undefined {
+    for (const key of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
+        const value = parsed[key];
+        if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value);
+    }
+    return undefined;
 }
 
 /** The marker line. Deliberately explicit: a reader (or the summarizer) must
@@ -290,6 +309,19 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
         return undefined;
     }
     if (!isRec(parsed)) return undefined;
+    // The window is shared with the reply. A provider that caps input+output
+    // at `window` rejects a body that clears `window` only because the request
+    // ALSO asks for a large completion. Live proof: a 27.4 MB compaction replay
+    // was fitted to ~830,803 tok against the 1,048,576 window and still came
+    // back "Input too long: input exceeds the context limit" — the request
+    // declared max_tokens 256,000, so the real input ceiling was 792,576 and
+    // the fit had stopped 38,227 tok too late. Budget the fit against what the
+    // provider will actually accept, using the same reserve the proxy's
+    // headroom policy applies to every other lane.
+    const reserveCeiling = Math.floor(window * COMPACTION_FIT_OUTPUT_RESERVE_PCT);
+    const reserved = Math.min(declaredOutputTokens(parsed) ?? reserveCeiling, reserveCeiling);
+    const budget = Math.max(1, window - reserved);
+    if (originalTokens <= budget * COMPACTION_FIT_TRIGGER_RATIO) return undefined;
     const wire = protocolOf(parsed);
     if (wire === undefined) return undefined;
     const { protocol, field } = wire;
@@ -301,7 +333,7 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
     const headEnd = leadingSystemCount(items);
     if (total - headEnd < 2) return undefined;
 
-    const targetBytes = Math.floor(window * COMPACTION_FIT_TARGET_RATIO) * 4;
+    const targetBytes = Math.floor(budget * COMPACTION_FIT_TARGET_RATIO) * 4;
     const itemBytes: number[] = new Array(total).fill(0);
     for (let i = headEnd; i < total; i += 1) {
         const json = JSON.stringify(items[i]);
@@ -337,7 +369,7 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
         // mailing something neither side can reason about.
         if (fittedBytes >= originalBytes) continue;
         const fittedTokens = Math.ceil(fittedBytes / 4);
-        if (fittedTokens > window * COMPACTION_FIT_TARGET_RATIO) continue;
+        if (fittedTokens > budget * COMPACTION_FIT_TARGET_RATIO) continue;
         return {
             body,
             protocol,
@@ -350,6 +382,7 @@ export function planCompactionFit(raw: string, declaredWindow: number | undefine
             originalTokens,
             fittedTokens,
             window,
+            budget,
             placeholder: text,
         };
     }

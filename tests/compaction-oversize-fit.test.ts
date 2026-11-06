@@ -325,6 +325,46 @@ test("planCompactionFit: responses wire fits `input` with a typed placeholder", 
     assert.deepEqual(messagesOf(plan.body, "input").at(-1), { type: "message", role: "user", content: [{ type: "input_text", text: DIRECTIVE }] });
 });
 
+/** A replay whose kept TAIL is itself large: a 100 KB early tool result plus
+ *  four assistant/user pairs of `tailChars`. */
+function mixedHistoryBody(padChars: number, tailChars: number, maxTokens: number): string {
+    const items: Rec[] = [
+        { role: "user", content: TASK },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_pad", name: "read_file", input: { path: "big.ts" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_pad", content: "p".repeat(padChars) }] },
+    ];
+    for (let k = 0; k < 4; k += 1) {
+        items.push({ role: "assistant", content: "a".repeat(tailChars) });
+        items.push({ role: "user", content: k === 3 ? DIRECTIVE : "u".repeat(tailChars) });
+    }
+    return JSON.stringify({ model: "deepseek-test", max_tokens: maxTokens, stream: true, system: "you are a coding agent", messages: items });
+}
+
+test("planCompactionFit: budgets the fit against window minus the declared reply allowance", () => {
+    const window = 100_000;
+    const plan = planCompactionFit(mixedHistoryBody(100_000, 50_000, 25_000), window);
+    assert.ok(plan !== undefined, "an oversize replay is fitted");
+    // The provider caps input+output at the window, so asking for 25,000 output
+    // tokens leaves a 75,000 input ceiling — and the target is 80% of THAT.
+    // Live evidence: a 27.4 MB replay was fitted to ~830,803 tok against the
+    // 1,048,576 window and the provider still answered "Input too long", because
+    // the request declared max_tokens 256,000 and the ceiling was 792,576.
+    assert.equal(plan.budget, 75_000);
+    assert.ok(plan.fittedTokens <= 60_000, `fitted ${plan.fittedTokens} tok exceeds the 80% target`);
+    assert.ok(plan.droppedMessages > 0);
+    const kept = messagesOf(plan.body);
+    assert.equal(kept.at(-1)?.content, DIRECTIVE);
+    assertNoOrphanToolResults(kept);
+});
+
+test("planCompactionFit: a modest reply allowance leaves the window essentially intact", () => {
+    const window = 100_000;
+    const plan = planCompactionFit(mixedHistoryBody(100_000, 50_000, 8_192), window);
+    assert.ok(plan !== undefined);
+    assert.equal(plan.budget, 91_808, "only the 8,192-token reply is held back");
+    assert.ok(plan.fittedTokens <= Math.floor(91_808 * 0.8));
+});
+
 test("planCompactionFit: declines every shape it cannot reason about", () => {
     const small = anthropicCompactionBody(1_000);
     assert.equal(planCompactionFit(small, WINDOW), undefined, "in-window");
