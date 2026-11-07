@@ -3584,6 +3584,7 @@ export async function preflightCompressIfNeeded(
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
     const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
+    let unfoldedDoomed = false;
     if (probeForEvidence) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has
@@ -3615,15 +3616,26 @@ export async function preflightCompressIfNeeded(
             // 413 mirrors the side-request guard's "cannot fit, NOT forwarded"
             // convention and is terminal for every mainstream host. Same doom
             // math, same message, same no-forward behavior — status only.
-            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            // This bar is judged on the UNFOLDED payload, and preflight can still
+            // shrink it (v1.4.5 died here at 01:59:12 in 10s, before any fold round
+            // ran, even though 13 folds from the earlier walk were persisted). Never
+            // forward it (a guaranteed 400 on a multi-MB body), but do not fail fast
+            // before folding: fall through to the fold walk, and the post-fold
+            // check below decides whether it still fails.
+            log("warn", `[${session.id}] unfolded payload core text ~${coreTextBytes} bytes exceeds both doom bars — NOT forwarding; folding first, the post-fold check decides (${doomedMessage.slice(0, 120)}…)`);
+            // A payload that trips BOTH doom bars is not forwarded as-is: folding runs
+            // first and the post-fold verdict decides. The flag still suppresses the
+            // forward-once escape below, because re-sending the untouched 27 MB body is
+            // exactly the guaranteed-400 request this guard exists to stop (#301/#4185).
+            // No noteLocalRefusal here: nothing was refused yet — the terminal 413 later
+            // in this function owns that record (#3846).
+            unfoldedDoomed = true;
         }
         if (localRefusalHere) {
             // #3846: bili already refused this scope locally — the estimate-only
             // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
             log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
-        } else {
+        } else if (!unfoldedDoomed) {
             log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
             return prepared;
         }

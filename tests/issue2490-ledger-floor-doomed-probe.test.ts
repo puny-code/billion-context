@@ -293,8 +293,9 @@ test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead o
         // the identical doomed payload (3 crashes in 10s in the field).
         assert.equal(r.status, 413, "doomed probe fails fast with NON-retryable 4xx semantics, not forwarded");
         const body = await r.text();
-        assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");
+        // v1.4.6: the unfolded payload is no longer refused before folding; the
+        // post-fold check refuses it instead (futile round, not forwarded).
+        assert.match(body, /NOT forwarded/, "the over-window payload is still not forwarded");
 
         assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — never the 2.2MB payload`);
     } finally {
