@@ -3677,7 +3677,7 @@ export async function preflightCompressIfNeeded(
     // this same forward-instead-of-fail-fast decision after compression (below).
     const imageArbitration = imageTokens > 0 && textChannel < limit && textChannel + imageTokens >= limit && noOverflowEvidence;
     // #3846: a scoped local 413 outranks the image-arbitration bet too.
-    if (imageArbitration && !localRefusalHere && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
+    if (imageArbitration && !localRefusalHere && !unfoldedDoomed && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, nothing compressible, no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
         return prepared;
     }
@@ -3739,7 +3739,11 @@ export async function preflightCompressIfNeeded(
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
         // #3146: fit is judged on the CJK-aware estimate (payloadFitsWindow) for
         // every regime, so a fresh session whose real size fits forwards here.
-        if (payloadFitsWindow) {
+        // #2490: the flag participates here because a k̂-scaled estimate can
+        // read a doomed-by-bytes body as fitting the window — forwarding it
+        // as-is would re-send the untouched multi-MB payload this guard exists
+        // to stop. Fold first; the post-fold verdict decides.
+        if (payloadFitsWindow && !unfoldedDoomed) {
             log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${Math.round(calibratedPayload)}/${limit}${kFactor !== undefined ? `, k̂=${kFactor.toFixed(2)}` : ""}); forwarding as-is`);
             return prepared;
         }

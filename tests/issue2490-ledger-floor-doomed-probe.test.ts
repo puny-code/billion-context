@@ -376,3 +376,140 @@ test("e2e #4079: the non-doomed probe forward logs NO profile line (negative dir
     assert.equal(status, 200, "experiment-sized payload still probes (#2313/#1001 preserved)");
     assert.equal(profiles.length, 0, "the diagnostic only fires on the refusal path, never on the hot path");
 });
+
+// ---------------------------------------------------------------------------
+// (e) the pre-fold "forward as-is" fast paths must respect unfoldedDoomed
+
+// The pre-fold kill switch maps core-text BYTES to a token floor; a k̂ < 1 can
+// shrink the same body's calibrated estimate back under the window. The only
+// regime where a fired trigger and `payloadFitsWindow` can coexist is the
+// codex responses lane (its 90% health bar makes the target < window); in the
+// chat lane the trigger's `textChannel >= target` and `payloadFitsWindow`
+// (`calibratedPayload < limit`) are mutually exclusive. So this case rides the
+// codex lane: a 3.05MB single-paste body (doomed: past both bars) whose
+// calibrated estimate lands at ~0.95×window, with nothing compressible
+// (one message = the whole protected recent zone).
+const FASTPATH_WINDOW = 200_000;
+const CODEX_UA = "codex_cli_rs/0.1.0 (linux x86_64)";
+
+function makeResponsesUpstream(): { server: http.Server; calls: Call[] } {
+    const calls: Call[] = [];
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let body: { stream?: boolean; input?: unknown } = {};
+            try { body = JSON.parse(raw) as typeof body; } catch { /* counted as empty */ }
+            calls.push({ summary: body.stream !== true, contentChars: JSON.stringify(body.input ?? null).length });
+            if (body.stream !== true) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: SUMMARY_TEXT }] }] }));
+                return;
+            }
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "forwarded answer" })}\n\n`);
+            res.end(`event: response.completed\ndata: ${JSON.stringify({ response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: 12, output_tokens: 1, total_tokens: 13 } } })}\n\n`);
+        });
+    });
+    return { server, calls };
+}
+
+async function runDoomedFastPathScenario(sessionId: string): Promise<{ status: number; body: string; calls: Call[]; lines: string[] }> {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-2490-fastpath-"));
+    const lines: string[] = [];
+    const prevMode = process.env.BILI_CODEX_COMPACT;
+    const prevPrompt = process.env.ACP_NO_COMPRESS_PROMPT;
+    process.env.BILI_CODEX_COMPACT = "intercept";
+    process.env.ACP_NO_COMPRESS_PROMPT = "1";
+    setLogCapture((_level, msg) => lines.push(msg));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const { server: upstream, calls } = makeResponsesUpstream();
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const origin = `http://127.0.0.1:${upstreamPort}`;
+    const proxy = await startServer(proxyOptions(
+        { [origin]: { models: { "gpt-resp": { context: FASTPATH_WINDOW } } } },
+        {
+            modelContextLimit: FASTPATH_WINDOW,
+            kernelConfig: defaultConfig(FASTPATH_WINDOW, {
+                preserveRecentMessages: 2,
+                preserveRecentTokens: 2000,
+                compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
+            }),
+            compress: { injectTool: true, injectNudge: true },
+            log: true,
+            logFile: path.join(root, "bili.log"),
+        },
+    ));
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/${origin}/v1/responses`;
+    const send = (input: unknown) => fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+        body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: sessionId, input }),
+    });
+    try {
+        const seed = await send([{ type: "message", role: "user", content: "hello" }]);
+        assert.equal(seed.status, 200, await seed.clone().text());
+        await seed.text();
+        const s = getSession(sessionId);
+        assert.ok(s, "session exists after the seed turn");
+        // #2313/#2490 stuck-meter seed: an estimate-grade baseline from a
+        // FOREIGN origin demotes to zero (#1933 F2), so the probe gate — and
+        // therefore the doom branch — is the next decision. k̂ = 0.25 (the
+        // clamp floor) is the learned scale that makes a 7.5×window-BYTES body
+        // read as fitting.
+        s.stats.lastInputTokens = 7_300_000;
+        s.stats.lastInputTokensSource = "estimate";
+        s.stats.lastInputTokensOrigin = "http://127.0.0.1:1";
+        s.stats.calibratedEstimate = 0.25;
+        s.stats.calibratedEstimateOrigin = origin;
+        s.stats.calibratedEstimateModel = "gpt-resp";
+
+        lines.length = 0;
+        // 3.05M ASCII chars ≈ 762.5K raw tokens × 0.25 ≈ 190.6K calibrated —
+        // above the codex 90% target (180K) and below the 200K window, while
+        // the raw core text (>2MB) trips the absolute doom bar.
+        const r = await send([{ type: "message", role: "user", content: "f".repeat(3_050_000) }]);
+        return { status: r.status, body: await r.text(), calls, lines };
+    } finally {
+        setLogCapture(null);
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+        if (prevMode === undefined) delete process.env.BILI_CODEX_COMPACT;
+        else process.env.BILI_CODEX_COMPACT = prevMode;
+        if (prevPrompt === undefined) delete process.env.ACP_NO_COMPRESS_PROMPT;
+        else process.env.ACP_NO_COMPRESS_PROMPT = prevPrompt;
+        rmrf(root);
+    }
+}
+
+test("e2e #2490 e: a doomed-by-bytes body whose k̂-scaled estimate fits the window never takes a pre-fold forward-as-is path", async () => {
+    const { status, body, calls, lines } = await runDoomedFastPathScenario("s-2490-fastpath");
+    // With the pre-fold escape open this request is forwarded verbatim (200,
+    // 3MB body upstream). Folded first, the post-fold verdict refuses it: 502
+    // because the calibrated view fits (`!payloadFitsWindow` is what turns the
+    // deterministic-exhaustion verdict into 413). Either terminal outcome is
+    // fine — what matters is that the untouched body never leaves.
+    assert.ok(status === 413 || status === 502, `the doomed multi-MB body must not be forwarded as-is (status=${status}, body=${body.slice(0, 200)})`);
+    assert.match(body, /NOT forwarded/);
+    assert.ok(
+        !lines.some((l) => /preflight target reached .*forwarding as-is/.test(l)),
+        "the pre-fold 'fits, forwarding as-is' fast path must not fire for a doomed payload",
+    );
+    assert.ok(
+        lines.some((l) => l.includes("preflight compressing before forward")),
+        `the doomed payload must reach the fold walk (logs=${JSON.stringify(lines.filter((l) => /preflight/.test(l)).slice(0, 6))})`,
+    );
+    assert.ok(
+        calls.filter((c) => !c.summary).length === 1 && calls.every((c) => c.contentChars < 50_000),
+        `only the seed turn may reach the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — never the 3MB payload`,
+    );
+});
