@@ -113,19 +113,31 @@ test("a small window never overruns after the allowance is rewritten", () => {
 });
 
 test("an ambiguous envelope never ships max_tokens: 1", () => {
-    // Two numeric occurrences (the real allowance and a nested one): the rewrite
-    // refuses to guess, so the cut must be dropped rather than sent with the
-    // 1-token clamp still in it.
-    const head = '{"model":"m","max_tokens":1,"metadata":{"max_tokens":1},';
-    const msgs = [
-        { role: "user", content: "u".repeat(40_000) },
-        { role: "assistant", content: "a".repeat(40_000) },
+    // Two numeric occurrences (the real allowance and a nested one) make the
+    // rewrite refuse to guess which field is the reply allowance. Because it
+    // refuses, EVERY candidate cut is dropped — leaving the 1-token clamp in the
+    // body would ship a request that still declares `max_tokens: 1`, and the
+    // provider answers that with a one-token "summary" the host throws away as a
+    // truncated checkpoint. With no cut left the fit refuses to be produced at
+    // all (undefined), so the caller keeps today's behaviour instead of shipping
+    // that body.
+    const messages = [
+        { role: "user", content: "u".repeat(400_000) },
+        { role: "assistant", content: "a".repeat(400_000) },
         { role: "user", content: DIRECTIVE },
     ];
-    const plan = planCompactionFit(`${head}"messages":${JSON.stringify(msgs)}}`, 100_000);
-    if (plan !== undefined) {
-        assert.notEqual((JSON.parse(plan.body) as Rec).max_tokens, 1, "a 1-token plan must never be sent");
-    }
+    const replay = JSON.stringify(messages);
+    const plan = planCompactionFit(`{"model":"m","max_tokens":1,"metadata":{"max_tokens":1},"messages":${replay}}`, 100_000);
+    assert.equal(plan, undefined, "an ambiguous envelope must not produce a plan");
+
+    // CONTROL: the same oversized replay with ONE unambiguous top-level
+    // allowance must produce a plan. Without this the assertion above could pass
+    // for the wrong reason — a body too small to clear COMPACTION_FIT_TRIGGER_RATIO
+    // returns undefined before the rewrite path is ever reached.
+    const control = planCompactionFit(`{"model":"m","max_tokens":1,"messages":${replay}}`, 100_000);
+    assert.ok(control, "the same replay with one unambiguous allowance must be fitted");
+    assert.equal(control.outputTokens, COMPACTION_FIT_RESTORED_OUTPUT_TOKENS);
+    assert.equal((JSON.parse(control.body) as Rec).max_tokens, COMPACTION_FIT_RESTORED_OUTPUT_TOKENS);
 });
 test("rewriteReplyAllowance rewrites exactly one scalar and leaves every other byte", () => {
     const head = '{\n  "model": "m",\n  "max_tokens": 1,\n  "system": "s",';
