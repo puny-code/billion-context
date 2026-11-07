@@ -15,7 +15,7 @@ import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
-import { COMPACTION_FIT_RETRY_LIMIT, COMPACTION_FIT_TRIGGER_RATIO, planCompactionFit, type CompactionFitPlan } from "./compaction-fit.js";
+import { COMPACTION_FIT_CAP_RETRY_LIMIT, COMPACTION_FIT_RETRY_LIMIT, COMPACTION_FIT_TRIGGER_RATIO, planCompactionFit, type CompactionFitPlan } from "./compaction-fit.js";
 import { maskUrlForLog } from "../log-mask.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
@@ -1170,9 +1170,14 @@ function statedTokenCount(text: string): number | undefined {
 
 /** Re-cut an already-fitted compaction body so the estimate lands under
  *  `targetTokens`. Fail-open: undefined means "keep what you have". */
-function refitCompactionBody(original: string, plan: CompactionFitPlan, targetTokens: number): CompactionFitPlan | undefined {
+function refitCompactionBody(
+    original: string,
+    plan: CompactionFitPlan,
+    targetTokens: number | undefined,
+    outputCeiling?: number,
+): CompactionFitPlan | undefined {
     try {
-        return planCompactionFit(original, plan.window, targetTokens);
+        return planCompactionFit(original, plan.window, targetTokens, outputCeiling);
     } catch {
         return undefined;
     }
@@ -1213,11 +1218,12 @@ async function sendFittedCompaction(
     };
     let current = plan;
     let response = await dispatch(current.body);
-    for (let attempt = 0; ; attempt += 1) {
+    let reCuts = 0;
+    let capReCuts = 0;
+    for (;;) {
         const status = response.status;
-        const retriesLeft = original !== undefined && attempt < COMPACTION_FIT_RETRY_LIMIT;
         if (status < 400) {
-            describe("info", String(status), attempt === 0 ? "accepted" : `accepted after ${attempt} re-cut(s)`);
+            describe("info", String(status), reCuts + capReCuts === 0 ? "accepted" : `accepted after ${reCuts + capReCuts} re-cut(s)`);
             return response;
         }
         let text = "";
@@ -1230,10 +1236,33 @@ async function sendFittedCompaction(
             describe("warn", String(status), "not a size rejection, this fit cannot fix it — keeping the response as-is");
             return response;
         }
-        if (!retriesLeft) {
+        // A provider whose maximum output is below the restored allowance answers
+        // `max_tokens too large` (src/side-request.ts records the 32K cap). That is
+        // not a size rejection: shrinking the INPUT again would never converge on an
+        // accepted reply budget. Lower the allowance instead, on its own retry
+        // budget, and bypass the "nothing cut" guard below — a smaller reply widens
+        // the input budget, so the body may legitimately GROW.
+        const capRejected = original !== undefined
+            && capReCuts < COMPACTION_FIT_CAP_RETRY_LIMIT
+            && /max_(?:output_)?tokens?|max_completion_tokens/i.test(text)
+            && /too large|exceed/i.test(text);
+        if (capRejected) {
+            const ceiling = Math.max(4096, Math.floor(current.outputTokens / 2));
+            const next = refitCompactionBody(original, current, undefined, ceiling);
+            if (next === undefined || next.outputTokens >= current.outputTokens) {
+                describe("error", String(status), "the provider rejects the reply allowance and no smaller one fits — keeping the response as-is");
+                return response;
+            }
+            capReCuts += 1;
+            logHostEvent("warn", "[native-client]", `[compaction-fit] upstream answered ${status} — provider output cap: lowering the reply allowance ${current.outputTokens.toLocaleString("en-US")} → ${next.outputTokens.toLocaleString("en-US")} tok, attempt ${capReCuts}/${COMPACTION_FIT_CAP_RETRY_LIMIT}`);
+            current = next;
+            response = await dispatch(current.body);
+            continue;
+        }
+        if (original === undefined || reCuts >= COMPACTION_FIT_RETRY_LIMIT) {
             describe("error", String(status), original === undefined
                 ? "still too large and the pre-fit body is gone, so no re-cut is possible"
-                : `still too large after ${attempt} re-cut(s) — giving up rather than looping`);
+                : `still too large after ${reCuts} re-cut(s) — giving up rather than looping`);
             return response;
         }
         // A stated request size beats a blind halving: the provider is telling
@@ -1253,7 +1282,8 @@ async function sendFittedCompaction(
             describe("error", `${status}${stated === undefined ? "" : ` (provider counted ${stated.toLocaleString("en-US")} tok)`}`, "still too large but nothing cuttable is left — the kept tail alone is over the limit");
             return response;
         }
-        logHostEvent("warn", "[native-client]", `[compaction-fit] upstream answered ${status}${stated === undefined ? "" : ` (provider counted ${stated.toLocaleString("en-US")} tok)`} — re-cutting attempt ${attempt + 1}/${COMPACTION_FIT_RETRY_LIMIT}: ceiling ${current.budget.toLocaleString("en-US")} → ${next.budget.toLocaleString("en-US")} tok, dropping ${next.droppedMessages.toLocaleString("en-US")} earlier message(s)`);
+        reCuts += 1;
+        logHostEvent("warn", "[native-client]", `[compaction-fit] upstream answered ${status}${stated === undefined ? "" : ` (provider counted ${stated.toLocaleString("en-US")} tok)`} — re-cutting attempt ${reCuts}/${COMPACTION_FIT_RETRY_LIMIT}: ceiling ${current.budget.toLocaleString("en-US")} → ${next.budget.toLocaleString("en-US")} tok, dropping ${next.droppedMessages.toLocaleString("en-US")} earlier message(s)`);
         current = next;
         response = await dispatch(current.body);
     }
@@ -1352,7 +1382,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // only decides WHEN it applies: a host-compaction POST whose body
         // provably cannot fit the window. Everything else — small compaction
         // calls included — keeps its exact bytes.
-        const fitFloorBytes = Math.ceil(MIN_ASSUMED_WINDOW_TOKENS * COMPACTION_FIT_TRIGGER_RATIO) * 4;
+        const headerDeclared = declaredWindowFromHeaders(input, init);
         let compactionFitCache: { source: unknown; plan: CompactionFitPlan | undefined; text: string | undefined } | undefined;
         let compactionFitLogged = false;
         const compactionFitFor = async (
@@ -1365,25 +1395,20 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // No body the guard could ever act on (a sub-fits-any-supported-
             // window body): skip the window hook — which may refresh model
             // info — entirely, so ordinary traffic pays a byte count only.
-            if (bytes !== undefined && bytes <= fitFloorBytes) return undefined;
+            if (bytes !== undefined
+                && bytes <= Math.ceil((headerDeclared ?? MIN_ASSUMED_WINDOW_TOKENS) * COMPACTION_FIT_TRIGGER_RATIO) * 4) return undefined;
             const cached = compactionFitCache;
             if (cached !== undefined && cached.source === source) return cached.plan;
             let plan: CompactionFitPlan | undefined;
             let body: string | undefined;
-            const declared = declaredWindowFromHeaders(input, init) ?? state.declaredWindowForDirect?.();
-            // #4079 distrusts windows BELOW MIN_ASSUMED_WINDOW_TOKENS, but a
-            // host-compaction body is the ONE request that replays the whole
-            // history, so "too small to trust" must not mean "send it verbatim
-            // anyway". Live evidence: the dsh lane resolves 1,048,576 and then
-            // subtracts output headroom down to 792,576 — a legitimate number
-            // below the floor — so requiring `declared >= floor` silently
-            // disabled this fit and the 1,972,454-token compaction kept failing
-            // exactly as before. A DECLARED window is therefore lifted to the
-            // floor: we only ever assume MORE room than reported, so the body is
-            // still fitted only when it cannot fit even that assumption. A lane
-            // with no window at all keeps today's verbatim hand-back.
-            const declaredUsable = Number.isFinite(declared) && (declared as number) > 0;
-            const fitWindow = declaredUsable ? Math.max(declared as number, MIN_ASSUMED_WINDOW_TOKENS) : undefined;
+            const declared = headerDeclared ?? state.declaredWindowForDirect?.();
+            // A DECLARED window is the model's real ceiling — use it as-is. Lifting it to
+            // MIN_ASSUMED_WINDOW_TOKENS made the fit budget 967,232 input + 32,768 reply
+            // on a 786,432-token model: the "fitted" body was still ~7k tokens over the
+            // real window, so every first hand-back 400'd. An ABSENT window keeps today's
+            // behaviour (verbatim hand-back, undefined).
+            const declaredUsable = declared !== undefined && Number.isFinite(declared) && declared > 0;
+            const fitWindow = declaredUsable ? Math.floor(declared as number) : undefined;
             if (fitWindow !== undefined) {
                 try {
                     body = await read();
@@ -1432,7 +1457,19 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 const directInit = { ...init, headers: directHeaders };
                 state.onDispatch?.(target, "direct");
                 if (restoredBody !== undefined) {
-                    const restored = withRestoredBody(directInput, directInit, compactionFit !== undefined ? compactionFit.body : restoredBody);
+                    if (compactionFit !== undefined) {
+                        // compaction-fit-retry: the restored lane must re-cut on a
+                        // size/cap rejection like every other wire does, or the
+                        // three wires do not share one behaviour.
+                        return await sendFittedCompaction(
+                            send,
+                            target,
+                            (body) => withRestoredBody(directInput, directInit, body),
+                            compactionFitCache?.text,
+                            compactionFit,
+                        );
+                    }
+                    const restored = withRestoredBody(directInput, directInit, restoredBody);
                     return send(restored.input, restored.init);
                 }
                 if (compactionFit !== undefined) {

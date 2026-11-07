@@ -71,6 +71,19 @@ function anthropicCompactionBody(padChars: number): string {
     });
 }
 
+/** Alternating replay of `pairs` exchanges. Unlike the single-pad fixture this
+ *  keeps a MATERIAL tail — the property that makes the fitted size depend on
+ *  which window the budget was computed from. */
+function alternatingBody(pairs: number, padChars: number, maxTokens: number): string {
+    const messages: Rec[] = [{ role: "user", content: TASK }];
+    for (let i = 0; i < pairs; i += 1) {
+        messages.push({ role: "user", content: "u".repeat(padChars) });
+        messages.push({ role: "assistant", content: "a".repeat(padChars) });
+    }
+    messages.push({ role: "user", content: DIRECTIVE });
+    return JSON.stringify({ model: "deepseek-test", max_tokens: maxTokens, stream: true, system: "you are a coding agent", messages });
+}
+
 interface Sent {
     url: string;
     body: string | undefined;
@@ -552,4 +565,65 @@ test("compaction-fit: the hand-back is observed in bili.log, success and rejecti
     assert.equal(rejected.length, 1, `one line for the give-up, saw ${JSON.stringify(rejected)}`);
     assert.match(rejected[0], /still too large but nothing cuttable is left/);
     assert.match(rejected[0], /: 400$/);
+});
+
+// P0 regression: a DECLARED window is the model's real ceiling. The fit used to
+// lift it to MIN_ASSUMED_WINDOW_TOKENS (1,000,000), so a 786,432-token model was
+// budgeted 967,232 input + 32,768 reply — the "fitted" body was still over the
+// real window and every first hand-back 400'd. The cheap byte floor applied the
+// same lift, which skipped the fit entirely for a ~3.3 MB replay.
+test("compaction-fit: a 786,432-token window fits on the first hand-back (no 400)", async () => {
+    const window = 786_432;
+    const body = alternatingBody(30, 55_000, 1);
+    assert.ok(Buffer.byteLength(body) / 4 > window * 0.9, "the replay must be provably over the real window");
+    await withIntercept({ window, gate: false }, async ({ sent }) => {
+        const res = await fetch("https://provider.test/v1/messages", {
+            method: "POST",
+            body,
+            headers: { "x-bili-plugin-context-window": String(window) },
+        });
+        assert.equal(res.status, 200, "the FIRST hand-back must be accepted, not 400 and retried");
+        assert.equal(sent.length, 1, "exactly one dispatch — a 400 here is the regression");
+        const fitted = sent[0].body;
+        assert.ok(fitted !== undefined);
+        assert.notEqual(fitted, body, "the over-window replay must not ride the wire verbatim");
+        assert.equal((JSON.parse(fitted) as Rec).max_tokens, 32_768, "the starved allowance is restored");
+        const fittedTokens = Math.ceil(Buffer.byteLength(fitted) / 4);
+        assert.ok(fittedTokens + 32_768 + 2_048 <= window,
+            `fitted ${fittedTokens} + 32768 + 2048 must stay under the real ${window} window`);
+        assert.match(String(placeholderOf(messagesOf(fitted))?.content), /NOT included in this request/);
+    });
+});
+
+test("compaction-fit: a provider output-cap rejection lowers max_tokens and is accepted", async () => {
+    const window = 786_432;
+    const body = alternatingBody(30, 55_000, 1);
+    const allowances: number[] = [];
+    await withIntercept(
+        {
+            window,
+            gate: false,
+            respond: (call, sentBody) => {
+                const parsed = JSON.parse(sentBody ?? "{}") as Rec;
+                allowances.push(typeof parsed.max_tokens === "number" ? parsed.max_tokens : -1);
+                if (call === 1) {
+                    return new Response(
+                        JSON.stringify({ type: "invalid_request_error", message: "max_tokens is too large: 32768 > 8192" }),
+                        { status: 400, headers: { "content-type": "application/json" } },
+                    );
+                }
+                return new Response("{}", { status: 200 });
+            },
+        },
+        async ({ sent }) => {
+            const res = await fetch("https://provider.test/v1/messages", {
+                method: "POST",
+                body,
+                headers: { "x-bili-plugin-context-window": String(window) },
+            });
+            assert.equal(res.status, 200, "the cap re-plan's response is what the caller sees");
+            assert.equal(sent.length, 2, "one rejected allowance, then one smaller one — the input is not re-cut");
+            assert.deepEqual(allowances, [32_768, 16_384], "the retry halves the provider-facing allowance");
+        },
+    );
 });

@@ -60,12 +60,36 @@ export const COMPACTION_FIT_TARGET_RATIO = 0.8;
  *  on every other lane (reserve `min(max output, 25% of window)`). */
 export const COMPACTION_FIT_OUTPUT_RESERVE_PCT = 0.25;
 
+/** Below this a "reply allowance" is not a budget but a collapse artifact.
+ *  The provider layer clamps with `max(1, window - inputEstimate - 4096)`, so a
+ *  replay that is already over the window declares exactly 1 — and the upstream
+ *  then writes a one-token "summary" the host discards as `summarization
+ *  truncated at the token cap`. 256 leaves deliberate small budgets (512, 1024,
+ *  8192) untouched while catching the clamp. */
+export const COMPACTION_FIT_STARVED_OUTPUT_MAX = 256;
+
+/** What a starved allowance is restored to. DSH's own summarizer cap defaults to
+ *  65,536 output tokens; half of that (32k ≈ 128 KB of text) is several times
+ *  the observed checkpoint size (3,589 tok / 15,779 chars on a 636k-token
+ *  replay) and still finishes in minutes rather than tens of minutes. */
+export const COMPACTION_FIT_RESTORED_OUTPUT_TOKENS = 32768;
+
+/** Headroom kept between `input + output` and the window so a tokenizer that
+ *  counts a little denser than `bytes / 4` cannot re-trip the ceiling. */
+export const COMPACTION_FIT_OUTPUT_SAFETY_TOKENS = 2048;
+
 /** How many times a hand-back may re-cut an already-fitted compaction body
  *  after the provider rejected it for size. Each retry halves the target, so
  *  two attempts reach a quarter of the first one — enough to absorb the 3-4×
  *  gap between `bytes / 4` and a real tokenizer on CJK/base64-heavy replays
  *  without a retry storm. */
 export const COMPACTION_FIT_RETRY_LIMIT = 2;
+
+/** How many times a hand-back may lower its reply allowance after the provider
+ *  rejected it as above its own maximum output. Kept separate from the size
+ *  retries: a provider capped at 8,192 needs 32,768 → 16,384 → 8,192 to
+ *  converge, and those attempts must not consume the size budget. */
+export const COMPACTION_FIT_CAP_RETRY_LIMIT = 3;
 
 export type CompactionWireProtocol = "anthropic" | "openai" | "responses";
 
@@ -89,6 +113,10 @@ export interface CompactionFitPlan {
     /** Input ceiling actually used: `window` minus the reply allowance, or the
      *  narrower retry target when the caller re-cut after a rejection. */
     budget: number;
+    /** Reply allowance the fitted body actually declares. 0 when the envelope
+     *  carries no allowance field at all. Recomputed against the window so
+     *  `fittedTokens + outputTokens + safety <= window` always holds. */
+    outputTokens: number;
     /** The marker text (also the placeholder message's content). */
     placeholder: string;
 }
@@ -112,6 +140,56 @@ function declaredOutputTokens(parsed: Rec): number | undefined {
         if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value);
     }
     return undefined;
+}
+
+export interface ReplyAllowanceRewrite {
+    head: string;
+    tail: string;
+}
+
+/** Rewrite the top-level reply allowance of an already-spliced compaction body,
+ *  touching ONLY that scalar. `head`/`tail` are the envelope fragments that sat
+ *  before and after the replayed array.
+ *
+ *  Fail-safe by construction: the rewrite happens only when exactly one of the
+ *  three known keys appears exactly once AND its value matches what the parsed
+ *  envelope declared. A tool schema that also declares a `max_tokens` property
+ *  makes the match ambiguous, and an ambiguous match returns undefined so the
+ *  caller keeps today's behaviour instead of rewriting the wrong number. */
+export function rewriteReplyAllowance(
+    head: string,
+    tail: string,
+    value: number,
+    declared: number | undefined,
+): ReplyAllowanceRewrite | undefined {
+    const KEYS = ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const;
+    const hits: Array<{ where: "head" | "tail"; index: number; length: number; key: string; num: number }> = [];
+    const scan = (text: string, where: "head" | "tail"): void => {
+        for (const key of KEYS) {
+            const re = new RegExp(`(?<=[{,]\\s*)"${key}"\\s*:\\s*(\\d+)`, "g");
+            for (const m of text.matchAll(re)) {
+                hits.push({ where, index: m.index ?? 0, length: m[0].length, key, num: Number(m[1]) });
+            }
+        }
+    };
+    scan(head, "head");
+    scan(tail, "tail");
+    if (hits.length !== 1) return undefined;
+    const hit = hits[0]!;
+    if (declared !== undefined && hit.num !== declared) return undefined;
+    const replacement = `"${hit.key}": ${value}`;
+    if (hit.where === "head") {
+        return { head: `${head.slice(0, hit.index)}${replacement}${head.slice(hit.index + hit.length)}`, tail };
+    }
+    return { head, tail: `${tail.slice(0, hit.index)}${replacement}${tail.slice(hit.index + hit.length)}` };
+}
+
+/** True when the body carries the host-compaction directive even though no
+ *  protocol parser recognised it (today: google's `generationConfig`). Used only
+ *  to log the gap loudly — a silent pass-through is how this class of failure
+ *  went unnoticed for two rounds. */
+export function looksLikeHostCompaction(raw: string): boolean {
+    return raw.includes(DSH_COMPACTION_MARKER_SNIFF);
 }
 
 /** The marker line. Deliberately explicit: a reader (or the summarizer) must
@@ -311,6 +389,10 @@ export function planCompactionFit(
      *  caller narrows the target and re-cuts rather than guessing a tokenizer.
      *  Absent = the ordinary window-minus-reply target. */
     targetTokens?: number,
+    /** compaction-fit-retry: the provider's own maximum output. A restored
+     *  allowance above it is rejected as `max_tokens too large`, so the caller
+     *  re-plans with a smaller ceiling instead of shrinking the input again. */
+    outputCeiling?: number,
 ): CompactionFitPlan | undefined {
     if (declaredWindow === undefined || !Number.isFinite(declaredWindow) || declaredWindow <= 0) return undefined;
     const window = Math.floor(declaredWindow);
@@ -342,7 +424,21 @@ export function planCompactionFit(
     // provider will actually accept, using the same reserve the proxy's
     // headroom policy applies to every other lane.
     const reserveCeiling = Math.floor(window * COMPACTION_FIT_OUTPUT_RESERVE_PCT);
-    const reserved = Math.min(declaredOutputTokens(parsed) ?? reserveCeiling, reserveCeiling);
+    // The safety pad may never exceed the window's own reply reserve: a window
+    // smaller than the constant (the 400-token fixture, tiny local models) has
+    // no room for a blanket 2k pad, and demanding one would make every cut
+    // illegal there. Unchanged (2,048) for every window >= 8,192.
+    const safetyTokens = Math.min(COMPACTION_FIT_OUTPUT_SAFETY_TOKENS, reserveCeiling);
+    const declared = declaredOutputTokens(parsed);
+    // A starved allowance is a clamp artifact, not intent: budget the reply at a
+    // usable size so the checkpoint can be written, and let the input ceiling
+    // absorb the difference. The cap keeps a small-window model (e.g. 100k) from
+    // reserving a reply budget it cannot afford.
+    const starved = declared !== undefined && declared < COMPACTION_FIT_STARVED_OUTPUT_MAX;
+    const wantedReply = starved
+        ? Math.min(COMPACTION_FIT_RESTORED_OUTPUT_TOKENS, Math.floor(window * 0.4), outputCeiling ?? COMPACTION_FIT_RESTORED_OUTPUT_TOKENS)
+        : (declared ?? reserveCeiling);
+    const reserved = Math.min(wantedReply, reserveCeiling);
     const budget = Math.max(1, window - reserved);
     // Retry narrowing: never wider than the ordinary budget, and never so small
     // that the kept tail cannot hold the directive (a fit that drops the whole
@@ -352,7 +448,12 @@ export function planCompactionFit(
         : Math.max(Math.min(budget, Math.floor(targetTokens)), 1);
     if (originalTokens <= ceiling * COMPACTION_FIT_TRIGGER_RATIO) return undefined;
     const wire = protocolOf(parsed);
-    if (wire === undefined) return undefined;
+    if (wire === undefined) {
+        if (looksLikeHostCompaction(raw)) {
+            process.emitWarning("[compaction-fit] recognised a host compaction on a wire this build cannot fit (e.g. google generationConfig) — the request is left as-is and may be rejected for size");
+        }
+        return undefined;
+    }
     const { protocol, field } = wire;
     const span = topLevelArraySpanOf(raw, field);
     if (span === undefined) return undefined;
@@ -391,14 +492,52 @@ export function planCompactionFit(
         const next: unknown[] = attempt.merge
             ? [...items.slice(0, attempt.headEnd), mergeMarkerInto(items[cut], protocol, text), ...items.slice(cut + 1)]
             : [...items.slice(0, attempt.headEnd), placeholderItem(protocol, attempt.placeholderRole, dropped), ...items.slice(cut)];
-        const body = `${raw.slice(0, span.start)}${JSON.stringify(next)}${raw.slice(span.end)}`;
-        const fittedBytes = Buffer.byteLength(body);
-        // A fit that does not actually shrink (or still overflows) is not a
-        // fit: fail open so the caller keeps today's behavior instead of
-        // mailing something neither side can reason about.
+        const head = raw.slice(0, span.start);
+        const tail = raw.slice(span.end);
+        const bodyWith = (value: number | undefined): { body: string; rewritten: boolean } => {
+            if (value === undefined) return { body: `${head}${JSON.stringify(next)}${tail}`, rewritten: false };
+            const rw = rewriteReplyAllowance(head, tail, value, declared);
+            if (rw === undefined) return { body: `${head}${JSON.stringify(next)}${tail}`, rewritten: false };
+            return { body: `${rw.head}${JSON.stringify(next)}${rw.tail}`, rewritten: true };
+        };
+        let outputTokens = declared ?? 0;
+        let built = bodyWith(undefined);
+        let body = built.body;
+        let fittedBytes = Buffer.byteLength(body);
+        let fittedTokens = Math.ceil(fittedBytes / 4);
+        // Keep the existing fail-open guard: a "fit" that does not actually shrink the
+        // body must never be sent.
         if (fittedBytes >= originalBytes) continue;
-        const fittedTokens = Math.ceil(fittedBytes / 4);
+        const roomForReply = window - fittedTokens - safetyTokens;
+        if (roomForReply <= 0) continue;
+        const wanted = starved ? wantedReply : (declared ?? 0);
+        if (starved || (declared !== undefined && declared > roomForReply)) {
+            // Aim at the full allowance first: a blanket safety shave would turn 32,768
+            // into 32,760 and make the restored value impossible to pin in a test. Only
+            // shave when the rewrite itself (1 -> 32768 lengthens the field) pushes the
+            // sum over the window.
+            let target = Math.max(1, Math.min(wanted > 0 ? wanted : wantedReply, roomForReply));
+            built = bodyWith(target);
+            if (!built.rewritten) {
+                // Ambiguous envelope: leaving `max_tokens: 1` in place guarantees a
+                // truncated checkpoint, which is worse than a shallower cut.
+                process.emitWarning(`[compaction-fit] reply allowance could not be rewritten (ambiguous envelope); trying a shallower cut (window ${window}, fitted ~${fittedTokens} tok)`);
+                continue;
+            }
+            fittedTokens = Math.ceil(Buffer.byteLength(built.body) / 4);
+            const overflow = fittedTokens + target + safetyTokens - window;
+            if (overflow > 0) {
+                target = Math.max(1, target - overflow);
+                built = bodyWith(target);
+                if (!built.rewritten) continue;
+                fittedTokens = Math.ceil(Buffer.byteLength(built.body) / 4);
+            }
+            body = built.body;
+            fittedBytes = Buffer.byteLength(body);
+            outputTokens = target;
+        }
         if (fittedTokens > ceiling * COMPACTION_FIT_TARGET_RATIO) continue;
+        if (fittedTokens + outputTokens + safetyTokens > window) continue;
         return {
             body,
             protocol,
@@ -411,7 +550,8 @@ export function planCompactionFit(
             originalTokens,
             fittedTokens,
             window,
-            budget: ceiling,
+            budget: Math.max(1, Math.min(ceiling, window - outputTokens)),
+            outputTokens,
             placeholder: text,
         };
     }
