@@ -1183,6 +1183,15 @@ function refitCompactionBody(
     }
 }
 
+/** Exported for the wording test only: the hand-back line is the operator's
+ *  proof that an allowance was restored, so it must not be inlined and drift
+ *  silently. The leading `B, dropped …` shape is kept because existing tests
+ *  and rollback notes match on it. */
+export function _formatHandBackLineForTest(plan: Pick<CompactionFitPlan,
+    "window" | "budget" | "outputTokens" | "fittedBytes" | "fittedTokens" | "droppedMessages" | "keptMessages">): string {
+    return `${plan.fittedBytes.toLocaleString("en-US")} B, dropped ${plan.droppedMessages.toLocaleString("en-US")}/${(plan.droppedMessages + plan.keptMessages).toLocaleString("en-US")} msg, est ~${plan.fittedTokens.toLocaleString("en-US")} tok against a ${plan.budget.toLocaleString("en-US")} tok ceiling (input budget), output ${plan.outputTokens.toLocaleString("en-US")} tok of a ${plan.window.toLocaleString("en-US")} tok window`;
+}
+
 /** Host-compaction fit (compaction-fit-retry): send a fitted compaction body,
  *  observe what came back, and re-cut when the provider still calls it too
  *  large.
@@ -1214,7 +1223,7 @@ async function sendFittedCompaction(
         return await send(next.input, next.init);
     };
     const describe = (level: "info" | "warn" | "error", status: number | string, extra: string): void => {
-        logHostEvent(level, "[native-client]", `[compaction-fit] hand-back → ${maskUrlForLog(target)}, ${Buffer.byteLength(current.body).toLocaleString("en-US")} B, dropped ${current.droppedMessages.toLocaleString("en-US")}/${(current.droppedMessages + current.keptMessages).toLocaleString("en-US")} msg, est ~${current.fittedTokens.toLocaleString("en-US")} tok against a ${current.budget.toLocaleString("en-US")} tok ceiling — ${extra}: ${status}`);
+        logHostEvent(level, "[native-client]", `[compaction-fit] hand-back → ${maskUrlForLog(target)}, ${_formatHandBackLineForTest(current)} — ${extra}: ${status}`);
     };
     let current = plan;
     let response = await dispatch(current.body);

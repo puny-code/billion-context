@@ -174,3 +174,20 @@ test("the same restore works on the openai and responses wires", () => {
     assert.equal(responsesPlan.outputTokens, COMPACTION_FIT_RESTORED_OUTPUT_TOKENS);
     assert.equal((JSON.parse(responsesPlan.body) as Rec).max_output_tokens, COMPACTION_FIT_RESTORED_OUTPUT_TOKENS);
 });
+test("the hand-back log names the declared allowance and the real input ceiling", async () => {
+    const { _formatHandBackLineForTest } = await import("../src/agent/native-intercept.ts");
+    const line = _formatHandBackLineForTest({
+        window: 786_432,
+        budget: 753_664,
+        outputTokens: 32_768,
+        fittedBytes: 2_406_701,
+        fittedTokens: 601_676,
+        droppedMessages: 4_190,
+        keptMessages: 3_811,
+    });
+    // Wording is pinned because this line is the operator's only proof, in
+    // production, that the allowance was restored rather than left clamped.
+    assert.match(line, /2,406,701 B, dropped 4,190\/8,001 msg/);
+    assert.match(line, /est ~601,676 tok against a 753,664 tok ceiling \(input budget\)/);
+    assert.match(line, /output 32,768 tok of a 786,432 tok window/);
+});
